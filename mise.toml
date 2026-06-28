@@ -1,0 +1,75 @@
+# Rust toolchain is inherited from the workspace-root mise.toml ([tools] rust).
+[tasks."pre-commit"]
+description = "Run pre-commit checks via prek"
+run = "prek run --show-diff-on-failure --color=always --all-files --hook-stage=manual"
+
+# ── Build ─────────────────────────────────────────────────────────────────────
+
+[tasks."build"]
+description = "Build all crates (debug)"
+run = "cargo build"
+sources = ["Cargo.toml", "crates/**/Cargo.toml", "crates/**/*.rs"]
+
+[tasks."build:release"]
+description = "Build all crates (release)"
+run = "cargo build --release"
+sources = ["Cargo.toml", "crates/**/Cargo.toml", "crates/**/*.rs"]
+
+# ── Test ──────────────────────────────────────────────────────────────────────
+
+[tasks.test]
+description = """
+Run the full test suite. Integration tests download vendor slides from the
+OpenSlide test data server (cached under target/testdata); if the manifest's
+declared total exceeds the size budget they are skipped via OPENSLIDE_SKIP_DOWNLOAD.
+"""
+env = { RUST_BACKTRACE = "1" }
+run = '''
+#!/usr/bin/env bash
+set -euo pipefail
+
+manifest="crates/slidekit/tests/testdata.yaml"
+limit_gib=10
+limit=$((limit_gib * 1024 * 1024 * 1024))
+
+# Sum the declared `size:` fields without fetching anything, so the budget is
+# decided before any download. Counts slides by their `- path:` entries.
+total=$(awk '/^[[:space:]]*size:/ { s += $2 } END { print s + 0 }' "$manifest")
+count=$(grep -cE '^[[:space:]]*-[[:space:]]+path:' "$manifest")
+printf 'Test data manifest: %d slides, %d bytes (%.2f GiB).\n' \
+  "$count" "$total" "$(awk "BEGIN { print $total / 1073741824 }")"
+
+if [ "$total" -gt "$limit" ]; then
+  echo "Declared total exceeds ${limit_gib} GiB -> skipping integration downloads (OPENSLIDE_SKIP_DOWNLOAD=1)."
+  export OPENSLIDE_SKIP_DOWNLOAD=1
+fi
+
+cargo test --workspace
+'''
+
+[tasks."test:unit"]
+description = "Run unit + network-free tests only (no slide downloads)"
+env = { OPENSLIDE_SKIP_DOWNLOAD = "1" }
+run = "cargo test --workspace"
+
+# ── Lint & Format ─────────────────────────────────────────────────────────────
+
+[tasks.lint]
+description = "Run clippy on all crates"
+run = "cargo clippy -- -D warnings"
+
+[tasks.fmt]
+description = "Format all Rust code"
+run = "cargo fmt --all"
+
+[tasks."fmt:check"]
+description = "Check Rust formatting"
+run = "cargo fmt --all --check"
+
+[tasks.check]
+description = "Run fmt check, clippy, and tests"
+depends = ["fmt:check", "lint", "test"]
+
+[tasks.clean]
+description = "Clean build artifacts"
+run = "cargo clean"

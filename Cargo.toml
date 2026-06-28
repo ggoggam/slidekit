@@ -1,0 +1,25 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/slidekit",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "LGPL-2.1"
+rust-version = "1.85"
+
+[workspace.dependencies]
+thiserror = "2"
+sha2 = "0.10"
+lru = "0.12"
+parking_lot = "0.12"
+quick-xml = "0.37"
+bytes = "1"
+jpeg-decoder = "0.3"
+weezl = "0.1"
+miniz_oxide = "0.8"
+object_store = { version = "0.14", features = ["aws", "gcp", "azure", "http"] }
+tokio = { version = "1", features = ["rt-multi-thread", "sync"] }
+url = "2"

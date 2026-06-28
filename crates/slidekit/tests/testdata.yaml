@@ -1,0 +1,38 @@
+# Vendor test slides downloaded from the OpenSlide test data server.
+#
+# This file is git-tracked and is the single source of truth for the
+# integration test fixtures. It serves three purposes:
+#
+#   1. `tests/common/mod.rs` parses it to know what to download, where to fetch
+#      it, and which SHA-256 to verify against.
+#   2. CI keys its test cache on this file's hash (see .github/projects.json
+#      `lockfile`), so downloaded slides are reused across runs and only
+#      re-fetched when this manifest changes — never on unrelated code churn.
+#   3. CI sums the `size` fields (see `mise run test`); if the declared total
+#      exceeds 10 GiB, integration downloads are skipped to keep CI bounded.
+#
+# `size` is the exact Content-Length served by the data server, in bytes. Keep
+# it accurate: it drives the 10 GiB CI budget decision before anything is
+# fetched.
+
+base_url: https://openslide.cs.cmu.edu/download/openslide-testdata/
+
+slides:
+  - path: Aperio/CMU-1.svs
+    sha256: 00a3d54482cd707abf254fe69dccc8d06b8ff757a1663f1290c23418c480eb30
+    size: 177552579
+  - path: Aperio/CMU-1-JP2K-33005.svs
+    sha256: 9a1923cd9bcb260ba4d99d64f8d6e32550648c332ba48817f920662f3a513420
+    size: 132565343
+  - path: Aperio/CMU-1-Small-Region.svs
+    sha256: ed92d5a9f2e86df67640d6f92ce3e231419ce127131697fbbce42ad5e002c8a7
+    size: 1938955
+  - path: Aperio/JP2K-33003-1.svs
+    sha256: 6205ccf75a8fa6c32df7c5c04b7377398971a490fb6b320d50d91f7ba6a0e6fd
+    size: 63847265
+  - path: Generic-TIFF/CMU-1.tiff
+    sha256: 73a7e89bc15576587c3d68e55d9bf92f09690280166240b48ff4b48230b13bcd
+    size: 204117846
+  - path: Trestle/CMU-1.zip
+    sha256: d52070d474de8cdaf3a6e2934dff077b0aee6e957c7883b101388770b6910b39
+    size: 166582923
