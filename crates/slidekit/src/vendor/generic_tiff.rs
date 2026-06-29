@@ -142,7 +142,10 @@ impl VendorDriver for GenericTiffDriver {
 }
 
 /// Create a tile decoder appropriate for the compression of a TIFF directory.
-fn make_decoder_for_dir(tl: &mut TiffLike, dir: i64) -> Result<Box<dyn TileDecoder>> {
+///
+/// Errors on an unsupported compression scheme, which doubles as the
+/// "is this codec configured?" check for callers building levels.
+pub(crate) fn make_decoder_for_dir(tl: &mut TiffLike, dir: i64) -> Result<Box<dyn TileDecoder>> {
     let compression = if tl.has_tag(dir, tags::COMPRESSION) {
         tl.get_uint(dir, tags::COMPRESSION)?
     } else {

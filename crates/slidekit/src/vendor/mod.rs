@@ -1,5 +1,6 @@
 pub mod aperio;
 pub mod generic_tiff;
+pub mod philips;
 pub mod trestle;
 
 use crate::associated::AssociatedImage;
@@ -76,6 +77,7 @@ pub fn all_drivers() -> Vec<Box<dyn VendorDriver>> {
         // must come before generic-tiff (the fallback).
         Box::new(trestle::TrestleDriver),
         Box::new(aperio::AperioDriver),
+        Box::new(philips::PhilipsDriver),
         Box::new(generic_tiff::GenericTiffDriver),
     ]
 }

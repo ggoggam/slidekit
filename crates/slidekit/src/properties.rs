@@ -34,6 +34,10 @@ impl Properties {
         self.map.get(key).map(|s| s.as_str())
     }
 
+    pub fn remove(&mut self, key: &str) {
+        self.map.remove(key);
+    }
+
     pub fn names(&self) -> Vec<String> {
         self.map.keys().cloned().collect()
     }

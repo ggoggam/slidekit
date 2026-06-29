@@ -336,8 +336,14 @@ fn make_decoder_for_dir(tl: &mut TiffLike, dir: i64) -> Result<Box<dyn TileDecod
 /// Decode a stripped associated image into ARGB pixel data.
 ///
 /// For JPEG-compressed strips, each strip is a separate JPEG image that must
-/// be decoded independently, then stitched together row by row.
-fn decode_associated_image(tl: &mut TiffLike, dir: i64, w: i64, h: i64) -> Result<Vec<u32>> {
+/// be decoded independently, then stitched together row by row. Shared with
+/// the Philips driver, whose label/macro images are stored the same way.
+pub(crate) fn decode_associated_image(
+    tl: &mut TiffLike,
+    dir: i64,
+    w: i64,
+    h: i64,
+) -> Result<Vec<u32>> {
     let compression = if tl.has_tag(dir, tags::COMPRESSION) {
         tl.compression(dir)? as u16
     } else {

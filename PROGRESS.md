@@ -155,7 +155,7 @@
 - [ ] `synthetic` — synthetic test slides (no real file needed)
 - [x] `aperio` — Aperio SVS (`vendor/aperio.rs`) — detect + open + properties + associated images + ICC + tile decode
 - [x] `trestle` — Trestle TIFF (`vendor/trestle.rs`) — detect + open + properties + tile decode
-- [ ] `philips` — Philips TIFF
+- [x] `philips` — Philips TIFF (`vendor/philips.rs`) — detect + open + XML-driven level fixup + properties (mpp, objective) + associated images + tile decode
 - [ ] `ventana` — Roche Ventana BIF
 - [ ] `leica` — Leica SCN (SQLite-based)
 - [ ] `sakura` — Sakura (SQLite-based)
