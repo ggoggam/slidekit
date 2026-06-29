@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 
 /// Predefined OpenSlide property names.
 pub mod names {
+    pub const COMMENT: &str = "openslide.comment";
     pub const VENDOR: &str = "openslide.vendor";
     pub const QUICKHASH1: &str = "openslide.quickhash-1";
     pub const BACKGROUND_COLOR: &str = "openslide.background-color";

@@ -4,6 +4,13 @@ members = [
     "crates/slidekit",
 ]
 
+# Optimize dependencies even in debug/test builds. The integration suite hashes
+# multi-GB cached slides (sha2) and decodes JPEG/deflate/LZW on every run; left
+# unoptimized those crates crawl at ~28 MB/s (a 2.7 GB SHA-256 alone took ~97s).
+# Optimizing only deps keeps our own crate cheap to compile and debuggable.
+[profile.dev.package."*"]
+opt-level = 3
+
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
