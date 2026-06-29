@@ -194,6 +194,7 @@ impl VendorDriver for TrestleDriver {
                 decoder,
                 tiff_tile_width: tile_w,
                 tiff_tile_height: tile_h,
+                tilemap: None,
             });
         }
 

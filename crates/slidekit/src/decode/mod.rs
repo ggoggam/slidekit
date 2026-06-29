@@ -3,6 +3,7 @@ pub mod jpeg;
 pub mod lzw;
 pub mod packbits;
 pub mod tiff;
+pub mod xml;
 
 use crate::color::argb;
 use crate::error::{OpenSlideError, Result};

@@ -23,6 +23,7 @@
 use crate::associated::AssociatedImage;
 use crate::decode::tiff::TiffLike;
 use crate::decode::tiff::tags;
+use crate::decode::xml::{Node, parse_tree};
 use crate::error::{OpenSlideError, Result};
 use crate::grid::simple::SimpleGrid;
 use crate::io::SlideReader;
@@ -82,14 +83,13 @@ impl VendorDriver for PhilipsDriver {
 
         // Parse the XML metadata from directory 0's ImageDescription.
         let xml = tl.get_string(0, tags::IMAGE_DESCRIPTION)?;
-        let root = parse_xml_tree(&xml)?;
+        let root = parse_tree(&xml)?;
 
         // Locate the single WSI scanned image. More (or fewer) than one is an error.
-        let scanned = root
-            .child_attr_node("PIM_DP_SCANNED_IMAGES")
+        let scanned = child_attr_node(&root, "PIM_DP_SCANNED_IMAGES")
             .ok_or_else(|| OpenSlideError::Decode("No scanned images in XML".into()))?;
         let wsi_images: Vec<&Node> = array_objects(scanned)
-            .filter(|d| d.child_attr_text("PIM_DP_IMAGE_TYPE") == Some("WSI"))
+            .filter(|d| child_attr_text(d, "PIM_DP_IMAGE_TYPE") == Some("WSI"))
             .collect();
         if wsi_images.len() != 1 {
             return Err(OpenSlideError::Decode(format!(
@@ -100,23 +100,21 @@ impl VendorDriver for PhilipsDriver {
         let wsi = wsi_images[0];
 
         // Per-level pixel spacings (one PixelDataRepresentation per level).
-        let level_spacings: Vec<(f64, f64)> = wsi
-            .child_attr_node("PIIM_PIXEL_DATA_REPRESENTATION_SEQUENCE")
-            .map(|seq| {
-                array_objects(seq)
-                    .filter_map(|repr| repr.child_attr_text("DICOM_PIXEL_SPACING"))
-                    .filter_map(parse_pixel_spacing)
-                    .collect()
-            })
-            .unwrap_or_default();
+        let level_spacings: Vec<(f64, f64)> =
+            child_attr_node(wsi, "PIIM_PIXEL_DATA_REPRESENTATION_SEQUENCE")
+                .map(|seq| {
+                    array_objects(seq)
+                        .filter_map(|repr| child_attr_text(repr, "DICOM_PIXEL_SPACING"))
+                        .filter_map(parse_pixel_spacing)
+                        .collect()
+                })
+                .unwrap_or_default();
 
         // Base resolution (for mpp) and objective power.
-        let base_spacing = wsi
-            .child_attr_text("DICOM_PIXEL_SPACING")
-            .and_then(parse_pixel_spacing);
-        let objective_power = wsi
-            .child_attr_text("DICOM_DERIVATION_DESCRIPTION")
-            .and_then(parse_objective_power);
+        let base_spacing =
+            child_attr_text(wsi, "DICOM_PIXEL_SPACING").and_then(parse_pixel_spacing);
+        let objective_power =
+            child_attr_text(wsi, "DICOM_DERIVATION_DESCRIPTION").and_then(parse_objective_power);
 
         // Walk directories: tiled → pyramid level, Label/Macro → associated image.
         let dir_count = tl.directory_count();
@@ -171,6 +169,7 @@ impl VendorDriver for PhilipsDriver {
                     decoder,
                     tiff_tile_width: tile_w,
                     tiff_tile_height: tile_h,
+                    tilemap: None,
                 });
             } else if tl.has_tag(dir, tags::IMAGE_DESCRIPTION) {
                 let desc = tl.get_string(dir, tags::IMAGE_DESCRIPTION)?;
@@ -265,49 +264,22 @@ fn fix_level_dimensions(levels: &mut [LevelData], spacings: &[(f64, f64)]) -> Re
     Ok(())
 }
 
-// ───────────────────────── XML parsing ─────────────────────────────────────
+// ───────────────────────── XML helpers ─────────────────────────────────────
 //
-// ponytail: a minimal in-house XML tree, scoped to this one driver. The Philips
-// `DataObject`/`Attribute` shape is vendor-specific, so a generic XML module
-// would be speculative — lift this into `decode/xml.rs` when a second vendor
-// needs XML.
+// The generic XML tree lives in `decode::xml`; these helpers encode the Philips
+// `DataObject`/`Attribute` shape (`<Attribute Name="...">` wrappers, `<Array>`
+// of `<DataObject>`), which is vendor-specific.
 
-/// A minimal XML element tree node.
-struct Node {
-    name: String,
-    attrs: Vec<(String, String)>,
-    children: Vec<Node>,
-    text: String,
+/// Direct child `<Attribute Name="name">` node, if any.
+fn child_attr_node<'a>(node: &'a Node, name: &str) -> Option<&'a Node> {
+    node.children
+        .iter()
+        .find(|c| c.name == "Attribute" && c.attr("Name") == Some(name))
 }
 
-impl Node {
-    fn empty() -> Self {
-        Node {
-            name: String::new(),
-            attrs: Vec::new(),
-            children: Vec::new(),
-            text: String::new(),
-        }
-    }
-
-    fn attr(&self, key: &str) -> Option<&str> {
-        self.attrs
-            .iter()
-            .find(|(k, _)| k == key)
-            .map(|(_, v)| v.as_str())
-    }
-
-    /// Direct child `<Attribute Name="name">` node, if any.
-    fn child_attr_node(&self, name: &str) -> Option<&Node> {
-        self.children
-            .iter()
-            .find(|c| c.name == "Attribute" && c.attr("Name") == Some(name))
-    }
-
-    /// Trimmed text of the direct child `<Attribute Name="name">`.
-    fn child_attr_text(&self, name: &str) -> Option<&str> {
-        self.child_attr_node(name).map(|n| n.text.trim())
-    }
+/// Trimmed text of the direct child `<Attribute Name="name">`.
+fn child_attr_text<'a>(node: &'a Node, name: &str) -> Option<&'a str> {
+    child_attr_node(node, name).map(|n| n.text.trim())
 }
 
 /// `<DataObject>` elements inside an attribute node's `<Array>`.
@@ -317,56 +289,6 @@ fn array_objects(attr_node: &Node) -> impl Iterator<Item = &Node> {
         .iter()
         .filter(|c| c.name == "Array")
         .flat_map(|arr| arr.children.iter().filter(|c| c.name == "DataObject"))
-}
-
-fn start_node(e: &quick_xml::events::BytesStart) -> Node {
-    let mut node = Node::empty();
-    node.name = String::from_utf8_lossy(e.name().as_ref()).into_owned();
-    for a in e.attributes().flatten() {
-        let key = String::from_utf8_lossy(a.key.as_ref()).into_owned();
-        let value = String::from_utf8_lossy(a.value.as_ref()).into_owned();
-        node.attrs.push((key, value));
-    }
-    node
-}
-
-/// Parse an XML document into a tree, returning the root element.
-fn parse_xml_tree(xml: &str) -> Result<Node> {
-    let mut reader = Reader::from_str(xml);
-    // Sentinel root collects the real document root as its only child.
-    let mut stack: Vec<Node> = vec![Node::empty()];
-    loop {
-        match reader.read_event() {
-            Ok(Event::Start(e)) => stack.push(start_node(&e)),
-            Ok(Event::Empty(e)) => {
-                let node = start_node(&e);
-                stack.last_mut().unwrap().children.push(node);
-            }
-            Ok(Event::End(_)) => {
-                if stack.len() > 1 {
-                    let node = stack.pop().unwrap();
-                    stack.last_mut().unwrap().children.push(node);
-                }
-            }
-            Ok(Event::Text(t)) => {
-                let s = String::from_utf8_lossy(t.as_ref());
-                if !s.trim().is_empty() {
-                    stack.last_mut().unwrap().text.push_str(&s);
-                }
-            }
-            Ok(Event::CData(c)) => {
-                let s = String::from_utf8_lossy(c.as_ref());
-                stack.last_mut().unwrap().text.push_str(&s);
-            }
-            Ok(Event::Eof) => break,
-            Err(e) => return Err(OpenSlideError::Decode(format!("XML parse error: {e}"))),
-            _ => {}
-        }
-    }
-    stack
-        .pop()
-        .and_then(|sentinel| sentinel.children.into_iter().next())
-        .ok_or_else(|| OpenSlideError::Decode("Empty XML document".into()))
 }
 
 /// Cheap detection check: the first element must be `<DataObject
@@ -497,26 +419,24 @@ mod tests {
 
     #[test]
     fn tree_extraction_finds_wsi_and_spacings() {
-        let root = parse_xml_tree(SAMPLE_XML).unwrap();
+        let root = parse_tree(SAMPLE_XML).unwrap();
         assert_eq!(root.name, "DataObject");
 
-        let scanned = root.child_attr_node("PIM_DP_SCANNED_IMAGES").unwrap();
+        let scanned = child_attr_node(&root, "PIM_DP_SCANNED_IMAGES").unwrap();
         let wsi: Vec<&Node> = array_objects(scanned)
-            .filter(|d| d.child_attr_text("PIM_DP_IMAGE_TYPE") == Some("WSI"))
+            .filter(|d| child_attr_text(d, "PIM_DP_IMAGE_TYPE") == Some("WSI"))
             .collect();
         assert_eq!(wsi.len(), 1);
 
         let wsi = wsi[0];
         assert_eq!(
-            wsi.child_attr_text("DICOM_PIXEL_SPACING"),
+            child_attr_text(wsi, "DICOM_PIXEL_SPACING"),
             Some(r#""0.00025" "0.00025""#)
         );
 
-        let seq = wsi
-            .child_attr_node("PIIM_PIXEL_DATA_REPRESENTATION_SEQUENCE")
-            .unwrap();
+        let seq = child_attr_node(wsi, "PIIM_PIXEL_DATA_REPRESENTATION_SEQUENCE").unwrap();
         let spacings: Vec<(f64, f64)> = array_objects(seq)
-            .filter_map(|r| r.child_attr_text("DICOM_PIXEL_SPACING"))
+            .filter_map(|r| child_attr_text(r, "DICOM_PIXEL_SPACING"))
             .filter_map(parse_pixel_spacing)
             .collect();
         assert_eq!(spacings.len(), 3);
@@ -540,6 +460,7 @@ mod tests {
             decoder: Box::new(crate::decode::jpeg::JpegDecoder::new()),
             tiff_tile_width: 512,
             tiff_tile_height: 512,
+            tilemap: None,
         };
         let mut levels = vec![mk(40000, 30000), mk(20001, 15001), mk(10005, 7505)];
         fix_level_dimensions(&mut levels, &spacings).unwrap();

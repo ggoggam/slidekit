@@ -12,6 +12,7 @@
 
 #![allow(dead_code)] // not every test binary uses every helper
 
+use fs2::FileExt;
 use once_cell::sync::Lazy;
 use sha2::{Digest, Sha256};
 use std::fs;
@@ -71,14 +72,29 @@ fn cache_dir() -> PathBuf {
     }
 }
 
-/// Verify SHA-256 of a file matches expected hash.
+/// Local paths whose SHA-256 has already been confirmed in this test binary.
+/// Repeated `require_slide!` calls across tests would otherwise re-hash the same
+/// (multi-GB) file every time — hashing a 2.5 GB slide once per test dominated
+/// wall-clock far more than the actual read work.
+static VERIFIED: Lazy<std::sync::Mutex<std::collections::HashSet<PathBuf>>> =
+    Lazy::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+
+/// Verify the SHA-256 of a file matches `expected`, streaming the file in
+/// chunks so a multi-GB slide isn't slurped into a single allocation.
 fn verify_sha256(path: &Path, expected: &str) -> bool {
-    let Ok(data) = fs::read(path) else {
+    let Ok(mut file) = fs::File::open(path) else {
         return false;
     };
-    let hash = Sha256::digest(&data);
-    let hex = format!("{:x}", hash);
-    hex == expected
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 65536];
+    loop {
+        match file.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => hasher.update(&buf[..n]),
+            Err(_) => return false,
+        }
+    }
+    format!("{:x}", hasher.finalize()) == expected
 }
 
 /// Download a file from the test data server.
@@ -128,8 +144,35 @@ pub fn test_slide_path(relative_path: &str) -> Option<PathBuf> {
 
     let local = cache_dir().join(relative_path);
 
-    // Check if already cached with correct checksum.
+    // Warm path (lock-free): already verified in this process — skip the hash.
+    if VERIFIED.lock().unwrap().contains(&local) {
+        return Some(local);
+    }
+
+    // First-time resolution: serialize it per slide so a fixture shared by
+    // several tests is verified/downloaded once, not once per test. libtest
+    // runs test fns on parallel threads (and nextest across processes), which
+    // would otherwise have every test concurrently re-hash — or re-download
+    // into the same temp path — the same multi-GB file. `flock` serializes
+    // independent file descriptions whether they're in different threads or
+    // different processes, and the OS releases it if the holder dies, so a
+    // crashed test can't wedge the others.
+    if let Some(parent) = local.parent() {
+        fs::create_dir_all(parent).ok();
+    }
+    let lock = fs::File::create(local.with_extension("lock")).ok();
+    if let Some(f) = &lock {
+        f.lock_exclusive().ok();
+    }
+
+    // Re-check the memo under the lock: a peer may have finished while we waited.
+    if VERIFIED.lock().unwrap().contains(&local) {
+        return Some(local);
+    }
+
+    // Cached and intact? Hash it once, record it, done.
     if local.exists() && verify_sha256(&local, &entry.sha256) {
+        VERIFIED.lock().unwrap().insert(local.clone());
         return Some(local);
     }
 
@@ -137,6 +180,7 @@ pub fn test_slide_path(relative_path: &str) -> Option<PathBuf> {
     match download_file(&url, &local) {
         Ok(()) => {
             if verify_sha256(&local, &entry.sha256) {
+                VERIFIED.lock().unwrap().insert(local.clone());
                 Some(local)
             } else {
                 eprintln!("WARNING: SHA-256 mismatch for {relative_path}, removing");

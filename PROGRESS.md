@@ -65,6 +65,7 @@
 - [x] `test_grid.rs` — SimpleGrid unit tests
 - [x] `test_read_region.rs` — region reads, transparent-fill for missing tiles
 - [x] `test_read_region_async.rs` — async region reads via `object_store`
+- [~] `test_ventana.rs` — detect/open/levels/read_region; gated (skips) until a Ventana fixture is added to `testdata.yaml`
 - [ ] `test_properties.rs` — property names/values per vendor (not yet created)
 - [ ] `test_associated.rs` — associated image dimensions per vendor (not yet created)
 - [ ] `test_cache.rs` — LRU eviction, shared cache (not yet created)
@@ -132,7 +133,7 @@
 - [x] LZW decompression (TIFF strips/tiles) — `decode/lzw.rs`
 - [x] Deflate/ZIP decompression (TIFF) — `decode/deflate.rs`
 - [x] PackBits decompression (TIFF) — `decode/packbits.rs`
-- [ ] XML metadata parser (`decode/xml.rs`) — `quick-xml`
+- [x] XML metadata parser (`decode/xml.rs`) — minimal element tree over `quick-xml` (`Node` + `parse_tree` + `children_named`/`find_child`/`descend`), shared by Philips and Ventana
 - [ ] SQLite reader (`decode/sqlite.rs`) — `rusqlite`, for Leica/Sakura
 - [ ] DICOM decoder (`decode/dicom.rs`) — `dicom-rs` or partial port
 
@@ -142,7 +143,7 @@
 
 - [x] `TileGrid` trait — `tiles_for_region(x, y, w, h)`
 - [x] `SimpleGrid` — regular rectangular tile layout (`grid/simple.rs`)
-- [ ] `TilemapGrid` — arbitrary float-offset tiles (needed by Mirax)
+- [x] `TileMap` — arbitrary-offset placed (sub)tiles (`grid/tilemap.rs`); built by Ventana from AOI stitch geometry, consumed by `read_region` via an additive `LevelData.tilemap` path (also serves Mirax)
 - [ ] `RangeGrid` — Z-order / quadtree tiles
 - [x] `Cache` — LRU by capacity, `parking_lot::Mutex` (`cache.rs`)
 - [ ] Shared cache across multiple `OpenSlide` instances
@@ -156,7 +157,7 @@
 - [x] `aperio` — Aperio SVS (`vendor/aperio.rs`) — detect + open + properties + associated images + ICC + tile decode
 - [x] `trestle` — Trestle TIFF (`vendor/trestle.rs`) — detect + open + properties + tile decode
 - [x] `philips` — Philips TIFF (`vendor/philips.rs`) — detect + open + XML-driven level fixup + properties (mpp, objective) + associated images + tile decode
-- [ ] `ventana` — Roche Ventana BIF
+- [x] `ventana` — Roche Ventana BIF (`vendor/ventana.rs`) — detect (XMLPacket + iScan) + open + initial-XML properties (objective power, mpp) + level enumeration (level=/mag= validation) + AOI stitch geometry → `TileMap` + associated images (macro/thumbnail) + ICC. Geometry/parse unit-tested; end-to-end `test_ventana.rs` gated on a Ventana fixture not yet in `testdata.yaml` (multi-GB; needs a real sha256/size)
 - [ ] `leica` — Leica SCN (SQLite-based)
 - [ ] `sakura` — Sakura (SQLite-based)
 - [ ] `hamamatsu` — Hamamatsu VMS/VMU/NDPI (~2300 LOC in C)

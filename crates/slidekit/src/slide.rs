@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -8,6 +9,7 @@ use crate::cache::Cache;
 use crate::decode::tiff::TiffLike;
 use crate::error::{OpenSlideError, Result};
 use crate::grid::TileGrid;
+use crate::grid::tilemap::TileMap;
 use crate::io::local::LocalFileReader;
 use crate::io::{AsyncReadAt, SlideReader};
 use crate::properties::Properties;
@@ -238,6 +240,11 @@ impl OpenSlide {
         let lx = x as f64 / ds;
         let ly = y as f64 / ds;
 
+        // Tilemap levels (Ventana BIF AOIs) don't lie on a regular grid.
+        if let Some(tilemap) = &lvl.tilemap {
+            return self.read_region_tilemap(tilemap, lvl, lx, ly, w, h);
+        }
+
         // Find overlapping tiles
         let tiles = lvl.grid.tiles_for_region(lx, ly, w as f64, h as f64);
 
@@ -299,6 +306,71 @@ impl OpenSlide {
         Ok(output)
     }
 
+    /// Read a region from a tilemap level (Ventana BIF AOIs).
+    ///
+    /// Each placed (sub)tile names the physical TIFF tile it comes from, the
+    /// sub-rectangle within it, and its destination in level pixel space. One
+    /// physical tile can back many subtiles, so each is decoded at most once
+    /// per call.
+    fn read_region_tilemap(
+        &self,
+        tilemap: &TileMap,
+        lvl: &LevelData,
+        lx: f64,
+        ly: f64,
+        w: i64,
+        h: i64,
+    ) -> Result<Vec<u32>> {
+        let mut output = vec![0u32; (w * h) as usize];
+
+        let tiff_mutex = self.tiff.as_ref().ok_or_else(|| {
+            OpenSlideError::Decode("No TIFF data available for tile reading".into())
+        })?;
+
+        let ox = lx.round() as i64;
+        let oy = ly.round() as i64;
+        let tiff_tile_w = lvl.tiff_tile_width;
+        let tiff_tile_h = lvl.tiff_tile_height;
+
+        let mut decoded: HashMap<usize, Vec<u32>> = HashMap::new();
+        for t in tilemap.tiles_for_region(ox, oy, w, h) {
+            use std::collections::hash_map::Entry;
+            let px = match decoded.entry(t.tiff_tile_index) {
+                Entry::Occupied(e) => e.into_mut(),
+                Entry::Vacant(e) => {
+                    let data = {
+                        let mut tiff = tiff_mutex.lock();
+                        tiff.read_tile_data(lvl.tiff_dir, t.tiff_tile_index)?
+                    };
+                    if data.is_empty() {
+                        continue; // missing tile → leave transparent
+                    }
+                    let px = lvl
+                        .decoder
+                        .decode(&data, tiff_tile_w as u32, tiff_tile_h as u32)?;
+                    e.insert(px)
+                }
+            };
+            composite_subtile(
+                px,
+                tiff_tile_w,
+                t.src_x,
+                t.src_y,
+                t.src_w,
+                t.src_h,
+                t.dest_x,
+                t.dest_y,
+                &mut output,
+                ox,
+                oy,
+                w,
+                h,
+            );
+        }
+
+        Ok(output)
+    }
+
     /// Async counterpart to [`read_region`](Self::read_region).
     ///
     /// For slides opened from an async backend (`open_url`/`open_store` and
@@ -332,6 +404,15 @@ impl OpenSlide {
         }
 
         let lvl = &self.levels[level as usize];
+
+        // Tilemap (Ventana) levels need sub-rect compositing across shared
+        // physical tiles, which the range-fetch path below can't model. Read
+        // them via the sync path (positioned reads). ponytail: async subtile
+        // fetch if remote Ventana ever becomes a hot path.
+        if lvl.tilemap.is_some() {
+            return self.read_region(x, y, level, w, h);
+        }
+
         let ds = lvl.info.downsample;
         let lx = x as f64 / ds;
         let ly = y as f64 / ds;
@@ -498,7 +579,7 @@ where
         .map_err(|_| OpenSlideError::Other("slide open thread terminated unexpectedly".into()))?
 }
 
-/// Composite a decoded tile into the output buffer.
+/// Composite a whole decoded tile into the output buffer.
 ///
 /// `tile_pixels`: decoded ARGB pixels (tile_w * tile_h)
 /// `tile_x, tile_y`: tile's top-left in level pixel space
@@ -517,22 +598,64 @@ fn composite_tile(
     out_w: i64,
     out_h: i64,
 ) {
-    // Compute overlap between tile and output region
-    let src_x0 = (out_x - tile_x).max(0);
-    let src_y0 = (out_y - tile_y).max(0);
-    let dst_x0 = (tile_x - out_x).max(0);
-    let dst_y0 = (tile_y - out_y).max(0);
+    composite_subtile(
+        tile_pixels,
+        tile_w,
+        0,
+        0,
+        tile_w,
+        tile_h,
+        tile_x,
+        tile_y,
+        out_pixels,
+        out_x,
+        out_y,
+        out_w,
+        out_h,
+    );
+}
 
-    let copy_w = (tile_w - src_x0).min(out_w - dst_x0);
-    let copy_h = (tile_h - src_y0).min(out_h - dst_y0);
+/// Composite a sub-rectangle of a decoded tile into the output buffer.
+///
+/// Copies the `src_w * src_h` block at `(src_x, src_y)` within `tile_pixels`
+/// (row stride `tile_stride`) to `(dest_x, dest_y)` in the output region,
+/// clipping to the output bounds. [`composite_tile`] is the whole-tile case
+/// (source origin `(0,0)`, stride = tile width).
+#[allow(clippy::too_many_arguments)]
+fn composite_subtile(
+    tile_pixels: &[u32],
+    tile_stride: i64,
+    src_x: i64,
+    src_y: i64,
+    src_w: i64,
+    src_h: i64,
+    dest_x: i64,
+    dest_y: i64,
+    out_pixels: &mut [u32],
+    out_x: i64,
+    out_y: i64,
+    out_w: i64,
+    out_h: i64,
+) {
+    // Sub-rect's top-left relative to the output buffer.
+    let off_x = dest_x - out_x;
+    let off_y = dest_y - out_y;
+
+    // Clip the sub-rect to the output region.
+    let copy_x0 = off_x.max(0); // first output column written
+    let skip_x = copy_x0 - off_x; // source columns skipped at the left
+    let copy_w = (src_w - skip_x).min(out_w - copy_x0);
+    let copy_y0 = off_y.max(0);
+    let skip_y = copy_y0 - off_y;
+    let copy_h = (src_h - skip_y).min(out_h - copy_y0);
 
     if copy_w <= 0 || copy_h <= 0 {
         return;
     }
 
     for row in 0..copy_h {
-        let src_off = ((src_y0 + row) * tile_w + src_x0) as usize;
-        let dst_off = ((dst_y0 + row) * out_w + dst_x0) as usize;
+        let src_off = ((src_y + skip_y + row) * tile_stride + (src_x + skip_x)) as usize;
+        let dst_off = ((copy_y0 + row) * out_w + copy_x0) as usize;
         let len = copy_w as usize;
 
         if src_off + len <= tile_pixels.len() && dst_off + len <= out_pixels.len() {

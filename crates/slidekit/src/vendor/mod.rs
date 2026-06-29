@@ -2,12 +2,14 @@ pub mod aperio;
 pub mod generic_tiff;
 pub mod philips;
 pub mod trestle;
+pub mod ventana;
 
 use crate::associated::AssociatedImage;
 use crate::decode::TileDecoder;
 use crate::decode::tiff::TiffLike;
 use crate::error::Result;
 use crate::grid::simple::SimpleGrid;
+use crate::grid::tilemap::TileMap;
 use crate::io::SlideReader;
 use crate::level::LevelInfo;
 use crate::properties::Properties;
@@ -25,6 +27,10 @@ pub struct LevelData {
     pub tiff_tile_width: i64,
     /// Actual TIFF tile height (may differ from `info.tile_height`).
     pub tiff_tile_height: i64,
+    /// Explicit tile placement for formats whose tiles don't lie on a regular
+    /// row-major grid (Ventana BIF AOIs). When `Some`, the read path uses it
+    /// instead of `grid`/the row-major index formula; `grid` is then unused.
+    pub tilemap: Option<TileMap>,
 }
 
 /// Data produced by a vendor driver after opening a slide.
@@ -78,6 +84,7 @@ pub fn all_drivers() -> Vec<Box<dyn VendorDriver>> {
         Box::new(trestle::TrestleDriver),
         Box::new(aperio::AperioDriver),
         Box::new(philips::PhilipsDriver),
+        Box::new(ventana::VentanaDriver),
         Box::new(generic_tiff::GenericTiffDriver),
     ]
 }

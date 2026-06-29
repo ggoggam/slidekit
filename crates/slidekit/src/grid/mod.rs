@@ -1,4 +1,5 @@
 pub mod simple;
+pub mod tilemap;
 
 /// Trait for tile grid layouts.
 ///

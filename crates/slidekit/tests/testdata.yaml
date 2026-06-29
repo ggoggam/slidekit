@@ -41,3 +41,8 @@ slides:
   - path: Philips-TIFF/Philips-4.tiff
     sha256: 6a743d3bbf721a63f1fc2920f41ddcca43571346665114c6827e63efe034a0b0
     size: 290991342
+  # Roche Ventana BIF (Ki-67 stain, joint direction RIGHT). Exercises the BIF
+  # AOI-tilemap stitch path end-to-end. sha256 from the server's index.yaml.
+  - path: Ventana/OS-2.bif
+    sha256: 8c0bcfe258574e1ec5640d280f9c5b664b76840f52b9cdcd321ec690c113dbd2
+    size: 2717833684
