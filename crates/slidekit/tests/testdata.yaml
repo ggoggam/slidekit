@@ -46,3 +46,9 @@ slides:
   - path: Ventana/OS-2.bif
     sha256: 8c0bcfe258574e1ec5640d280f9c5b664b76840f52b9cdcd321ec690c113dbd2
     size: 2717833684
+  # Leica SCN (single brightfield region + macro overview). Exercises the
+  # XML-driven level selection and macro associated-image path. sha256 from the
+  # server's index.yaml; size is the served Content-Length.
+  - path: Leica/Leica-1.scn
+    sha256: 63a3c00fef5215497a9725cf19092a93f7f5ff855ce8561af74b087631831a97
+    size: 291812870

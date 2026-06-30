@@ -345,6 +345,12 @@ pub(crate) fn decode_associated_image(
     w: i64,
     h: i64,
 ) -> Result<Vec<u32>> {
+    // Tiled associated images (e.g. the Leica macro) need tile-based assembly;
+    // the strip paths below only handle stripped directories.
+    if tl.is_tiled(dir) {
+        return decode_tiled_image(tl, dir, w, h);
+    }
+
     let compression = if tl.has_tag(dir, tags::COMPRESSION) {
         tl.compression(dir)? as u16
     } else {
@@ -463,6 +469,52 @@ pub(crate) fn decode_associated_image(
             "Unsupported associated image compression: {other}"
         ))),
     }
+}
+
+/// Assemble a tiled TIFF directory into a full ARGB image buffer.
+///
+/// Some associated images (e.g. the Leica SCN macro) are stored tiled rather
+/// than stripped. Read each tile, decode it with the directory's codec, and
+/// blit it into place, clipping edge tiles to the image bounds. Missing tiles
+/// are left transparent.
+pub(crate) fn decode_tiled_image(tl: &mut TiffLike, dir: i64, w: i64, h: i64) -> Result<Vec<u32>> {
+    let tile_w = tl.get_uint(dir, tags::TILE_WIDTH)? as i64;
+    let tile_h = tl.get_uint(dir, tags::TILE_LENGTH)? as i64;
+    if tile_w <= 0 || tile_h <= 0 || w <= 0 || h <= 0 {
+        return Err(OpenSlideError::Decode(
+            "Invalid tiled associated-image dimensions".into(),
+        ));
+    }
+    let decoder = make_decoder_for_dir(tl, dir)?;
+    let across = (w + tile_w - 1) / tile_w;
+    let down = (h + tile_h - 1) / tile_h;
+    let tile_px_count = (tile_w * tile_h) as usize;
+
+    let mut argb = vec![0u32; (w * h) as usize];
+    for trow in 0..down {
+        for tcol in 0..across {
+            let idx = (trow * across + tcol) as usize;
+            let data = tl.read_tile_data(dir, idx)?;
+            if data.is_empty() {
+                continue; // missing tile → leave transparent
+            }
+            let tile = decoder.decode(&data, tile_w as u32, tile_h as u32)?;
+            if tile.len() < tile_px_count {
+                continue; // short decode → skip rather than panic
+            }
+            let copy_w = (tile_w.min(w - tcol * tile_w)) as usize;
+            for ty in 0..tile_h {
+                let dy = trow * tile_h + ty;
+                if dy >= h {
+                    break;
+                }
+                let src = (ty * tile_w) as usize;
+                let dst = (dy * w + tcol * tile_w) as usize;
+                argb[dst..dst + copy_w].copy_from_slice(&tile[src..src + copy_w]);
+            }
+        }
+    }
+    Ok(argb)
 }
 
 /// Decoder for uncompressed TIFF tiles.

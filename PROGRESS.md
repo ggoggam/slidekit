@@ -66,6 +66,7 @@
 - [x] `test_read_region.rs` — region reads, transparent-fill for missing tiles
 - [x] `test_read_region_async.rs` — async region reads via `object_store`
 - [~] `test_ventana.rs` — detect/open/levels/read_region; gated (skips) until a Ventana fixture is added to `testdata.yaml`
+- [x] `test_leica.rs` — detect/open/levels/properties/read_region/macro against `Leica/Leica-1.scn` (6 tests, passing; gated on download)
 - [ ] `test_properties.rs` — property names/values per vendor (not yet created)
 - [ ] `test_associated.rs` — associated image dimensions per vendor (not yet created)
 - [ ] `test_cache.rs` — LRU eviction, shared cache (not yet created)
@@ -158,7 +159,7 @@
 - [x] `trestle` — Trestle TIFF (`vendor/trestle.rs`) — detect + open + properties + tile decode
 - [x] `philips` — Philips TIFF (`vendor/philips.rs`) — detect + open + XML-driven level fixup + properties (mpp, objective) + associated images + tile decode
 - [x] `ventana` — Roche Ventana BIF (`vendor/ventana.rs`) — detect (XMLPacket + iScan) + open + initial-XML properties (objective power, mpp) + level enumeration (level=/mag= validation) + AOI stitch geometry → `TileMap` + associated images (macro/thumbnail) + ICC. Geometry/parse unit-tested; end-to-end `test_ventana.rs` gated on a Ventana fixture not yet in `testdata.yaml` (multi-GB; needs a real sha256/size)
-- [ ] `leica` — Leica SCN (SQLite-based)
+- [x] `leica` — Leica SCN (`vendor/leica.rs`) — TIFF+XML (not SQLite); detect (`scn` namespace in dir-0 ImageDescription) + open + XML-driven level selection from the main image's `<dimension ifd=…>` children + properties (objective power, mpp, `leica.*` metadata, barcode) + macro associated image (via the new tiled-image decode path) + ICC. Single brightfield main image fully supported; multi-region SCN (multiple main images composited at collection offsets) deferred — the read path keys one IFD per level, so `open` errors clearly. XML parse/classification unit-tested; end-to-end `test_leica.rs` against `Leica/Leica-1.scn` (6 tests passing)
 - [ ] `sakura` — Sakura (SQLite-based)
 - [ ] `hamamatsu` — Hamamatsu VMS/VMU/NDPI (~2300 LOC in C)
 - [ ] `mirax` — 3DHistech MRXS (~1900 LOC in C)

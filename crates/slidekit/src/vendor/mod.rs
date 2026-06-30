@@ -1,5 +1,6 @@
 pub mod aperio;
 pub mod generic_tiff;
+pub mod leica;
 pub mod philips;
 pub mod trestle;
 pub mod ventana;
@@ -83,6 +84,7 @@ pub fn all_drivers() -> Vec<Box<dyn VendorDriver>> {
         // must come before generic-tiff (the fallback).
         Box::new(trestle::TrestleDriver),
         Box::new(aperio::AperioDriver),
+        Box::new(leica::LeicaDriver),
         Box::new(philips::PhilipsDriver),
         Box::new(ventana::VentanaDriver),
         Box::new(generic_tiff::GenericTiffDriver),
