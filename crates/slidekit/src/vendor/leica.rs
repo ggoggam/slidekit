@@ -155,6 +155,7 @@ impl VendorDriver for LeicaDriver {
                 ndpi: None,
                 mirax: None,
                 zeiss: None,
+                synthetic: None,
             });
         }
 

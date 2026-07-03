@@ -261,6 +261,7 @@ fn open_czi(reader: Arc<dyn SlideReader>) -> Result<SlideData> {
                 reader: reader.clone(),
                 tiles,
             }),
+            synthetic: None,
         });
     }
 

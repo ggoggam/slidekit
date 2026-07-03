@@ -198,6 +198,7 @@ impl VendorDriver for TrestleDriver {
                 ndpi: None,
                 mirax: None,
                 zeiss: None,
+                synthetic: None,
             });
         }
 

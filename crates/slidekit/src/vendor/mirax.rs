@@ -313,6 +313,7 @@ fn open_mirax(dir: &Path) -> Result<SlideData> {
                 image_h: sections[0].image_h,
             }),
             zeiss: None,
+            synthetic: None,
         });
     }
 

@@ -36,6 +36,19 @@ impl OpenSlide {
     /// Open a whole slide image from a local file path.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
+
+        // Synthetic self-test slide: no backing file. Gated exactly like the C
+        // driver (empty filename + `synthetic` debug flag) so it never triggers
+        // for real input.
+        if path.as_os_str().is_empty() {
+            if !vendor::synthetic::debug_enabled() {
+                return Err(OpenSlideError::UnsupportedFormat {
+                    path: path.to_path_buf(),
+                });
+            }
+            return Ok(Self::from_slide_data(vendor::synthetic::open()?));
+        }
+
         if !path.exists() {
             return Err(OpenSlideError::Io(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
@@ -156,19 +169,23 @@ impl OpenSlide {
         match matched {
             Some(idx) => {
                 let driver = &drivers[idx];
-                let data = driver.open(detect_reader, tl)?;
-
-                Ok(Self {
-                    levels: data.levels,
-                    properties: data.properties,
-                    associated_images: data.associated_images,
-                    icc_profile: data.icc_profile,
-                    cache: Cache::default(),
-                    tiff: data.tiff.map(Mutex::new),
-                    async_reader: None,
-                })
+                Ok(Self::from_slide_data(driver.open(detect_reader, tl)?))
             }
             None => Err(OpenSlideError::UnsupportedFormat { path: source }),
+        }
+    }
+
+    /// Build a slide from parsed [`vendor::SlideData`]. Shared by the file-based
+    /// open pipeline and the file-less synthetic entry point.
+    fn from_slide_data(data: vendor::SlideData) -> Self {
+        Self {
+            levels: data.levels,
+            properties: data.properties,
+            associated_images: data.associated_images,
+            icc_profile: data.icc_profile,
+            cache: Cache::default(),
+            tiff: data.tiff.map(Mutex::new),
+            async_reader: None,
         }
     }
 
@@ -262,6 +279,28 @@ impl OpenSlide {
         // single container file, decoded per its own compression/pixel type.
         if let Some(zeiss) = &lvl.zeiss {
             return zeiss.read_region(lx.round() as i64, ly.round() as i64, w, h);
+        }
+
+        // Synthetic levels are one prebuilt image; crop the requested rect out
+        // of it (transparent fill outside), reusing the subtile compositor.
+        if let Some(img) = &lvl.synthetic {
+            let mut out = vec![0u32; (w * h) as usize];
+            composite_subtile(
+                img,
+                lvl.info.width,
+                0,
+                0,
+                lvl.info.width,
+                lvl.info.height,
+                0,
+                0,
+                &mut out,
+                lx.round() as i64,
+                ly.round() as i64,
+                w,
+                h,
+            );
+            return Ok(out);
         }
 
         // Find overlapping tiles
@@ -476,7 +515,11 @@ impl OpenSlide {
         // through the sync reader. Read both via the sync path (positioned
         // reads). ponytail: async subtile/tile fetch if either becomes a hot
         // remote path.
-        if lvl.tilemap.is_some() || lvl.ndpi.is_some() || lvl.mirax.is_some() || lvl.zeiss.is_some()
+        if lvl.tilemap.is_some()
+            || lvl.ndpi.is_some()
+            || lvl.mirax.is_some()
+            || lvl.zeiss.is_some()
+            || lvl.synthetic.is_some()
         {
             return self.read_region(x, y, level, w, h);
         }

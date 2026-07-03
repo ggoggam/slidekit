@@ -173,6 +173,7 @@ impl VendorDriver for PhilipsDriver {
                     ndpi: None,
                     mirax: None,
                     zeiss: None,
+                    synthetic: None,
                 });
             } else if tl.has_tag(dir, tags::IMAGE_DESCRIPTION) {
                 let desc = tl.get_string(dir, tags::IMAGE_DESCRIPTION)?;
@@ -467,6 +468,7 @@ mod tests {
             ndpi: None,
             mirax: None,
             zeiss: None,
+            synthetic: None,
         };
         let mut levels = vec![mk(40000, 30000), mk(20001, 15001), mk(10005, 7505)];
         fix_level_dimensions(&mut levels, &spacings).unwrap();

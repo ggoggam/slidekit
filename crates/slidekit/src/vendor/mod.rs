@@ -4,6 +4,7 @@ pub mod hamamatsu;
 pub mod leica;
 pub mod mirax;
 pub mod philips;
+pub mod synthetic;
 pub mod trestle;
 pub mod ventana;
 pub mod zeiss;
@@ -52,6 +53,10 @@ pub struct LevelData {
     /// carries its own compression/pixel type. When `Some`, the read path reads
     /// tiles through this (which owns the reader) and decodes them internally.
     pub zeiss: Option<crate::vendor::zeiss::ZeissLevel>,
+    /// Synthetic self-test level: the whole level pre-rendered as one row-major
+    /// `width × height` ARGB image. When `Some`, `read_region` crops it directly
+    /// (no file/decoder at read time — everything was decoded at `open`).
+    pub synthetic: Option<Vec<u32>>,
 }
 
 /// Data produced by a vendor driver after opening a slide.

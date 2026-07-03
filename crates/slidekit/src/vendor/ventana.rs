@@ -225,6 +225,7 @@ impl VendorDriver for VentanaDriver {
                 ndpi: None,
                 mirax: None,
                 zeiss: None,
+                synthetic: None,
             });
         }
 

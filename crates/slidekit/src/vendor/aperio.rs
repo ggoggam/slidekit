@@ -140,6 +140,7 @@ impl VendorDriver for AperioDriver {
                     ndpi: None,
                     mirax: None,
                     zeiss: None,
+                    synthetic: None,
                 });
             } else {
                 // Stripped directory → associated image

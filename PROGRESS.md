@@ -157,8 +157,22 @@
 
 ## Phase 5: Vendor Drivers (`vendor/`)
 
+> **Per-vendor requirement (definition of done):** every vendor driver must ship
+> both of the following before it counts as complete. A `[x]` for a real-file
+> format is not done until both exist (or the gap is called out explicitly, e.g.
+> a multi-GB fixture not yet in `testdata.yaml`):
+> 1. **Integration test against a real test slide** — an end-to-end `test_<vendor>.rs`
+>    (detect → open → levels → properties → `read_region` → associated images)
+>    run against a real fixture auto-downloaded + SHA-256-verified via `testdata.yaml`.
+> 2. **Benchmark vs. the OpenSlide test suite** — a case in `bench_openslide.rs`
+>    that cross-checks pixels against the reference OpenSlide `slidetool` output
+>    (tolerant diff for independent JPEG decoders) and records open/read latency.
+>
+> `synthetic` is the sole exception: it has no real file, so its `test_synthetic.rs`
+> self-test and embedded payloads stand in for both.
+
 - [x] `generic_tiff` — generic TIFF fallback (`vendor/generic_tiff.rs`)
-- [ ] `synthetic` — synthetic test slides (no real file needed)
+- [x] `synthetic` — synthetic test slides (`vendor/synthetic.rs`), no real file needed. Ported from `openslide-vendor-synthetic.c`: embeds tiny (16×16) zlib-compressed per-codec payloads and decodes every one at `open` (the self-test), then lays the rendered images out as one 1-row strip via a `LevelData.synthetic` pre-rendered-image read path. Gated behind an empty path + `OPENSLIDE_DEBUG=synthetic` (matches C). Includes the items whose decoders exist here — JPEG (YCbCr/RGB + corrupt-JPEG negative test), tiled JPEG/LZW classic+BigTIFF (via an in-memory `SlideReader`), XML (non-image), Zstd (raw BE-ARGB); **BMP/PNG/JPEG-2000/DICOM items deferred until those decoders land**. `test_synthetic.rs` (1 test, no download needed).
 - [x] `aperio` — Aperio SVS (`vendor/aperio.rs`) — detect + open + properties + associated images + ICC + tile decode
 - [x] `trestle` — Trestle TIFF (`vendor/trestle.rs`) — detect + open + properties + tile decode
 - [x] `philips` — Philips TIFF (`vendor/philips.rs`) — detect + open + XML-driven level fixup + properties (mpp, objective) + associated images + tile decode
