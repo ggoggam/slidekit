@@ -52,3 +52,17 @@ slides:
   - path: Leica/Leica-1.scn
     sha256: 63a3c00fef5215497a9725cf19092a93f7f5ff855ce8561af74b087631831a97
     size: 291812870
+  # Hamamatsu NDPI ("small scan with valid JPEG headers, brightfield"). Exercises
+  # the single-JPEG-per-level restart-marker tiling path end-to-end. sha256 from
+  # the server's index.yaml; size is the served Content-Length.
+  - path: Hamamatsu/CMU-1.ndpi
+    sha256: edf4a1ccf395c7000ae93ad3b44c07d97043810e00be0c1d167dd09bbe436e46
+    size: 198030965
+  # 3DHistech MIRAX (MRXS). A multi-file format: the .zip holds `CMU-1.mrxs`
+  # plus a `CMU-1/` dir of Slidedat.ini, Index.dat, and Data####.dat blobs.
+  # Brightfield, JPEG tiles, SLIDE_VERSION 1.9. Exercises the INI + binary
+  # Index.dat parse and the camera-position tile-placement read path end to end.
+  # sha256/size from the server's index.yaml / Content-Length.
+  - path: Mirax/CMU-1.zip
+    sha256: d9fb29b7d52318a2e61ae9f259449330cab2118026874ea33ff64fe677db3daf
+    size: 565106593

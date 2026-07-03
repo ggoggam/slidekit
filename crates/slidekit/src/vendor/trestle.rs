@@ -195,6 +195,8 @@ impl VendorDriver for TrestleDriver {
                 tiff_tile_width: tile_w,
                 tiff_tile_height: tile_h,
                 tilemap: None,
+                ndpi: None,
+                mirax: None,
             });
         }
 

@@ -13,6 +13,7 @@ use crate::grid::tilemap::TileMap;
 use crate::io::local::LocalFileReader;
 use crate::io::{AsyncReadAt, SlideReader};
 use crate::properties::Properties;
+use crate::vendor::hamamatsu::NdpiLevel;
 use crate::vendor::{self, LevelData};
 
 /// Main entry point for reading whole slide images.
@@ -245,6 +246,18 @@ impl OpenSlide {
             return self.read_region_tilemap(tilemap, lvl, lx, ly, w, h);
         }
 
+        // NDPI levels have no TIFF tiles — each tile is reconstructed from the
+        // level JPEG's restart markers.
+        if let Some(ndpi) = &lvl.ndpi {
+            return self.read_region_ndpi(ndpi, lvl, lx, ly, w, h);
+        }
+
+        // MIRAX levels have no TIFF either — tiles are standalone blobs in
+        // sibling `Data####.dat` files, placed by the MiraxLevel's own index.
+        if let Some(mirax) = &lvl.mirax {
+            return mirax.read_region(&*lvl.decoder, lx.round() as i64, ly.round() as i64, w, h);
+        }
+
         // Find overlapping tiles
         let tiles = lvl.grid.tiles_for_region(lx, ly, w as f64, h as f64);
 
@@ -371,6 +384,52 @@ impl OpenSlide {
         Ok(output)
     }
 
+    /// Read a region from an NDPI level (one giant JPEG, restart-marker tiles).
+    ///
+    /// The grid maps the region to `(col, row)` tiles as usual; each tile is
+    /// reconstructed into a self-contained JPEG and decoded via the level's
+    /// `JpegDecoder`. The TIFF mutex is held for the whole read because the
+    /// restart-marker offsets are resolved through its reader (see
+    /// `hamamatsu.rs` — restart-marker offsets are memoized per level).
+    fn read_region_ndpi(
+        &self,
+        ndpi: &NdpiLevel,
+        lvl: &LevelData,
+        lx: f64,
+        ly: f64,
+        w: i64,
+        h: i64,
+    ) -> Result<Vec<u32>> {
+        let tiff_mutex = self.tiff.as_ref().ok_or_else(|| {
+            OpenSlideError::Decode("No TIFF data available for tile reading".into())
+        })?;
+        let tiff = tiff_mutex.lock();
+        let reader = tiff.reader();
+
+        let tiles = lvl.grid.tiles_for_region(lx, ly, w as f64, h as f64);
+        let mut output = vec![0u32; (w * h) as usize];
+        let (tw, th) = (lvl.tiff_tile_width, lvl.tiff_tile_height);
+        let (ox, oy) = (lx as i64, ly as i64);
+
+        for (col, row) in tiles {
+            if let Some(decoded) = ndpi.decode_tile(reader, col, row, &*lvl.decoder)? {
+                composite_tile(
+                    &decoded,
+                    col * tw,
+                    row * th,
+                    tw,
+                    th,
+                    &mut output,
+                    ox,
+                    oy,
+                    w,
+                    h,
+                );
+            }
+        }
+        Ok(output)
+    }
+
     /// Async counterpart to [`read_region`](Self::read_region).
     ///
     /// For slides opened from an async backend (`open_url`/`open_store` and
@@ -405,11 +464,13 @@ impl OpenSlide {
 
         let lvl = &self.levels[level as usize];
 
-        // Tilemap (Ventana) levels need sub-rect compositing across shared
-        // physical tiles, which the range-fetch path below can't model. Read
-        // them via the sync path (positioned reads). ponytail: async subtile
-        // fetch if remote Ventana ever becomes a hot path.
-        if lvl.tilemap.is_some() {
+        // Tilemap (Ventana) and NDPI levels don't fit the range-fetch path: the
+        // former needs sub-rect compositing across shared physical tiles, the
+        // latter resolves per-tile byte ranges by walking restart markers
+        // through the sync reader. Read both via the sync path (positioned
+        // reads). ponytail: async subtile/tile fetch if either becomes a hot
+        // remote path.
+        if lvl.tilemap.is_some() || lvl.ndpi.is_some() || lvl.mirax.is_some() {
             return self.read_region(x, y, level, w, h);
         }
 
@@ -622,7 +683,7 @@ fn composite_tile(
 /// clipping to the output bounds. [`composite_tile`] is the whole-tile case
 /// (source origin `(0,0)`, stride = tile width).
 #[allow(clippy::too_many_arguments)]
-fn composite_subtile(
+pub(crate) fn composite_subtile(
     tile_pixels: &[u32],
     tile_stride: i64,
     src_x: i64,

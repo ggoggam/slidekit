@@ -1,6 +1,8 @@
 pub mod aperio;
 pub mod generic_tiff;
+pub mod hamamatsu;
 pub mod leica;
+pub mod mirax;
 pub mod philips;
 pub mod trestle;
 pub mod ventana;
@@ -14,6 +16,7 @@ use crate::grid::tilemap::TileMap;
 use crate::io::SlideReader;
 use crate::level::LevelInfo;
 use crate::properties::Properties;
+use crate::vendor::hamamatsu::NdpiLevel;
 
 /// Per-level rendering info needed to read tiles at runtime.
 pub struct LevelData {
@@ -32,6 +35,17 @@ pub struct LevelData {
     /// row-major grid (Ventana BIF AOIs). When `Some`, the read path uses it
     /// instead of `grid`/the row-major index formula; `grid` is then unused.
     pub tilemap: Option<TileMap>,
+    /// Restart-marker tiling state for Hamamatsu NDPI levels, whose whole level
+    /// is one giant JPEG in a single strip (no TIFF tiles). When `Some`, the
+    /// read path reconstructs a per-tile JPEG from this instead of reading
+    /// `tiff_dir`'s tile table; `grid` still maps regions → (col,row).
+    pub ndpi: Option<NdpiLevel>,
+    /// MIRAX per-level tile index. MIRAX is not TIFF-based: each tile is a
+    /// standalone image blob in one of several `Data####.dat` files, located by
+    /// (file, offset, length). When `Some`, the read path reads tiles through
+    /// this (which owns the data-file readers) instead of a TIFF container;
+    /// `grid` maps regions → (col,row).
+    pub mirax: Option<crate::vendor::mirax::MiraxLevel>,
 }
 
 /// Data produced by a vendor driver after opening a slide.
@@ -81,7 +95,10 @@ pub const DETECTION_ORDER: &[&str] = &[
 pub fn all_drivers() -> Vec<Box<dyn VendorDriver>> {
     vec![
         // Drivers are tried in DETECTION_ORDER. More specific vendors
-        // must come before generic-tiff (the fallback).
+        // must come before generic-tiff (the fallback). MIRAX matches only a
+        // `.mrxs` path, so it is safe to try first.
+        Box::new(mirax::MiraxDriver),
+        Box::new(hamamatsu::HamamatsuDriver),
         Box::new(trestle::TrestleDriver),
         Box::new(aperio::AperioDriver),
         Box::new(leica::LeicaDriver),

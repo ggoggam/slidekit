@@ -119,6 +119,8 @@ impl VendorDriver for GenericTiffDriver {
                 tiff_tile_width: d.tile_w,
                 tiff_tile_height: d.tile_h,
                 tilemap: None,
+                ndpi: None,
+                mirax: None,
             });
         }
 

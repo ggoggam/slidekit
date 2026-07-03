@@ -170,6 +170,8 @@ impl VendorDriver for PhilipsDriver {
                     tiff_tile_width: tile_w,
                     tiff_tile_height: tile_h,
                     tilemap: None,
+                    ndpi: None,
+                    mirax: None,
                 });
             } else if tl.has_tag(dir, tags::IMAGE_DESCRIPTION) {
                 let desc = tl.get_string(dir, tags::IMAGE_DESCRIPTION)?;
@@ -461,6 +463,8 @@ mod tests {
             tiff_tile_width: 512,
             tiff_tile_height: 512,
             tilemap: None,
+            ndpi: None,
+            mirax: None,
         };
         let mut levels = vec![mk(40000, 30000), mk(20001, 15001), mk(10005, 7505)];
         fix_level_dimensions(&mut levels, &spacings).unwrap();

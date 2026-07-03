@@ -222,6 +222,8 @@ impl VendorDriver for VentanaDriver {
                 tiff_tile_width: p.tile_w,
                 tiff_tile_height: p.tile_h,
                 tilemap,
+                ndpi: None,
+                mirax: None,
             });
         }
 

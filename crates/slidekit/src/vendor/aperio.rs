@@ -137,6 +137,8 @@ impl VendorDriver for AperioDriver {
                     tiff_tile_width: tile_w,
                     tiff_tile_height: tile_h,
                     tilemap: None,
+                    ndpi: None,
+                    mirax: None,
                 });
             } else {
                 // Stripped directory → associated image

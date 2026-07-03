@@ -1,6 +1,6 @@
 use std::fs::File;
 use std::os::unix::fs::FileExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::error::Result;
 use crate::io::SlideReader;
@@ -12,13 +12,19 @@ use crate::io::SlideReader;
 pub struct LocalFileReader {
     file: File,
     size: u64,
+    path: PathBuf,
 }
 
 impl LocalFileReader {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        let file = File::open(path.as_ref())?;
+        let path = path.as_ref();
+        let file = File::open(path)?;
         let size = file.metadata()?.len();
-        Ok(Self { file, size })
+        Ok(Self {
+            file,
+            size,
+            path: path.to_path_buf(),
+        })
     }
 }
 
@@ -30,5 +36,9 @@ impl SlideReader for LocalFileReader {
 
     fn size(&self) -> Result<u64> {
         Ok(self.size)
+    }
+
+    fn path(&self) -> Option<&Path> {
+        Some(&self.path)
     }
 }

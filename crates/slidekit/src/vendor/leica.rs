@@ -152,6 +152,8 @@ impl VendorDriver for LeicaDriver {
                 tiff_tile_width: l.tw,
                 tiff_tile_height: l.th,
                 tilemap: None,
+                ndpi: None,
+                mirax: None,
             });
         }
 

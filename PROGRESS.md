@@ -67,6 +67,8 @@
 - [x] `test_read_region_async.rs` — async region reads via `object_store`
 - [~] `test_ventana.rs` — detect/open/levels/read_region; gated (skips) until a Ventana fixture is added to `testdata.yaml`
 - [x] `test_leica.rs` — detect/open/levels/properties/read_region/macro against `Leica/Leica-1.scn` (6 tests, passing; gated on download)
+- [x] `test_hamamatsu.rs` — detect/open/levels/properties/read_region (restart-marker tiling)/macro against `Hamamatsu/CMU-1.ndpi` (6 tests, passing; gated on download)
+- [x] `test_mirax.rs` — detect/open/levels/properties/associated/read_region against `Mirax/CMU-1.zip` (6 tests, passing; gated on download)
 - [ ] `test_properties.rs` — property names/values per vendor (not yet created)
 - [ ] `test_associated.rs` — associated image dimensions per vendor (not yet created)
 - [ ] `test_cache.rs` — LRU eviction, shared cache (not yet created)
@@ -144,7 +146,7 @@
 
 - [x] `TileGrid` trait — `tiles_for_region(x, y, w, h)`
 - [x] `SimpleGrid` — regular rectangular tile layout (`grid/simple.rs`)
-- [x] `TileMap` — arbitrary-offset placed (sub)tiles (`grid/tilemap.rs`); built by Ventana from AOI stitch geometry, consumed by `read_region` via an additive `LevelData.tilemap` path (also serves Mirax)
+- [x] `TileMap` — arbitrary-offset placed (sub)tiles (`grid/tilemap.rs`); built by Ventana from AOI stitch geometry, consumed by `read_region` via an additive `LevelData.tilemap` path. (Mirax needs its own non-TIFF byte source, so it uses a separate `LevelData.mirax` / `MiraxLevel` read path rather than this one.)
 - [ ] `RangeGrid` — Z-order / quadtree tiles
 - [x] `Cache` — LRU by capacity, `parking_lot::Mutex` (`cache.rs`)
 - [ ] Shared cache across multiple `OpenSlide` instances
@@ -161,8 +163,8 @@
 - [x] `ventana` — Roche Ventana BIF (`vendor/ventana.rs`) — detect (XMLPacket + iScan) + open + initial-XML properties (objective power, mpp) + level enumeration (level=/mag= validation) + AOI stitch geometry → `TileMap` + associated images (macro/thumbnail) + ICC. Geometry/parse unit-tested; end-to-end `test_ventana.rs` gated on a Ventana fixture not yet in `testdata.yaml` (multi-GB; needs a real sha256/size)
 - [x] `leica` — Leica SCN (`vendor/leica.rs`) — TIFF+XML (not SQLite); detect (`scn` namespace in dir-0 ImageDescription) + open + XML-driven level selection from the main image's `<dimension ifd=…>` children + properties (objective power, mpp, `leica.*` metadata, barcode) + macro associated image (via the new tiled-image decode path) + ICC. Single brightfield main image fully supported; multi-region SCN (multiple main images composited at collection offsets) deferred — the read path keys one IFD per level, so `open` errors clearly. XML parse/classification unit-tested; end-to-end `test_leica.rs` against `Leica/Leica-1.scn` (6 tests passing)
 - [ ] `sakura` — Sakura (SQLite-based)
-- [ ] `hamamatsu` — Hamamatsu VMS/VMU/NDPI (~2300 LOC in C)
-- [ ] `mirax` — 3DHistech MRXS (~1900 LOC in C)
+- [x] `hamamatsu` — Hamamatsu NDPI (`vendor/hamamatsu.rs`) — detect (TIFF + tag 65420) + open + directory classification by source lens (>0 pyramid, -1 macro) + z=0 focal-plane pyramid + **restart-marker JPEG tiling** (each level is one giant single-strip JPEG; tiles reconstructed as header + one restart interval's entropy + EOI, SOF resized, decoded by the stock `JpegDecoder`) via a new `LevelData.ndpi` read path + `NDPI_MCU_STARTS` tag fast-path with lazy restart-marker scan fallback + properties (objective, X/Y offsets, reference, `NDPI_PROPERTY_MAP` → `hamamatsu.*`, mpp) + macro associated image + ICC. JPEG-marker parse / MCU geometry / restart-marker scan / property-map unit-tested; end-to-end `test_hamamatsu.rs` against `Hamamatsu/CMU-1.ndpi` (6 tests passing). **VMS/VMU** (multi-file index formats, need a multi-blob reader), **z-stacks**, and **`scale_denom` derived levels** deferred
+- [x] `mirax` — 3DHistech MRXS (`vendor/mirax.rs`) — multi-file format (`.mrxs` + sibling `Foo/` dir of `Slidedat.ini`, `Index.dat`, `Data####.dat`). Reaches sibling files via the new `SlideReader::path()` (local-only). Parses the INI (levels/datafiles/nonhier groups) + the binary `Index.dat` (hier data pages → `(image_index, offset, length, fileno)` tile entries; nonhier records → associated images + `VIMSLIDE_POSITION_BUFFER`) + the 9-byte camera-position buffer. Builds per-level placed-subtile lists via faithful `mirax.c` geometry (cumulative concat exponents, subtile expansion, `get_tile_position` camera-position math, level-0 active-position filtering), rendered through a new `LevelData.mirax` read path (`MiraxLevel` owns the data-file readers + decodes standalone JPEG blobs). Properties (`mirax.*` dump, objective, mpp, background) + macro/label/thumbnail associated images. INI/nonhier-offset/base-dim/position unit-tested; end-to-end `test_mirax.rs` against `Mirax/CMU-1.zip` (6 tests passing; 10 levels, 109240×220696, verified against the thumbnail). **Fluorescence** (multi-channel), **PNG/BMP tiles**, **`StitchingIntensityLayer` (zlib) position fallback**, and **openslide.bounds-\*** deferred; extreme-zoom levels show faint subtile seams from integer (vs cairo subpixel) compositing
 - [ ] `zeiss` — Zeiss CZI (~1400 LOC in C)
 - [ ] `dicom` — DICOM WSI (~1200 LOC in C)
 

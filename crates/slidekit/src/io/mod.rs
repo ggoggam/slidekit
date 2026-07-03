@@ -22,6 +22,15 @@ pub trait SlideReader: Send + Sync {
     /// Total size of the underlying data source in bytes.
     fn size(&self) -> Result<u64>;
 
+    /// Local filesystem path this reader was opened from, if any.
+    ///
+    /// Only local readers know their path; remote/in-memory readers return
+    /// `None`. Multi-file formats (MIRAX) need it to locate sibling files next
+    /// to the primary file, and so only work over a local path.
+    fn path(&self) -> Option<&std::path::Path> {
+        None
+    }
+
     /// Read exactly `buf.len()` bytes at `offset`, or return an error.
     fn read_exact_at(&self, offset: u64, buf: &mut [u8]) -> Result<()> {
         let mut pos = offset;
