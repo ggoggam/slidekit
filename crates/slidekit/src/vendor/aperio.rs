@@ -11,7 +11,6 @@ use crate::associated::AssociatedImage;
 use crate::color::argb;
 use crate::decode::TileDecoder;
 use crate::decode::deflate::DeflateDecoder;
-use crate::decode::jpeg::JpegDecoder;
 use crate::decode::lzw::{self, LzwDecoder};
 use crate::decode::packbits::PackBitsDecoder;
 use crate::decode::tiff::TiffLike;
@@ -21,7 +20,9 @@ use crate::grid::simple::SimpleGrid;
 use crate::io::SlideReader;
 use crate::level::LevelInfo;
 use crate::properties::{self, Properties};
-use crate::vendor::generic_tiff::{set_resolution_props, set_tiff_string_props};
+use crate::vendor::generic_tiff::{
+    jpeg_decoder_for_dir, set_resolution_props, set_tiff_string_props,
+};
 use crate::vendor::{LevelData, SlideData, VendorDriver};
 
 const APERIO_DESCRIPTION: &str = "Aperio";
@@ -310,13 +311,7 @@ fn make_decoder_for_dir(tl: &mut TiffLike, dir: i64) -> Result<Box<dyn TileDecod
     let compression = tl.compression(dir)? as u16;
 
     match compression {
-        tags::COMPRESSION_JPEG => {
-            let tables = tl.jpeg_tables(dir)?;
-            match tables {
-                Some(t) => Ok(Box::new(JpegDecoder::with_tables(t))),
-                None => Ok(Box::new(JpegDecoder::new())),
-            }
-        }
+        tags::COMPRESSION_JPEG => Ok(Box::new(jpeg_decoder_for_dir(tl, dir)?)),
         tags::COMPRESSION_JP2K_YCBCR | tags::COMPRESSION_JP2K_RGB => {
             // TODO: Add JPEG 2000 decoder support
             Err(OpenSlideError::Decode(format!(
@@ -366,12 +361,7 @@ pub(crate) fn decode_associated_image(
             // Each strip is an independent JPEG — decode separately and stitch
             let strips = tl.read_strips(dir)?;
             let rows_per_strip = tl.rows_per_strip(dir)? as i64;
-            let jpeg_tables = tl.jpeg_tables(dir)?;
-
-            let decoder = match jpeg_tables {
-                Some(t) => JpegDecoder::with_tables(t),
-                None => JpegDecoder::new(),
-            };
+            let decoder = jpeg_decoder_for_dir(tl, dir)?;
 
             let pixel_count = (w * h) as usize;
             let mut argb_buf = Vec::with_capacity(pixel_count);

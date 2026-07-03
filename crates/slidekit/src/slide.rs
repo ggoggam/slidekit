@@ -321,7 +321,7 @@ impl OpenSlide {
         // Actual TIFF tile dimensions for decoding
         let tiff_tile_w = lvl.tiff_tile_width;
         let tiff_tile_h = lvl.tiff_tile_height;
-        let tiles_across = lvl.grid.tiles_across();
+        let tiles_across = tiff_tiles_across(tiff_mutex, lvl.tiff_dir, tiff_tile_w)?;
 
         for (col, row) in tiles {
             // Tile's position in level pixel space (using grid advance)
@@ -541,7 +541,7 @@ impl OpenSlide {
         let grid_tile_h = lvl.grid.tile_h;
         let tiff_tile_w = lvl.tiff_tile_width;
         let tiff_tile_h = lvl.tiff_tile_height;
-        let tiles_across = lvl.grid.tiles_across();
+        let tiles_across = tiff_tiles_across(tiff_mutex, lvl.tiff_dir, tiff_tile_w)?;
 
         // Phase 1 (sync, under lock): resolve each tile's byte range. The mutex
         // guard is released before any await — parking_lot guards are not held
@@ -688,6 +688,22 @@ where
     });
     rx.await
         .map_err(|_| OpenSlideError::Other("slide open thread terminated unexpectedly".into()))?
+}
+
+/// Real TIFF tile-column count for row-major tile indexing, i.e.
+/// `ceil(image_width / tile_width)` read straight from the TIFF.
+///
+/// This is deliberately NOT `grid.tiles_across()`: for overlap formats (Trestle)
+/// the grid's stride is the overlap-adjusted *advance* (tile − overlap), so its
+/// column count exceeds the real TIFF tile grid by one. Using the grid count to
+/// index `tile_index = row * across + col` then drifts by one tile per row —
+/// correct at row 0, badly wrong deep into the slide. For non-overlap formats
+/// the two counts coincide, so this is safe for every vendor.
+fn tiff_tiles_across(tiff: &Mutex<TiffLike>, dir: i64, tile_w: i64) -> Result<i64> {
+    let iw = tiff
+        .lock()
+        .get_uint(dir, crate::decode::tiff::tags::IMAGE_WIDTH)? as i64;
+    Ok((iw + tile_w - 1) / tile_w)
 }
 
 /// Composite a whole decoded tile into the output buffer.

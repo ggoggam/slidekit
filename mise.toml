@@ -76,3 +76,62 @@ depends = ["fmt:check", "lint", "test"]
 [tasks.clean]
 description = "Clean build artifacts"
 run = "cargo clean"
+
+# ── Bench (OpenSlide comparison) ──────────────────────────────────────────────
+# `bench_openslide` cross-checks slidekit against OpenSlide's `slidetool`.
+# Homebrew still ships 4.0.0; this builds 4.0.1 from source into .tools/openslide,
+# which the [env] block below puts on PATH whenever mise is active in the repo.
+
+[tasks."bench:setup-slidetool"]
+description = "Build & install OpenSlide 4.0.1 (slidetool) into .tools/openslide for bench_openslide"
+tools = { meson = "latest", ninja = "latest" }
+run = '''
+#!/usr/bin/env bash
+set -euo pipefail
+
+version=4.0.1
+sha256=df82f6b264f98d11eeb80d85bbb10c7935fcd69c7abae1d610ce49b9a0437faf
+root="${MISE_PROJECT_ROOT:-$(pwd)}"
+prefix="$root/.tools/openslide"
+
+if [ -x "$prefix/bin/slidetool" ] && "$prefix/bin/slidetool" --version 2>&1 | grep -q "$version"; then
+  echo "slidetool $version already installed at $prefix"
+  exit 0
+fi
+
+command -v brew >/dev/null || { echo "Homebrew is required to provide the C build deps" >&2; exit 1; }
+
+# OpenSlide's C dependencies. Idempotent: install only what's missing.
+# (Accumulate into a string, not a bash array-length expansion — brace-hash
+# collides with mise's Tera templating of this run block.)
+deps="glib libtiff openjpeg libpng cairo gdk-pixbuf sqlite libxml2 libdicom zstd jpeg-turbo"
+missing=""
+for d in $deps; do brew list --versions "$d" >/dev/null 2>&1 || missing="$missing $d"; done
+[ -z "$missing" ] || brew install $missing
+
+# Keg-only formulae keep their pkg-config files under their own prefix.
+pc="$(brew --prefix)/lib/pkgconfig:$(brew --prefix)/share/pkgconfig"
+for d in libxml2 libtiff sqlite zstd; do pc="$pc:$(brew --prefix "$d")/lib/pkgconfig"; done
+export PKG_CONFIG_PATH="$pc"
+
+work="$(mktemp -d)"
+trap 'rm -rf "$work"' EXIT
+url="https://github.com/openslide/openslide/releases/download/v$version/openslide-$version.tar.xz"
+echo "Downloading $url"
+curl -fsSL -o "$work/os.tar.xz" "$url"
+echo "$sha256  $work/os.tar.xz" | shasum -a 256 -c -
+tar xf "$work/os.tar.xz" -C "$work"
+
+meson setup "$work/build" "$work/openslide-$version" --prefix="$prefix" -Dbuildtype=release
+meson install -C "$work/build"
+
+echo "Installed: $("$prefix/bin/slidetool" --version 2>&1 | head -1) -> $prefix/bin/slidetool"
+'''
+
+[tasks."bench:openslide"]
+description = "Run the OpenSlide comparison bench (needs slidetool on PATH + warm slide cache)"
+run = "cargo test --release --test bench_openslide -- --ignored --nocapture"
+
+[env]
+# Repo-local slidetool from `mise run bench:setup-slidetool` (harmless if absent).
+_.path = [".tools/openslide/bin"]

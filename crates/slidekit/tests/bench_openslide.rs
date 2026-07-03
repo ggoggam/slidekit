@@ -26,20 +26,25 @@
 mod common;
 
 use slidekit::OpenSlide;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Instant;
 
-/// (relative slide path, level) — one representative real slide per vendor.
+/// (case path, level) — one representative real slide per vendor.
+///
+/// Most are manifest-relative paths resolved straight from the warm cache. The
+/// two ZIP-packaged vendors (Trestle, Mirax) use a bare `Vendor/CMU-1` key that
+/// [`resolve`] maps to the file their test suites extract next to the ZIP; the
+/// JP2K Aperio variants are omitted (slidekit has no JPEG-2000 decoder yet).
 const CASES: &[(&str, i32)] = &[
     ("Aperio/CMU-1.svs", 0),
     ("Hamamatsu/CMU-1.ndpi", 0),
     ("Leica/Leica-1.scn", 0),
     ("Philips-TIFF/Philips-4.tiff", 0),
     ("Generic-TIFF/CMU-1.tiff", 0),
-    // Mirax omitted: multi-file .mrxs needs zip extraction the simple path
-    // resolver here doesn't do; its read path is covered by test_mirax.
-    ("Zeiss/Zeiss-5-Uncompressed.czi", 0), // OpenSlide 4.0 can't read this CZI — slidekit-only row
+    ("Trestle/CMU-1", 0),
+    ("Mirax/CMU-1", 0),
+    ("Zeiss/Zeiss-5-Uncompressed.czi", 0),
     ("Ventana/OS-2.bif", 0),
 ];
 
@@ -71,10 +76,18 @@ fn bench_vs_openslide() {
         eprintln!("NOTE: `slidetool` not on PATH — reporting slidekit latency only.");
     }
 
+    // Optional: dump each reader's region as a PNG for side-by-side inspection.
+    //   SLIDEKIT_BENCH_DUMP=/tmp/cmp cargo test --test bench_openslide -- --ignored
+    let dump_dir = std::env::var_os("SLIDEKIT_BENCH_DUMP").map(PathBuf::from);
+    if let Some(dir) = dump_dir.as_deref() {
+        std::fs::create_dir_all(dir).expect("create dump dir");
+        eprintln!("Dumping regions to {}", dir.display());
+    }
+
     let mut rows = Vec::new();
     for &(rel, level) in CASES {
-        let Some(path) = common::test_slide_path(rel) else {
-            eprintln!("SKIP: {rel} not cached");
+        let Some(path) = resolve(rel) else {
+            eprintln!("SKIP: {rel} not cached (ZIP vendors need their test run once to extract)");
             continue;
         };
 
@@ -92,10 +105,15 @@ fn bench_vs_openslide() {
         let (lw, lh) = slide.level_dimensions(level).unwrap_or((0, 0));
         let w = REGION.min(lw);
         let h = REGION.min(lh);
-        // Center of the level, in level-0 coordinates.
+        // Top-left of the compared window, in level-0 coords. Prefer a spot with
+        // real tissue (many slides have blank centers); fall back to center.
         let ds = slide.level_downsample(level).unwrap_or(1.0);
-        let x0 = (((lw - w) / 2) as f64 * ds) as i64;
-        let y0 = (((lh - h) / 2) as f64 * ds) as i64;
+        let (x0, y0) = tissue_region(&slide, level, w, h).unwrap_or_else(|| {
+            (
+                (((lw - w) / 2) as f64 * ds) as i64,
+                (((lh - h) / 2) as f64 * ds) as i64,
+            )
+        });
 
         let t = Instant::now();
         let sk = slide
@@ -103,11 +121,16 @@ fn bench_vs_openslide() {
             .expect("slidekit read_region");
         let sk_read_ms = ms(t.elapsed());
 
+        let vendor = rel.split('/').next().unwrap_or(rel);
+
         // ── openslide: one cold process, open+read+encode ──
         let (osl_ms, mean_diff, max_diff, opaque_frac) = if have_slidetool {
             match run_slidetool(&path, x0, y0, level, w, h) {
                 Some((osl_ms, rgba)) => {
                     let (mean, max, frac) = diff(&sk, &rgba, (w * h) as usize);
+                    if let Some(dir) = dump_dir.as_deref() {
+                        dump_png(&dir.join(format!("{vendor}_openslide.png")), &rgba, w, h);
+                    }
                     (Some(osl_ms), Some(mean), Some(max), Some(frac))
                 }
                 None => (None, None, None, None),
@@ -115,6 +138,16 @@ fn bench_vs_openslide() {
         } else {
             (None, None, None, None)
         };
+
+        // Dump slidekit's region too, for side-by-side visual comparison.
+        if let Some(dir) = dump_dir.as_deref() {
+            dump_png(
+                &dir.join(format!("{vendor}_slidekit.png")),
+                &argb_to_rgba(&sk),
+                w,
+                h,
+            );
+        }
 
         // Tolerant correctness check — only where there's real opaque overlap to
         // compare (a background-only region tells us nothing about the decoder).
@@ -127,7 +160,7 @@ fn bench_vs_openslide() {
         }
 
         rows.push(Row {
-            vendor: rel.split('/').next().unwrap_or(rel).to_string(),
+            vendor: vendor.to_string(),
             dims: format!("{lw}x{lh}"),
             sk_open_ms,
             sk_read_ms,
@@ -143,6 +176,120 @@ fn bench_vs_openslide() {
         !rows.is_empty(),
         "no slides available — warm the cache first"
     );
+}
+
+/// Pack slidekit's ARGB (0xAARRGGBB) into straight R,G,B,A bytes for PNG.
+fn argb_to_rgba(argb: &[u32]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(argb.len() * 4);
+    for &px in argb {
+        out.push((px >> 16) as u8); // R
+        out.push((px >> 8) as u8); // G
+        out.push(px as u8); // B
+        out.push((px >> 24) as u8); // A
+    }
+    out
+}
+
+/// Write 8-bit RGBA pixels to `path` as a PNG. Best-effort — a failure here
+/// only costs a debug artifact, so it warns rather than aborting the bench.
+fn dump_png(path: &Path, rgba: &[u8], w: i64, h: i64) {
+    let file = match std::fs::File::create(path) {
+        Ok(f) => f,
+        Err(e) => return eprintln!("WARN: cannot write {}: {e}", path.display()),
+    };
+    let mut enc = png::Encoder::new(std::io::BufWriter::new(file), w as u32, h as u32);
+    enc.set_color(png::ColorType::Rgba);
+    enc.set_depth(png::BitDepth::Eight);
+    if let Err(e) = enc
+        .write_header()
+        .and_then(|mut wr| wr.write_image_data(rgba))
+    {
+        eprintln!("WARN: cannot encode {}: {e}", path.display());
+    }
+}
+
+/// Find the WxH window (at `level`, returned as level-0 top-left coords) that
+/// covers the most tissue, by scanning the coarsest pyramid level for non-white
+/// opaque pixels. Returns None if the overview can't be read, so the caller
+/// falls back to slide center.
+///
+/// ponytail: builds a summed-area table over the overview so the best-window
+/// search is O(pixels) instead of O(pixels * window). The coarsest level is a
+/// small thumbnail on real pyramids, so memory/time are trivial.
+fn tissue_region(slide: &OpenSlide, level: i32, w: i64, h: i64) -> Option<(i64, i64)> {
+    let ov = slide.level_count() - 1;
+    let (ow, oh) = slide.level_dimensions(ov)?;
+    if ow <= 0 || oh <= 0 {
+        return None;
+    }
+    let ov_ds = slide.level_downsample(ov)?;
+    let px = slide.read_region(0, 0, ov, ow, oh).ok()?;
+
+    // Tissue mask: opaque and not near-white (dark OR saturated → stain).
+    let (ow, oh) = (ow as usize, oh as usize);
+    let mut sat = vec![0u32; (ow + 1) * (oh + 1)]; // summed-area table, 1px pad
+    let stride = ow + 1;
+    for y in 0..oh {
+        for x in 0..ow {
+            let p = px[y * ow + x];
+            let (r, g, b, a) = ((p >> 16) & 0xff, (p >> 8) & 0xff, p & 0xff, p >> 24);
+            let bright = r.max(g).max(b);
+            let saturation = bright - r.min(g).min(b);
+            let tissue = (a & 0xff) == 0xff && (bright < 210 || saturation > 25);
+            let v = tissue as u32;
+            sat[(y + 1) * stride + (x + 1)] =
+                v + sat[y * stride + (x + 1)] + sat[(y + 1) * stride + x] - sat[y * stride + x];
+        }
+    }
+
+    // Window size at overview scale (level → level-0 → overview px).
+    let target_ds = slide.level_downsample(level)?;
+    let win_w = ((w as f64 * target_ds / ov_ds).round() as usize).clamp(1, ow);
+    let win_h = ((h as f64 * target_ds / ov_ds).round() as usize).clamp(1, oh);
+
+    let sum = |x: usize, y: usize, bw: usize, bh: usize| {
+        sat[(y + bh) * stride + x + bw] + sat[y * stride + x]
+            - sat[y * stride + x + bw]
+            - sat[(y + bh) * stride + x]
+    };
+    let (mut best, mut best_xy) = (0, (0usize, 0usize));
+    for y in 0..=(oh - win_h) {
+        for x in 0..=(ow - win_w) {
+            let s = sum(x, y, win_w, win_h);
+            if s > best {
+                best = s;
+                best_xy = (x, y);
+            }
+        }
+    }
+    if best == 0 {
+        return None; // no tissue found — let caller use center
+    }
+    // Overview top-left → level-0 coords (what read_region expects).
+    Some((
+        (best_xy.0 as f64 * ov_ds) as i64,
+        (best_xy.1 as f64 * ov_ds) as i64,
+    ))
+}
+
+/// Resolve a case to an on-disk slide. Plain single-file slides come straight
+/// from the manifest cache; the two ZIP-packaged vendors are resolved to the
+/// file their test suites extract next to the cached ZIP. The bench assumes a
+/// warm cache, so this only *reads* the extraction — it never creates it (run
+/// `test_trestle` / `test_mirax` once to populate `extracted/`).
+fn resolve(rel: &str) -> Option<PathBuf> {
+    match rel {
+        "Trestle/CMU-1" => extracted("Trestle/CMU-1.zip", "CMU-1.tif"),
+        "Mirax/CMU-1" => extracted("Mirax/CMU-1.zip", "CMU-1.mrxs"),
+        _ => common::test_slide_path(rel),
+    }
+}
+
+/// Path to `extracted/<name>` beside a cached ZIP, if it's already been unpacked.
+fn extracted(zip_rel: &str, name: &str) -> Option<PathBuf> {
+    let zip = common::test_slide_path(zip_rel)?;
+    let path = zip.parent()?.join("extracted").join(name);
+    path.exists().then_some(path)
 }
 
 fn run_slidetool(

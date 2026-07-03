@@ -13,6 +13,12 @@ use super::TileDecoder;
 pub struct JpegDecoder {
     /// Optional JPEG tables (from TIFF JPEGTables tag) to prepend to tile data.
     jpeg_tables: Option<Vec<u8>>,
+    /// Treat the 3 components as R,G,B (interleaved) rather than YCbCr.
+    /// Set for JPEG-in-TIFF tiles whose TIFF PhotometricInterpretation is RGB:
+    /// their components are already R,G,B, but the stream carries no Adobe/JFIF
+    /// marker, so jpeg-decoder would otherwise default to YCbCr and shift color
+    /// (e.g. Aperio "JPEG/RGB" tiles turning neutral gray into magenta).
+    assume_rgb: bool,
 }
 
 impl Default for JpegDecoder {
@@ -24,7 +30,10 @@ impl Default for JpegDecoder {
 impl JpegDecoder {
     /// Create a decoder without JPEG tables (standalone JPEG tiles).
     pub fn new() -> Self {
-        Self { jpeg_tables: None }
+        Self {
+            jpeg_tables: None,
+            assume_rgb: false,
+        }
     }
 
     /// Create a decoder with JPEG tables from the TIFF JPEGTables tag.
@@ -36,7 +45,15 @@ impl JpegDecoder {
     pub fn with_tables(tables: Vec<u8>) -> Self {
         Self {
             jpeg_tables: Some(tables),
+            assume_rgb: false,
         }
+    }
+
+    /// Treat the decoded 3-component data as already-RGB (no YCbCr transform).
+    /// Use when the TIFF PhotometricInterpretation is RGB. See the field docs.
+    pub fn assume_rgb(mut self) -> Self {
+        self.assume_rgb = true;
+        self
     }
 
     /// Build complete JPEG data by prepending tables if needed.
@@ -70,6 +87,12 @@ impl TileDecoder for JpegDecoder {
         let jpeg_data = self.prepare_data(data)?;
 
         let mut decoder = jpeg_decoder::Decoder::new(jpeg_data.as_ref());
+        if self.assume_rgb {
+            // Force interleaved-RGB output. NB: `ColorTransform::None` is *not*
+            // right here — it emits planar output that the RGB24 packer below
+            // would read as scrambled triples. `RGB` gives interleaved R,G,B.
+            decoder.set_color_transform(jpeg_decoder::ColorTransform::RGB);
+        }
         let pixels = decoder
             .decode()
             .map_err(|e| OpenSlideError::Decode(format!("JPEG decode error: {e}")))?;

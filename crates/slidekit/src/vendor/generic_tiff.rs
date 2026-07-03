@@ -146,6 +146,31 @@ impl VendorDriver for GenericTiffDriver {
     }
 }
 
+/// Build a JPEG tile decoder for `dir`, honoring the TIFF PhotometricInterpretation.
+///
+/// TIFF-tiled JPEG streams carry no JFIF/Adobe marker (they rely on the shared
+/// JPEGTables tag), so jpeg-decoder can't tell RGB tiles from YCbCr and defaults
+/// to YCbCr. A `PHOTOMETRIC_RGB` tile already holds R,G,B components; letting the
+/// YCbCr→RGB transform run turns neutral gray magenta (e.g. Aperio "JPEG/RGB").
+/// Read the tag and force RGB interpretation when it says so.
+///
+/// NB: Aperio SVS also sets a `YCbCrSubSampling` tag of 2,2 on these RGB tiles,
+/// but it's spurious — the JPEG frame headers declare 1×1 sampling and the data
+/// really is RGB. So the subsampling tag must NOT be used to second-guess the
+/// photometric here; trust `PHOTOMETRIC_RGB`.
+pub(crate) fn jpeg_decoder_for_dir(tl: &mut TiffLike, dir: i64) -> Result<JpegDecoder> {
+    let is_rgb = tl.has_tag(dir, tags::PHOTOMETRIC)
+        && tl.get_uint(dir, tags::PHOTOMETRIC)? == tags::PHOTOMETRIC_RGB as u64;
+    let mut dec = match tl.jpeg_tables(dir)? {
+        Some(t) => JpegDecoder::with_tables(t),
+        None => JpegDecoder::new(),
+    };
+    if is_rgb {
+        dec = dec.assume_rgb();
+    }
+    Ok(dec)
+}
+
 /// Create a tile decoder appropriate for the compression of a TIFF directory.
 ///
 /// Errors on an unsupported compression scheme, which doubles as the
@@ -158,13 +183,7 @@ pub(crate) fn make_decoder_for_dir(tl: &mut TiffLike, dir: i64) -> Result<Box<dy
     };
 
     match compression as u16 {
-        tags::COMPRESSION_JPEG => {
-            let tables = tl.jpeg_tables(dir)?;
-            match tables {
-                Some(t) => Ok(Box::new(JpegDecoder::with_tables(t))),
-                None => Ok(Box::new(JpegDecoder::new())),
-            }
-        }
+        tags::COMPRESSION_JPEG => Ok(Box::new(jpeg_decoder_for_dir(tl, dir)?)),
         tags::COMPRESSION_LZW => Ok(Box::new(LzwDecoder::for_dir(tl, dir)?)),
         tags::COMPRESSION_DEFLATE | tags::COMPRESSION_DEFLATE_OLD => {
             Ok(Box::new(DeflateDecoder::for_dir(tl, dir)?))
