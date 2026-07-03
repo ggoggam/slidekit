@@ -9,6 +9,9 @@
 //! `src/vendor/mirax.rs`; these exercise the full open + tile-placement read
 //! path against real pixels. The slide is ~565 MiB, so they skip via
 //! `require_mirax_slide!` when downloads are disabled.
+//!
+//! Assertions about the same slide are grouped so we open it a single time per
+//! test rather than re-parsing it once per assertion.
 
 mod common;
 
@@ -57,17 +60,17 @@ macro_rules! require_mirax_slide {
     };
 }
 
+/// Everything we can assert about the extracted `CMU-1.mrxs` from a single open.
 #[test]
-fn detect_vendor_mirax() {
+fn cmu1() {
     let path = require_mirax_slide!();
-    assert_eq!(OpenSlide::detect_vendor(&path).as_deref(), Some("mirax"));
-}
 
-#[test]
-fn open_pyramid_levels() {
-    let path = require_mirax_slide!();
+    // ── Detection ──
+    assert_eq!(OpenSlide::detect_vendor(&path).as_deref(), Some("mirax"));
+
     let slide = OpenSlide::open(&path).expect("should open MIRAX CMU-1");
 
+    // ── Pyramid levels ──
     // CMU-1.mrxs is the canonical 10-level, ~109240x220696 slide.
     assert_eq!(slide.level_count(), 10);
     assert_eq!(slide.level0_dimensions(), (109240, 220696));
@@ -83,13 +86,8 @@ fn open_pyramid_levels() {
         let (pw, ph) = slide.level_dimensions(i - 1).unwrap();
         assert!(w < pw && h < ph, "level {i} should be smaller");
     }
-}
 
-#[test]
-fn properties_vendor_and_metadata() {
-    let path = require_mirax_slide!();
-    let slide = OpenSlide::open(&path).unwrap();
-
+    // ── Properties: vendor and metadata ──
     assert_eq!(slide.property_value("openslide.vendor"), Some("mirax"));
     assert_eq!(
         slide.property_value("openslide.objective-power"),
@@ -105,13 +103,8 @@ fn properties_vendor_and_metadata() {
             .any(|n| n.starts_with("mirax.GENERAL.")),
         "expected mirax.GENERAL.* properties from Slidedat.ini"
     );
-}
 
-#[test]
-fn associated_images_present() {
-    let path = require_mirax_slide!();
-    let slide = OpenSlide::open(&path).unwrap();
-
+    // ── Associated images ──
     // OpenSlide's naming: SlideThumbnail→macro, SlideBarcode→label,
     // SlidePreview→thumbnail. All three are JPEG in CMU-1.
     let names = slide.associated_image_names();
@@ -124,13 +117,8 @@ fn associated_images_present() {
         assert_eq!(px.len(), (w * h) as usize);
         assert!(px.iter().all(|&p| (p >> 24) == 0xFF), "{want} not opaque");
     }
-}
 
-#[test]
-fn read_region_over_tissue_is_well_formed() {
-    let path = require_mirax_slide!();
-    let slide = OpenSlide::open(&path).unwrap();
-
+    // ── read_region over tissue is well-formed ──
     // The scanned tissue sits around x∈[10k,77k], y∈[89k,183k] in level-0
     // pixels; read a region squarely inside it.
     let px = slide.read_region(20000, 100000, 0, 512, 512).unwrap();
@@ -144,13 +132,8 @@ fn read_region_over_tissue_is_well_formed() {
         px.iter().filter(|&&p| p != 0).all(|&p| (p >> 24) == 0xFF),
         "decoded pixels should be opaque"
     );
-}
 
-#[test]
-fn read_smallest_level_has_tissue() {
-    let path = require_mirax_slide!();
-    let slide = OpenSlide::open(&path).unwrap();
-
+    // ── Smallest level shows the tissue ──
     let last = slide.level_count() - 1;
     let (w, h) = slide.level_dimensions(last).unwrap();
     let px = slide.read_region(0, 0, last, w, h).expect("read smallest");

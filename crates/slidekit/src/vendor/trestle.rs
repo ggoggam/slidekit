@@ -197,6 +197,7 @@ impl VendorDriver for TrestleDriver {
                 tilemap: None,
                 ndpi: None,
                 mirax: None,
+                zeiss: None,
             });
         }
 

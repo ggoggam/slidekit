@@ -224,6 +224,7 @@ impl VendorDriver for VentanaDriver {
                 tilemap,
                 ndpi: None,
                 mirax: None,
+                zeiss: None,
             });
         }
 

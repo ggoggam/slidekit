@@ -258,6 +258,12 @@ impl OpenSlide {
             return mirax.read_region(&*lvl.decoder, lx.round() as i64, ly.round() as i64, w, h);
         }
 
+        // Zeiss CZI levels are likewise non-TIFF: each tile is a subblock in the
+        // single container file, decoded per its own compression/pixel type.
+        if let Some(zeiss) = &lvl.zeiss {
+            return zeiss.read_region(lx.round() as i64, ly.round() as i64, w, h);
+        }
+
         // Find overlapping tiles
         let tiles = lvl.grid.tiles_for_region(lx, ly, w as f64, h as f64);
 
@@ -470,7 +476,8 @@ impl OpenSlide {
         // through the sync reader. Read both via the sync path (positioned
         // reads). ponytail: async subtile/tile fetch if either becomes a hot
         // remote path.
-        if lvl.tilemap.is_some() || lvl.ndpi.is_some() || lvl.mirax.is_some() {
+        if lvl.tilemap.is_some() || lvl.ndpi.is_some() || lvl.mirax.is_some() || lvl.zeiss.is_some()
+        {
             return self.read_region(x, y, level, w, h);
         }
 

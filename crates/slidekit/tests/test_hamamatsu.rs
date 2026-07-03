@@ -7,6 +7,9 @@
 //! `OPENSLIDE_SKIP_DOWNLOAD`). The JPEG-marker parsing and restart-marker
 //! scanning are unit-tested in `src/vendor/hamamatsu.rs`; these exercise the
 //! end-to-end open + restart-marker tiling read path against real pixels.
+//!
+//! Each slide is opened a single time per test — assertions about the same
+//! slide are grouped so we don't re-parse it once per assertion.
 
 mod common;
 
@@ -14,20 +17,20 @@ use slidekit::OpenSlide;
 
 const SLIDE: &str = "Hamamatsu/CMU-1.ndpi";
 
+/// Everything we can assert about `CMU-1.ndpi` from a single open.
 #[test]
-fn detect_vendor_hamamatsu() {
+fn cmu1() {
     let path = require_slide!(SLIDE);
+
+    // ── Detection ──
     assert_eq!(
         OpenSlide::detect_vendor(&path).as_deref(),
         Some("hamamatsu")
     );
-}
 
-#[test]
-fn open_ndpi_pyramid() {
-    let path = require_slide!(SLIDE);
     let slide = OpenSlide::open(&path).expect("should open Hamamatsu NDPI");
 
+    // ── Levels: pyramid ──
     assert!(slide.level_count() >= 1, "expected at least one level");
 
     let (w0, h0) = slide.level0_dimensions();
@@ -47,13 +50,8 @@ fn open_ndpi_pyramid() {
             "level {i} should be smaller than previous"
         );
     }
-}
 
-#[test]
-fn properties_vendor_and_metadata() {
-    let path = require_slide!(SLIDE);
-    let slide = OpenSlide::open(&path).unwrap();
-
+    // ── Properties: vendor and metadata ──
     assert_eq!(slide.property_value("openslide.vendor"), Some("hamamatsu"));
     assert!(
         slide
@@ -75,13 +73,8 @@ fn properties_vendor_and_metadata() {
         slide.property_value("openslide.mpp-x").is_some(),
         "expected openslide.mpp-x"
     );
-}
 
-#[test]
-fn read_region_level0_is_well_formed() {
-    let path = require_slide!(SLIDE);
-    let slide = OpenSlide::open(&path).unwrap();
-
+    // ── read_region: level 0 ──
     // Reads spanning several restart-marker tiles of the base level.
     let pixels = slide.read_region(0, 0, 0, 512, 512).unwrap();
     assert_eq!(pixels.len(), 512 * 512);
@@ -94,13 +87,8 @@ fn read_region_level0_is_well_formed() {
         pixels.iter().all(|&p| (p >> 24) == 0xFF),
         "decoded pixels should be opaque"
     );
-}
 
-#[test]
-fn read_smallest_level_has_tissue() {
-    let path = require_slide!(SLIDE);
-    let slide = OpenSlide::open(&path).unwrap();
-
+    // ── read_region: smallest level ──
     let last = slide.level_count() - 1;
     let (w, h) = slide.level_dimensions(last).unwrap();
     let rw = w.min(2048);
@@ -114,13 +102,8 @@ fn read_smallest_level_has_tissue() {
         pixels.iter().any(|&p| p != 0),
         "smallest level should contain visible content"
     );
-}
 
-#[test]
-fn macro_associated_image_present() {
-    let path = require_slide!(SLIDE);
-    let slide = OpenSlide::open(&path).unwrap();
-
+    // ── Associated images: macro ──
     // NDPI files carry a macro overview (source lens -1); if our whole-JPEG
     // decode handled it, it surfaces here. Report rather than hard-fail so a
     // variant without one doesn't break the suite.

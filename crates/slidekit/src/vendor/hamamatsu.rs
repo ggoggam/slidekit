@@ -135,6 +135,7 @@ impl VendorDriver for HamamatsuDriver {
                     tilemap: None,
                     ndpi: Some(lvl),
                     mirax: None,
+                    zeiss: None,
                 }
             })
             .collect();

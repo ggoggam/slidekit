@@ -121,6 +121,7 @@ impl VendorDriver for GenericTiffDriver {
                 tilemap: None,
                 ndpi: None,
                 mirax: None,
+                zeiss: None,
             });
         }
 

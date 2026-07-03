@@ -66,3 +66,26 @@ slides:
   - path: Mirax/CMU-1.zip
     sha256: d9fb29b7d52318a2e61ae9f259449330cab2118026874ea33ff64fe677db3daf
     size: 565106593
+  # Zeiss CZI (ZISRAW). Mouse kidney, trichrome, brightfield, 10x, two scenes,
+  # uncompressed pyramidal (Axioscan 7). The main end-to-end fixture: exercises
+  # the CZI segment/subblock-directory parse and the placed-subtile read path
+  # against real BGR pixels. Large (~1 GiB) but it is the only server CZI whose
+  # compression this driver (like OpenSlide's own) supports for the main image.
+  - path: Zeiss/Zeiss-5-Uncompressed.czi
+    sha256: 5c794c0a118e11a1061e246786c0da8dc0492befa5d48f42353816c043d87999
+    size: 1053758432
+  # SlidePreview attachment (48 bpp) re-encoded with zstd v0 — exercises the
+  # Zstd0 decode path. sha256 from the server's index.yaml.
+  - path: Zeiss/Zeiss-5-SlidePreview-Zstd0.czi
+    sha256: 920c10f45b781591d7a46759e692e18e14278c2d41b069b518f81fda0748dd22
+    size: 1955488
+  # Same preview, HiLo byte-packed and zstd v1 compressed — exercises the Zstd1
+  # header parse + hi/lo unpack path. sha256 from the server's index.yaml.
+  - path: Zeiss/Zeiss-5-SlidePreview-Zstd1-HiLo.czi
+    sha256: fd5cea806a557954e2ff63c2eb0dd23c83fe05d4900aac9d81a4af2a412288b0
+    size: 1885344
+  # JPEG XR pyramidal CZI. Detected as Zeiss but unsupported (OpenSlide rejects
+  # JXR too); the test asserts a clean unsupported-compression error on open.
+  - path: Zeiss/Zeiss-5-JXR.czi
+    sha256: c202ddf7b0bd473cdbe29977aee07c10c207077779485c0b1f876e8c00da77f7
+    size: 68811968

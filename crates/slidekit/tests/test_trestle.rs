@@ -2,6 +2,9 @@
 //!
 //! Unit tests use synthetic TIFF data. Integration tests use real test data
 //! from the OpenSlide test data server (Trestle/CMU-1.zip → CMU-1.tif).
+//!
+//! Each real slide is opened a single time per test — assertions about the same
+//! slide are grouped so we don't re-parse it once per assertion.
 
 mod common;
 
@@ -402,18 +405,18 @@ macro_rules! require_trestle_slide {
     };
 }
 
+/// Everything we can assert about `CMU-1.tif` from a single open.
 #[test]
-fn integration_detect_vendor() {
+fn cmu1() {
     let path = require_trestle_slide!();
+
+    // ── Detection ──
     let vendor = OpenSlide::detect_vendor(&path);
     assert_eq!(vendor.as_deref(), Some("trestle"));
-}
 
-#[test]
-fn integration_open_and_levels() {
-    let path = require_trestle_slide!();
     let slide = OpenSlide::open(&path).expect("should open Trestle CMU-1.tif");
 
+    // ── Levels ──
     assert!(slide.level_count() >= 1, "expected at least one level");
 
     let (w0, h0) = slide.level0_dimensions();
@@ -424,24 +427,13 @@ fn integration_open_and_levels() {
         (ds0 - 1.0).abs() < f64::EPSILON,
         "level 0 downsample should be 1.0"
     );
-}
 
-#[test]
-fn integration_properties_vendor() {
-    let path = require_trestle_slide!();
-    let slide = OpenSlide::open(&path).unwrap();
-
+    // ── Properties ──
     assert_eq!(
         slide.property_value("openslide.vendor"),
         Some("trestle"),
         "vendor should be 'trestle'"
     );
-}
-
-#[test]
-fn integration_properties_trestle_specific() {
-    let path = require_trestle_slide!();
-    let slide = OpenSlide::open(&path).unwrap();
 
     let names = slide.property_names();
     let trestle_props: Vec<_> = names.iter().filter(|n| n.starts_with("trestle.")).collect();
@@ -449,13 +441,8 @@ fn integration_properties_trestle_specific() {
         !trestle_props.is_empty(),
         "should have trestle.* properties from ImageDescription"
     );
-}
 
-#[test]
-fn integration_read_region() {
-    let path = require_trestle_slide!();
-    let slide = OpenSlide::open(&path).unwrap();
-
+    // ── read_region ──
     let pixels = slide.read_region(0, 0, 0, 256, 256).unwrap();
     assert_eq!(pixels.len(), 256 * 256);
 

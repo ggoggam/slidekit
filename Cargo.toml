@@ -27,6 +27,7 @@ bytes = "1"
 jpeg-decoder = "0.3"
 weezl = "0.1"
 miniz_oxide = "0.8"
+ruzstd = "0.7"
 object_store = { version = "0.14", features = ["aws", "gcp", "azure", "http"] }
 tokio = { version = "1", features = ["rt-multi-thread", "sync"] }
 url = "2"

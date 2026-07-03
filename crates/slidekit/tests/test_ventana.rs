@@ -7,6 +7,9 @@
 //! enumeration, and AOI stitch geometry are unit-tested in
 //! `src/vendor/ventana.rs`; these exercise the end-to-end open + tilemap read
 //! path against real pixels.
+//!
+//! The slide is opened a single time per test — assertions about the same slide
+//! are grouped so we don't re-parse it once per assertion.
 
 mod common;
 
@@ -14,17 +17,17 @@ use slidekit::OpenSlide;
 
 const SLIDE: &str = "Ventana/OS-2.bif";
 
+/// Everything we can assert about `Ventana/OS-2.bif` from a single open.
 #[test]
-fn detect_vendor_ventana() {
+fn os_2() {
     let path = require_slide!(SLIDE);
-    assert_eq!(OpenSlide::detect_vendor(&path).as_deref(), Some("ventana"));
-}
 
-#[test]
-fn open_ventana_pyramid() {
-    let path = require_slide!(SLIDE);
+    // ── Detection ──
+    assert_eq!(OpenSlide::detect_vendor(&path).as_deref(), Some("ventana"));
+
     let slide = OpenSlide::open(&path).expect("should open Ventana BIF");
 
+    // ── Levels ──
     assert!(slide.level_count() >= 1, "expected at least one level");
 
     let (w0, h0) = slide.level0_dimensions();
@@ -44,13 +47,8 @@ fn open_ventana_pyramid() {
             "level {i} should be smaller than previous"
         );
     }
-}
 
-#[test]
-fn properties_vendor_and_objective() {
-    let path = require_slide!(SLIDE);
-    let slide = OpenSlide::open(&path).unwrap();
-
+    // ── Properties ──
     assert_eq!(slide.property_value("openslide.vendor"), Some("ventana"));
     // iScan attributes are surfaced under the ventana.* namespace.
     assert!(
@@ -60,23 +58,13 @@ fn properties_vendor_and_objective() {
             .any(|n| n.starts_with("ventana.")),
         "expected ventana.* properties from the iScan metadata"
     );
-}
 
-#[test]
-fn read_region_level0_is_well_formed() {
-    let path = require_slide!(SLIDE);
-    let slide = OpenSlide::open(&path).unwrap();
-
+    // ── read_region (level 0) ──
     // The AOI tilemap should composite real tissue somewhere near the origin.
     let pixels = slide.read_region(0, 0, 0, 512, 512).unwrap();
     assert_eq!(pixels.len(), 512 * 512);
-}
 
-#[test]
-fn read_smallest_level_has_tissue() {
-    let path = require_slide!(SLIDE);
-    let slide = OpenSlide::open(&path).unwrap();
-
+    // ── read_region (smallest level) ──
     let last = slide.level_count() - 1;
     let (w, h) = slide.level_dimensions(last).unwrap();
     let rw = w.min(2048);

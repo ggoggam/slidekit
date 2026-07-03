@@ -97,6 +97,33 @@ fn verify_sha256(path: &Path, expected: &str) -> bool {
     format!("{:x}", hasher.finalize()) == expected
 }
 
+/// Path of the on-disk "already verified" sentinel for a cached slide.
+fn sentinel_path(local: &Path) -> PathBuf {
+    local.with_extension("verified")
+}
+
+/// Whether `local` has a valid verification sentinel: it records the expected
+/// SHA and is at least as new as the slide file. This lets a fresh process skip
+/// the multi-GB re-hash — nextest runs every test in its own process, so the
+/// in-process [`VERIFIED`] memo alone would re-hash once per test.
+fn sentinel_ok(local: &Path, expected: &str) -> bool {
+    let sentinel = sentinel_path(local);
+    let (Ok(recorded), Ok(sm), Ok(fm)) = (
+        fs::read_to_string(&sentinel),
+        sentinel.metadata().and_then(|m| m.modified()),
+        local.metadata().and_then(|m| m.modified()),
+    ) else {
+        return false;
+    };
+    // Stale if the slide was rewritten after the sentinel (e.g. re-downloaded).
+    recorded.trim() == expected && sm >= fm
+}
+
+/// Record that `local` matches `expected` so other processes skip re-hashing.
+fn write_sentinel(local: &Path, expected: &str) {
+    fs::write(sentinel_path(local), expected).ok();
+}
+
 /// Download a file from the test data server.
 fn download_file(url: &str, dest: &Path) -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("Downloading {} ...", url);
@@ -149,6 +176,14 @@ pub fn test_slide_path(relative_path: &str) -> Option<PathBuf> {
         return Some(local);
     }
 
+    // Cross-process warm path: a prior process left a valid sentinel, so skip
+    // both the flock and the multi-GB re-hash. Critical under nextest, which
+    // runs each test in its own process (the in-process memo above never hits).
+    if sentinel_ok(&local, &entry.sha256) {
+        VERIFIED.lock().unwrap().insert(local.clone());
+        return Some(local);
+    }
+
     // First-time resolution: serialize it per slide so a fixture shared by
     // several tests is verified/downloaded once, not once per test. libtest
     // runs test fns on parallel threads (and nextest across processes), which
@@ -170,8 +205,9 @@ pub fn test_slide_path(relative_path: &str) -> Option<PathBuf> {
         return Some(local);
     }
 
-    // Cached and intact? Hash it once, record it, done.
+    // Cached and intact? Hash it once, record it (memo + on-disk sentinel), done.
     if local.exists() && verify_sha256(&local, &entry.sha256) {
+        write_sentinel(&local, &entry.sha256);
         VERIFIED.lock().unwrap().insert(local.clone());
         return Some(local);
     }
@@ -180,6 +216,7 @@ pub fn test_slide_path(relative_path: &str) -> Option<PathBuf> {
     match download_file(&url, &local) {
         Ok(()) => {
             if verify_sha256(&local, &entry.sha256) {
+                write_sentinel(&local, &entry.sha256);
                 VERIFIED.lock().unwrap().insert(local.clone());
                 Some(local)
             } else {

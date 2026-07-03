@@ -7,6 +7,9 @@
 //! `OPENSLIDE_SKIP_DOWNLOAD`). The XML parsing and main/macro classification are
 //! unit-tested in `src/vendor/leica.rs`; these exercise the end-to-end open +
 //! read path against real pixels.
+//!
+//! The slide is opened a single time per test — assertions about the same slide
+//! are grouped so we don't re-parse it once per assertion.
 
 mod common;
 
@@ -14,17 +17,17 @@ use slidekit::OpenSlide;
 
 const SLIDE: &str = "Leica/Leica-1.scn";
 
+/// Everything we can assert about `Leica-1.scn` from a single open.
 #[test]
-fn detect_vendor_leica() {
+fn leica_1() {
     let path = require_slide!(SLIDE);
-    assert_eq!(OpenSlide::detect_vendor(&path).as_deref(), Some("leica"));
-}
 
-#[test]
-fn open_leica_pyramid() {
-    let path = require_slide!(SLIDE);
+    // ── Detection ──
+    assert_eq!(OpenSlide::detect_vendor(&path).as_deref(), Some("leica"));
+
     let slide = OpenSlide::open(&path).expect("should open Leica SCN");
 
+    // ── Levels (pyramid) ──
     assert!(slide.level_count() >= 1, "expected at least one level");
 
     let (w0, h0) = slide.level0_dimensions();
@@ -44,13 +47,8 @@ fn open_leica_pyramid() {
             "level {i} should be smaller than previous"
         );
     }
-}
 
-#[test]
-fn properties_vendor_and_metadata() {
-    let path = require_slide!(SLIDE);
-    let slide = OpenSlide::open(&path).unwrap();
-
+    // ── Properties (vendor + metadata) ──
     assert_eq!(slide.property_value("openslide.vendor"), Some("leica"));
     assert!(
         slide
@@ -67,22 +65,12 @@ fn properties_vendor_and_metadata() {
         op.parse::<f64>().is_ok(),
         "objective-power {op:?} not numeric"
     );
-}
 
-#[test]
-fn read_region_level0_is_well_formed() {
-    let path = require_slide!(SLIDE);
-    let slide = OpenSlide::open(&path).unwrap();
-
+    // ── read_region: level 0 is well-formed ──
     let pixels = slide.read_region(0, 0, 0, 512, 512).unwrap();
     assert_eq!(pixels.len(), 512 * 512);
-}
 
-#[test]
-fn read_smallest_level_has_tissue() {
-    let path = require_slide!(SLIDE);
-    let slide = OpenSlide::open(&path).unwrap();
-
+    // ── Smallest level has visible tissue ──
     let last = slide.level_count() - 1;
     let (w, h) = slide.level_dimensions(last).unwrap();
     let rw = w.min(2048);
@@ -96,13 +84,8 @@ fn read_smallest_level_has_tissue() {
         pixels.iter().any(|&p| p != 0),
         "smallest level should contain visible content"
     );
-}
 
-#[test]
-fn macro_associated_image_present() {
-    let path = require_slide!(SLIDE);
-    let slide = OpenSlide::open(&path).unwrap();
-
+    // ── Macro associated image ──
     // SCN files carry a macro overview; if our strip-based associated-image
     // decode handled it, it surfaces here. Report rather than hard-fail so a
     // tiled-macro variant doesn't break the suite (see leica.rs deferrals).

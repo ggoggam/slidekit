@@ -44,13 +44,16 @@ if [ "$total" -gt "$limit" ]; then
   export OPENSLIDE_SKIP_DOWNLOAD=1
 fi
 
-cargo test --workspace
+# nextest runs every test binary's tests in one global pool, so the I/O-bound
+# integration binaries overlap instead of running one binary at a time.
+# (nextest doesn't run doctests; this crate has none.)
+cargo nextest run --workspace
 '''
 
 [tasks."test:unit"]
 description = "Run unit + network-free tests only (no slide downloads)"
 env = { OPENSLIDE_SKIP_DOWNLOAD = "1" }
-run = "cargo test --workspace"
+run = "cargo nextest run --workspace"
 
 # ── Lint & Format ─────────────────────────────────────────────────────────────
 

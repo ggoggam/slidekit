@@ -6,6 +6,7 @@ pub mod mirax;
 pub mod philips;
 pub mod trestle;
 pub mod ventana;
+pub mod zeiss;
 
 use crate::associated::AssociatedImage;
 use crate::decode::TileDecoder;
@@ -46,6 +47,11 @@ pub struct LevelData {
     /// this (which owns the data-file readers) instead of a TIFF container;
     /// `grid` maps regions → (col,row).
     pub mirax: Option<crate::vendor::mirax::MiraxLevel>,
+    /// Zeiss CZI per-level tile index. CZI is a single-file segmented container,
+    /// not TIFF: each tile is a subblock located by absolute file offset and
+    /// carries its own compression/pixel type. When `Some`, the read path reads
+    /// tiles through this (which owns the reader) and decodes them internally.
+    pub zeiss: Option<crate::vendor::zeiss::ZeissLevel>,
 }
 
 /// Data produced by a vendor driver after opening a slide.
@@ -98,6 +104,7 @@ pub fn all_drivers() -> Vec<Box<dyn VendorDriver>> {
         // must come before generic-tiff (the fallback). MIRAX matches only a
         // `.mrxs` path, so it is safe to try first.
         Box::new(mirax::MiraxDriver),
+        Box::new(zeiss::ZeissDriver),
         Box::new(hamamatsu::HamamatsuDriver),
         Box::new(trestle::TrestleDriver),
         Box::new(aperio::AperioDriver),
