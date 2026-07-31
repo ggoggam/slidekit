@@ -156,6 +156,7 @@ impl VendorDriver for LeicaDriver {
                 mirax: None,
                 zeiss: None,
                 synthetic: None,
+                dicom: None,
             });
         }
 

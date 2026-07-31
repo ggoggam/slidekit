@@ -262,6 +262,7 @@ fn open_czi(reader: Arc<dyn SlideReader>) -> Result<SlideData> {
                 tiles,
             }),
             synthetic: None,
+            dicom: None,
         });
     }
 

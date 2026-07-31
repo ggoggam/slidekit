@@ -1,4 +1,5 @@
 pub mod deflate;
+pub mod dicom;
 pub mod jpeg;
 pub mod lzw;
 pub mod packbits;

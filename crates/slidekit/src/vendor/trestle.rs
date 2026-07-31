@@ -200,6 +200,7 @@ impl VendorDriver for TrestleDriver {
                 mirax: None,
                 zeiss: None,
                 synthetic: None,
+                dicom: None,
             });
         }
 

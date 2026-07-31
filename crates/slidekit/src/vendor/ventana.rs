@@ -226,6 +226,7 @@ impl VendorDriver for VentanaDriver {
                 mirax: None,
                 zeiss: None,
                 synthetic: None,
+                dicom: None,
             });
         }
 

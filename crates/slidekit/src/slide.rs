@@ -281,6 +281,12 @@ impl OpenSlide {
             return zeiss.read_region(lx.round() as i64, ly.round() as i64, w, h);
         }
 
+        // DICOM levels are frames of one (or a concatenation of) SOP instances,
+        // each located and decoded by the level itself.
+        if let Some(dicom) = &lvl.dicom {
+            return dicom.read_region(lx.round() as i64, ly.round() as i64, w, h);
+        }
+
         // Synthetic levels are one prebuilt image; crop the requested rect out
         // of it (transparent fill outside), reusing the subtile compositor.
         if let Some(img) = &lvl.synthetic {
@@ -520,6 +526,7 @@ impl OpenSlide {
             || lvl.mirax.is_some()
             || lvl.zeiss.is_some()
             || lvl.synthetic.is_some()
+            || lvl.dicom.is_some()
         {
             return self.read_region(x, y, level, w, h);
         }

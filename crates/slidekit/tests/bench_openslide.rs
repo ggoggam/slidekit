@@ -33,9 +33,12 @@ use std::time::Instant;
 /// (case path, level) — one representative real slide per vendor.
 ///
 /// Most are manifest-relative paths resolved straight from the warm cache. The
-/// two ZIP-packaged vendors (Trestle, Mirax) use a bare `Vendor/CMU-1` key that
-/// [`resolve`] maps to the file their test suites extract next to the ZIP; the
-/// JP2K Aperio variants are omitted (slidekit has no JPEG-2000 decoder yet).
+/// ZIP-packaged vendors (Trestle, Mirax, DICOM) use a bare `Vendor/Name` key
+/// that [`resolve`] maps to the file their test suites extract next to the ZIP;
+/// the JP2K Aperio variants are omitted (slidekit has no JPEG-2000 decoder yet).
+/// Both DICOM slides are listed because they exercise different frame layouts
+/// (sparse vs. TILED_FULL), which is exactly the kind of tile-placement bug a
+/// pixel cross-check catches.
 const CASES: &[(&str, i32)] = &[
     ("Aperio/CMU-1.svs", 0),
     ("Hamamatsu/CMU-1.ndpi", 0),
@@ -46,6 +49,8 @@ const CASES: &[(&str, i32)] = &[
     ("Mirax/CMU-1", 0),
     ("Zeiss/Zeiss-5-Uncompressed.czi", 0),
     ("Ventana/OS-2.bif", 0),
+    ("DICOM/Leica-4", 0),
+    ("DICOM/Hamamatsu-2", 0),
 ];
 
 const REGION: i64 = 1024; // side length of the compared square
@@ -121,7 +126,14 @@ fn bench_vs_openslide() {
             .expect("slidekit read_region");
         let sk_read_ms = ms(t.elapsed());
 
-        let vendor = rel.split('/').next().unwrap_or(rel);
+        // One row per case. DICOM contributes two, so those keep the slide
+        // name; every other vendor has a single case and needs only its name.
+        let vendor = match rel.split('/').next().unwrap_or(rel) {
+            "DICOM" => rel.to_string(),
+            other => other.to_string(),
+        };
+        // Dump filenames must stay path-safe.
+        let slug = vendor.replace('/', "-");
 
         // ── openslide: one cold process, open+read+encode ──
         let (osl_ms, mean_diff, max_diff, opaque_frac) = if have_slidetool {
@@ -129,7 +141,7 @@ fn bench_vs_openslide() {
                 Some((osl_ms, rgba)) => {
                     let (mean, max, frac) = diff(&sk, &rgba, (w * h) as usize);
                     if let Some(dir) = dump_dir.as_deref() {
-                        dump_png(&dir.join(format!("{vendor}_openslide.png")), &rgba, w, h);
+                        dump_png(&dir.join(format!("{slug}_openslide.png")), &rgba, w, h);
                     }
                     (Some(osl_ms), Some(mean), Some(max), Some(frac))
                 }
@@ -142,7 +154,7 @@ fn bench_vs_openslide() {
         // Dump slidekit's region too, for side-by-side visual comparison.
         if let Some(dir) = dump_dir.as_deref() {
             dump_png(
-                &dir.join(format!("{vendor}_slidekit.png")),
+                &dir.join(format!("{slug}_slidekit.png")),
                 &argb_to_rgba(&sk),
                 w,
                 h,
@@ -160,7 +172,7 @@ fn bench_vs_openslide() {
         }
 
         rows.push(Row {
-            vendor: vendor.to_string(),
+            vendor,
             dims: format!("{lw}x{lh}"),
             sk_open_ms,
             sk_read_ms,
@@ -281,6 +293,10 @@ fn resolve(rel: &str) -> Option<PathBuf> {
     match rel {
         "Trestle/CMU-1" => extracted("Trestle/CMU-1.zip", "CMU-1.tif"),
         "Mirax/CMU-1" => extracted("Mirax/CMU-1.zip", "CMU-1.mrxs"),
+        // A DICOM slide is a directory of instances; opening any one of them
+        // opens the slide, so hand the driver the first.
+        "DICOM/Leica-4" => first_instance(&extracted("DICOM/Leica-4.zip", "Leica-4")?),
+        "DICOM/Hamamatsu-2" => first_instance(&extracted("DICOM/Hamamatsu-2.zip", "Hamamatsu-2")?),
         _ => common::test_slide_path(rel),
     }
 }
@@ -290,6 +306,17 @@ fn extracted(zip_rel: &str, name: &str) -> Option<PathBuf> {
     let zip = common::test_slide_path(zip_rel)?;
     let path = zip.parent()?.join("extracted").join(name);
     path.exists().then_some(path)
+}
+
+/// The first `.dcm` file in `dir`, in sorted order.
+fn first_instance(dir: &Path) -> Option<PathBuf> {
+    let mut entries: Vec<PathBuf> = std::fs::read_dir(dir)
+        .ok()?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|e| e.eq_ignore_ascii_case("dcm")))
+        .collect();
+    entries.sort();
+    entries.into_iter().next()
 }
 
 fn run_slidetool(
@@ -387,10 +414,10 @@ fn ms(d: std::time::Duration) -> f64 {
 fn print_table(rows: &[Row]) {
     eprintln!();
     eprintln!(
-        "{:<10} {:>15} {:>10} {:>10} {:>12} {:>10} {:>8} {:>10}",
+        "{:<20} {:>15} {:>10} {:>10} {:>12} {:>10} {:>8} {:>10}",
         "vendor", "level0", "sk_open", "sk_read", "osl_proc", "mean_d", "max_d", "opaque%"
     );
-    eprintln!("{}", "-".repeat(92));
+    eprintln!("{}", "-".repeat(102));
     for r in rows {
         let osl = r
             .osl_ms
@@ -409,7 +436,7 @@ fn print_table(rows: &[Row]) {
             .map(|v| format!("{:.0}%", v * 100.0))
             .unwrap_or_else(|| "-".into());
         eprintln!(
-            "{:<10} {:>15} {:>8.1}ms {:>8.1}ms {:>12} {:>10} {:>8} {:>10}",
+            "{:<20} {:>15} {:>8.1}ms {:>8.1}ms {:>12} {:>10} {:>8} {:>10}",
             r.vendor, r.dims, r.sk_open_ms, r.sk_read_ms, osl, mean, max, frac
         );
     }

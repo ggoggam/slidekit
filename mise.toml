@@ -1,4 +1,13 @@
-# Rust toolchain is inherited from the workspace-root mise.toml ([tools] rust).
+# slidekit is the only Rust project in the monorepo, so its toolchain is pinned
+# here rather than at the workspace root — every project's CI job loads the root
+# config, and nothing else needs cargo.
+[tools]
+rust = "latest"
+# cargo-nextest: runs tests from every crate's every test binary in one global
+# thread pool, so slidekit's I/O-bound integration binaries overlap instead of
+# running one binary at a time like `cargo test` does.
+"cargo:cargo-nextest" = "latest"
+
 [tasks."pre-commit"]
 description = "Run pre-commit checks via prek"
 run = "prek run --show-diff-on-failure --color=always --all-files --hook-stage=manual"

@@ -137,6 +137,7 @@ impl VendorDriver for HamamatsuDriver {
                     mirax: None,
                     zeiss: None,
                     synthetic: None,
+                    dicom: None,
                 }
             })
             .collect();

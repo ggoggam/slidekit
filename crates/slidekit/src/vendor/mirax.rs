@@ -314,6 +314,7 @@ fn open_mirax(dir: &Path) -> Result<SlideData> {
             }),
             zeiss: None,
             synthetic: None,
+            dicom: None,
         });
     }
 

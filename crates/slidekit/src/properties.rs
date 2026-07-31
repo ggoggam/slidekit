@@ -14,6 +14,7 @@ pub mod names {
     pub const BOUNDS_WIDTH: &str = "openslide.bounds-width";
     pub const BOUNDS_HEIGHT: &str = "openslide.bounds-height";
     pub const ICC_SIZE: &str = "openslide.icc-size";
+    pub const BARCODE: &str = "openslide.barcode";
 }
 
 /// Storage for slide properties (string key-value pairs).

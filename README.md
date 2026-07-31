@@ -26,14 +26,19 @@ let region = slide.read_region(0, 0, 0, 512, 512)?; // ARGB Vec<u32>
 | Hamamatsu NDPI | ✅ | Restart-marker JPEG tiling; VMS/VMU & z-stacks deferred |
 | 3DHistech MIRAX (`.mrxs`) | ✅ | Multi-file; brightfield JPEG tiles; fluorescence deferred |
 | Zeiss CZI (`.czi`) | ✅ | Uncompressed / Zstd0 / Zstd1; **JPEG XR not supported** ¹ |
-| Synthetic | ❌ | Planned |
-| Sakura | ❌ | Planned (needs SQLite reader) |
-| DICOM WSI | ❌ | Planned |
+| DICOM WSI (`.dcm`) | ✅ | Directory of instances; JPEG + uncompressed, **JPEG 2000 not supported** ² |
+| Synthetic | ✅ | Self-test slides, no file needed (`OPENSLIDE_DEBUG=synthetic`) |
+| Sakura | ❌ | Planned (needs a SQLite reader); no public test slide exists |
 
 ¹ Matches OpenSlide's own C driver, which also decodes only uncompressed/Zstd
 and rejects JPEG XR. JXR is common for brightfield CZIs but has no pure-Rust
 decoder; such files are detected as Zeiss but fail to open with a clear error
 rather than producing black tiles.
+
+² OpenSlide's C driver decodes JPEG 2000 DICOM through OpenJPEG. slidekit has no
+JPEG 2000 decoder yet, so those instances are detected as DICOM but fail to open
+with a clear error. Baseline-JPEG and uncompressed slides — what current scanners
+write — are fully supported.
 
 ## API surface
 
@@ -60,8 +65,8 @@ Mirrors the OpenSlide C API. All methods below are implemented on `OpenSlide`.
 | Deflate / ZIP (TIFF) | ✅ | `miniz_oxide` |
 | PackBits (TIFF) | ✅ | in-tree |
 | Zstd v0 / v1 (CZI) | ✅ | `ruzstd` (pure Rust) |
-| Uncompressed (CZI BGR/gray) | ✅ | in-tree |
-| JPEG 2000 | ❌ | Planned |
+| Uncompressed (CZI BGR/gray, DICOM RGB) | ✅ | in-tree |
+| JPEG 2000 | ❌ | Planned (needed by JP2K Aperio + DICOM slides) |
 | JPEG XR (CZI) | ❌ | No pure-Rust decoder |
 | PNG / BMP | ❌ | Planned |
 
@@ -91,7 +96,7 @@ declared fixture size exceeds its budget.
 
 ## Status
 
-Core library, I/O layer, and nine vendor drivers are implemented. Python
+Core library, I/O layer, and eleven vendor drivers are implemented. Python
 bindings (PyO3), the CLI, and the C-compatible FFI crate are planned — see
 [`PROGRESS.md`](PROGRESS.md) for the detailed checklist.
 

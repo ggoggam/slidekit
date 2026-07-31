@@ -1,4 +1,5 @@
 pub mod aperio;
+pub mod dicom;
 pub mod generic_tiff;
 pub mod hamamatsu;
 pub mod leica;
@@ -57,6 +58,12 @@ pub struct LevelData {
     /// `width × height` ARGB image. When `Some`, `read_region` crops it directly
     /// (no file/decoder at read time — everything was decoded at `open`).
     pub synthetic: Option<Vec<u32>>,
+    /// DICOM per-level frame index. A DICOM slide is a directory of instances,
+    /// one (or a concatenation) per level, whose tiles are the instance's
+    /// frames. When `Some`, the read path reads tiles through this (which owns
+    /// the per-instance readers and decodes them); `grid` maps regions →
+    /// (col,row).
+    pub dicom: Option<crate::vendor::dicom::DicomLevel>,
 }
 
 /// Data produced by a vendor driver after opening a slide.
@@ -110,6 +117,7 @@ pub fn all_drivers() -> Vec<Box<dyn VendorDriver>> {
         // `.mrxs` path, so it is safe to try first.
         Box::new(mirax::MiraxDriver),
         Box::new(zeiss::ZeissDriver),
+        Box::new(dicom::DicomDriver),
         Box::new(hamamatsu::HamamatsuDriver),
         Box::new(trestle::TrestleDriver),
         Box::new(aperio::AperioDriver),

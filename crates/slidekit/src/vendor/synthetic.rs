@@ -564,6 +564,7 @@ pub fn open() -> Result<SlideData> {
         mirax: None,
         zeiss: None,
         synthetic: Some(image),
+        dicom: None,
     };
 
     Ok(SlideData {

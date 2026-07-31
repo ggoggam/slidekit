@@ -89,3 +89,18 @@ slides:
   - path: Zeiss/Zeiss-5-JXR.czi
     sha256: c202ddf7b0bd473cdbe29977aee07c10c207077779485c0b1f876e8c00da77f7
     size: 68811968
+  # DICOM WSI, scanned on a Leica GT450 (WG26 PV22 connectathon). The ZIP holds
+  # one directory of `.dcm` instances plus a DICOMDIR. Three VOLUME levels
+  # (TILED_SPARSE, baseline JPEG / YBR_FULL_422), a THUMBNAIL and an OVERVIEW
+  # (JPEG), and a LABEL stored *uncompressed* — so one slide exercises the
+  # sparse frame index, both JPEG color paths, and the native-RGB path.
+  # sha256/size from the server's index.yaml / Content-Length.
+  - path: DICOM/Leica-4.zip
+    sha256: 71bd6db778d8565b28aa358d1abce0c55985c149183630c2ed31d1f8757185bb
+    size: 85348848
+  # DICOM WSI from a Hamamatsu NanoZoomer S20MD: TILED_FULL, so frames are
+  # indexed row-major with no per-frame positions — the other half of the
+  # dimension-organization matrix.
+  - path: DICOM/Hamamatsu-2.zip
+    sha256: 4e5eb397622044167b83b33bd047ded1ea7e35f08146893948d4b1a79dced470
+    size: 200221637
