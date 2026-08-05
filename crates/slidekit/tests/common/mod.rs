@@ -248,6 +248,413 @@ macro_rules! require_slide {
     };
 }
 
+// ───────────────────────── ZIP-packaged fixtures ───────────────────────────
+
+/// Extract a ZIP-packaged slide from the manifest into a sibling `extracted/`
+/// directory, returning that directory.
+///
+/// Three vendors ship as ZIPs because they are multi-file formats (or, for
+/// Trestle, simply packaged that way). `nest_in_stem` unpacks into
+/// `extracted/<zip stem>/` rather than `extracted/` — what the DICOM fixtures
+/// need, since a DICOM slide *is* a directory of instances and two of them
+/// share one vendor folder.
+///
+/// Extraction is serialized with the same `flock` the downloader uses and
+/// lands via a `.partial` rename, so concurrent test binaries can't race and a
+/// killed run can't leave a half-unpacked directory that looks complete.
+///
+/// A non-empty `dir` is what marks the extraction complete, so nothing that is
+/// not archive content may ever be written inside it — the lock file therefore
+/// lives beside the archive. (Putting it in `dir` made the non-nested vendors
+/// mistake their own lock for an unpacked slide and skip extracting entirely.)
+pub fn extracted_slide_dir(manifest_rel: &str, nest_in_stem: bool) -> Option<PathBuf> {
+    let zip_path = test_slide_path(manifest_rel)?;
+    let base = zip_path.parent()?.join("extracted");
+    let dir = if nest_in_stem {
+        base.join(zip_path.file_stem()?.to_str()?)
+    } else {
+        base.clone()
+    };
+
+    if dir_has_files(&dir) {
+        return Some(dir);
+    }
+
+    let lock = fs::File::create(zip_path.with_extension("extract.lock")).ok();
+    if let Some(f) = &lock {
+        f.lock_exclusive().ok();
+    }
+    // A peer may have finished while we waited on the lock.
+    if dir_has_files(&dir) {
+        return Some(dir);
+    }
+
+    fs::create_dir_all(dir.parent()?).ok()?;
+    let tmp = dir.with_extension("partial");
+    fs::remove_dir_all(&tmp).ok();
+    fs::create_dir_all(&tmp).ok()?;
+
+    let file = fs::File::open(&zip_path).ok()?;
+    let mut archive = zip::ZipArchive::new(file).ok()?;
+    for i in 0..archive.len() {
+        let mut entry = archive.by_index(i).ok()?;
+        let name = entry.name().to_string();
+        if name.ends_with('/') {
+            continue;
+        }
+        // A ZIP entry name is attacker-controlled in general; these archives are
+        // checksum-verified, but keep the extraction inside `tmp` regardless.
+        let out_path = tmp.join(&name);
+        if !out_path.starts_with(&tmp) {
+            eprintln!("WARNING: skipping suspicious zip entry {name}");
+            continue;
+        }
+        if let Some(parent) = out_path.parent() {
+            fs::create_dir_all(parent).ok()?;
+        }
+        let mut out_file = fs::File::create(&out_path).ok()?;
+        std::io::copy(&mut entry, &mut out_file).ok()?;
+    }
+
+    // Rename last: a killed run leaves `.partial`, not a "complete" directory.
+    // Renaming onto a non-empty directory fails, so clear any empty husk an
+    // earlier interrupted run left behind.
+    fs::remove_dir_all(&dir).ok();
+    fs::rename(&tmp, &dir).ok()?;
+    dir_has_files(&dir).then_some(dir)
+}
+
+/// Whether `dir` exists and holds at least one entry — an empty directory is
+/// treated as "not extracted" so a failed run retries instead of sticking.
+fn dir_has_files(dir: &Path) -> bool {
+    fs::read_dir(dir).is_ok_and(|mut e| e.next().is_some())
+}
+
+/// Every file under `root`, depth-first, in sorted order.
+fn walk_files(root: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        let mut paths: Vec<PathBuf> = entries.filter_map(|e| e.ok().map(|e| e.path())).collect();
+        paths.sort();
+        for path in paths {
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.is_file() {
+                out.push(path);
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// The first `.dcm` file under `dir`, in sorted order.
+pub fn first_dcm(dir: &Path) -> Option<PathBuf> {
+    walk_files(dir)
+        .into_iter()
+        .find(|p| p.extension().is_some_and(|e| e.eq_ignore_ascii_case("dcm")))
+}
+
+// ───────────────────────── bench fixture set ───────────────────────────────
+
+/// One representative real slide per vendor, with the level to read.
+///
+/// Shared by `bench_openslide`, `bench_remote`, and `upload_testdata` so all
+/// three agree on what "the bench set" is. The ZIP-packaged vendors use a bare
+/// `Vendor/Name` key that [`bench_slide`] resolves to the extracted files.
+///
+/// The JP2K Aperio variants and the JXR CZI are omitted: slidekit has no
+/// JPEG-2000 or JPEG XR decoder, so there is nothing to time. Both DICOM
+/// slides are kept because they exercise different frame layouts
+/// (`TILED_SPARSE` vs `TILED_FULL`) — exactly what a pixel cross-check catches.
+pub const BENCH_CASES: &[(&str, i32)] = &[
+    ("Aperio/CMU-1.svs", 0),
+    ("Hamamatsu/CMU-1.ndpi", 0),
+    ("Leica/Leica-1.scn", 0),
+    ("Philips-TIFF/Philips-4.tiff", 0),
+    ("Generic-TIFF/CMU-1.tiff", 0),
+    ("Trestle/CMU-1", 0),
+    ("Mirax/CMU-1", 0),
+    ("Zeiss/Zeiss-5-Uncompressed.czi", 0),
+    ("Ventana/OS-2.bif", 0),
+    ("DICOM/Leica-4", 0),
+    ("DICOM/Hamamatsu-2", 0),
+];
+
+/// A bench slide resolved on local disk, together with the object keys that
+/// mirror it into a bucket.
+///
+/// Single-file vendors carry one file. MIRAX and DICOM carry their whole
+/// sibling set — that set is precisely what makes them openable remotely, since
+/// both formats resolve siblings through `SlideFs` rather than reading one blob.
+pub struct BenchSlide {
+    /// Label used in bench output (the vendor, or `Vendor/Slide` for DICOM
+    /// where two cases share a vendor).
+    pub name: String,
+    /// Path handed to `OpenSlide::open`.
+    pub local_path: PathBuf,
+    /// Key handed to `OpenSlide::open_store`, relative to the mirror root.
+    pub open_key: String,
+    /// `(local file, key relative to the mirror root)` for every file the slide
+    /// needs.
+    pub files: Vec<(PathBuf, String)>,
+}
+
+impl BenchSlide {
+    /// Total on-disk size of every file in the slide.
+    pub fn total_bytes(&self) -> u64 {
+        self.files
+            .iter()
+            .filter_map(|(p, _)| p.metadata().ok().map(|m| m.len()))
+            .sum()
+    }
+}
+
+/// Resolve a [`BENCH_CASES`] entry to local files and mirror keys, extracting
+/// the ZIP-packaged vendors on demand. Returns `None` when the fixture isn't
+/// available (downloads disabled, or a fetch failed), so benches skip the case.
+pub fn bench_slide(case: &str) -> Option<BenchSlide> {
+    // (slide root on disk, key prefix under the mirror root, file to open)
+    let (root, prefix, open) = match case {
+        "Trestle/CMU-1" => {
+            let dir = extracted_slide_dir("Trestle/CMU-1.zip", false)?;
+            let open = dir.join("CMU-1.tif");
+            (dir, "Trestle", open)
+        }
+        "Mirax/CMU-1" => {
+            let dir = extracted_slide_dir("Mirax/CMU-1.zip", false)?;
+            let open = dir.join("CMU-1.mrxs");
+            (dir, "Mirax", open)
+        }
+        // A DICOM slide is a directory of instances; opening any one of them
+        // opens the slide, so hand the driver the first.
+        "DICOM/Leica-4" => {
+            let dir = extracted_slide_dir("DICOM/Leica-4.zip", true)?;
+            let open = first_dcm(&dir)?;
+            (dir, "DICOM/Leica-4", open)
+        }
+        "DICOM/Hamamatsu-2" => {
+            let dir = extracted_slide_dir("DICOM/Hamamatsu-2.zip", true)?;
+            let open = first_dcm(&dir)?;
+            (dir, "DICOM/Hamamatsu-2", open)
+        }
+        // Single-file vendors mirror straight to their manifest path.
+        single => {
+            let path = test_slide_path(single)?;
+            return Some(BenchSlide {
+                name: vendor_label(case),
+                local_path: path.clone(),
+                open_key: single.to_string(),
+                files: vec![(path, single.to_string())],
+            });
+        }
+    };
+
+    if !open.is_file() {
+        eprintln!(
+            "WARNING: {case}: expected {} in the archive",
+            open.display()
+        );
+        return None;
+    }
+
+    let key_of = |path: &Path| -> Option<String> {
+        let rel = path.strip_prefix(&root).ok()?;
+        // Object keys are `/`-separated regardless of host separator.
+        let rel: Vec<String> = rel
+            .components()
+            .map(|c| c.as_os_str().to_string_lossy().into_owned())
+            .collect();
+        Some(format!("{prefix}/{}", rel.join("/")))
+    };
+
+    let files: Vec<(PathBuf, String)> = walk_files(&root)
+        .into_iter()
+        .filter_map(|p| key_of(&p).map(|k| (p, k)))
+        .collect();
+
+    Some(BenchSlide {
+        name: vendor_label(case),
+        open_key: key_of(&open)?,
+        local_path: open,
+        files,
+    })
+}
+
+/// Bench label for a case: the vendor alone, except for DICOM where two slides
+/// share a vendor and the slide name is what distinguishes them.
+fn vendor_label(case: &str) -> String {
+    match case.split('/').next().unwrap_or(case) {
+        "DICOM" => case.to_string(),
+        other => other.to_string(),
+    }
+}
+
+// ───────────────────────── remote bench bucket ─────────────────────────────
+
+/// An S3-compatible bucket to mirror the bench slides into, configured from the
+/// environment. `slidekit/.env` (loaded by mise, git-ignored) supplies:
+///
+/// * `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` — credentials
+/// * `BUCKET_NAME` — bucket to write under
+/// * `BUCKET_REGION` — region (`auto` for endpoints that don't care)
+/// * `BUCKET_ENDPOINT_URL` — S3-compatible endpoint
+///
+/// Everything is written under one key prefix ([`RemoteBucket::root`]) so the
+/// bench never touches unrelated objects in a shared bucket.
+pub struct RemoteBucket {
+    pub store: std::sync::Arc<dyn object_store::ObjectStore>,
+    pub bucket: String,
+    /// Key prefix every bench object lives under.
+    pub root: String,
+}
+
+impl RemoteBucket {
+    /// Absolute object path for a mirror-root-relative key.
+    pub fn key(&self, rel: &str) -> object_store::path::Path {
+        object_store::path::Path::from(format!("{}/{}", self.root, rel))
+    }
+
+    /// `s3://` URL for a mirror-root-relative key — what a user would pass to
+    /// `OpenSlide::open_url` with the same endpoint configured in the
+    /// environment. Reported by the bench so the keys are copy-pasteable.
+    pub fn url(&self, rel: &str) -> String {
+        format!("s3://{}/{}/{}", self.bucket, self.root, rel)
+    }
+}
+
+/// Default key prefix for the mirrored bench slides. Overridable with
+/// `SLIDEKIT_BENCH_PREFIX`, which matters when the bucket is shared with
+/// something else (a CI cache, say).
+pub const DEFAULT_BENCH_PREFIX: &str = "slidekit-bench/testdata";
+
+/// Build the remote bench bucket from the environment, or `None` (with a note)
+/// when it isn't configured — so the remote bench and uploader skip rather than
+/// fail on a machine with no credentials.
+pub fn remote_bucket() -> Option<RemoteBucket> {
+    use object_store::aws::AmazonS3Builder;
+
+    let var = |name: &str| std::env::var(name).ok().filter(|v| !v.is_empty());
+    let (Some(key_id), Some(secret), Some(bucket)) = (
+        var("AWS_ACCESS_KEY_ID"),
+        var("AWS_SECRET_ACCESS_KEY"),
+        var("BUCKET_NAME"),
+    ) else {
+        eprintln!(
+            "SKIP: remote bucket not configured — set AWS_ACCESS_KEY_ID, \
+             AWS_SECRET_ACCESS_KEY and BUCKET_NAME (see slidekit/.env)"
+        );
+        return None;
+    };
+
+    let mut builder = AmazonS3Builder::new()
+        .with_bucket_name(&bucket)
+        .with_access_key_id(key_id)
+        .with_secret_access_key(secret)
+        // Non-AWS S3 implementations generally serve path-style URLs
+        // (`endpoint/bucket/key`) and don't provision per-bucket DNS.
+        .with_virtual_hosted_style_request(false)
+        .with_region(var("BUCKET_REGION").unwrap_or_else(|| "us-east-1".into()));
+    if let Some(endpoint) = var("BUCKET_ENDPOINT_URL") {
+        // Allow plain HTTP only for an explicitly non-TLS endpoint (a local
+        // MinIO); real endpoints are HTTPS and unaffected.
+        let insecure = endpoint.starts_with("http://");
+        builder = builder.with_endpoint(endpoint).with_allow_http(insecure);
+    }
+
+    match builder.build() {
+        Ok(store) => Some(RemoteBucket {
+            store: std::sync::Arc::new(store),
+            bucket,
+            root: std::env::var("SLIDEKIT_BENCH_PREFIX")
+                .unwrap_or_else(|_| DEFAULT_BENCH_PREFIX.to_string()),
+        }),
+        Err(e) => {
+            eprintln!("SKIP: cannot build S3 store: {e}");
+            None
+        }
+    }
+}
+
+// ───────────────────────── tissue-region search ────────────────────────────
+
+/// Find the `w`×`h` window (at `level`, returned as level-0 top-left coords)
+/// that covers the most tissue, by scanning the coarsest pyramid level for
+/// non-white opaque pixels. Returns `None` if the overview can't be read, so
+/// callers fall back to slide center.
+///
+/// Both benches pick their compared region this way, and the remote bench
+/// reuses the coordinates the local pass computed — so remote timings measure
+/// the read, not a second tissue search.
+///
+/// Builds a summed-area table so the search is O(pixels) rather than
+/// O(pixels × window). The coarsest level is a small thumbnail on real
+/// pyramids, so memory and time are trivial.
+pub fn tissue_region(
+    slide: &slidekit::OpenSlide,
+    level: i32,
+    w: i64,
+    h: i64,
+) -> Option<(i64, i64)> {
+    let ov = slide.level_count() - 1;
+    let (ow, oh) = slide.level_dimensions(ov)?;
+    if ow <= 0 || oh <= 0 {
+        return None;
+    }
+    let ov_ds = slide.level_downsample(ov)?;
+    let px = slide.read_region(0, 0, ov, ow, oh).ok()?;
+
+    // Tissue mask: opaque and not near-white (dark OR saturated → stain).
+    let (ow, oh) = (ow as usize, oh as usize);
+    let mut sat = vec![0u32; (ow + 1) * (oh + 1)]; // summed-area table, 1px pad
+    let stride = ow + 1;
+    for y in 0..oh {
+        for x in 0..ow {
+            let p = px[y * ow + x];
+            let (r, g, b, a) = ((p >> 16) & 0xff, (p >> 8) & 0xff, p & 0xff, p >> 24);
+            let bright = r.max(g).max(b);
+            let saturation = bright - r.min(g).min(b);
+            let tissue = (a & 0xff) == 0xff && (bright < 210 || saturation > 25);
+            let v = tissue as u32;
+            sat[(y + 1) * stride + (x + 1)] =
+                v + sat[y * stride + (x + 1)] + sat[(y + 1) * stride + x] - sat[y * stride + x];
+        }
+    }
+
+    // Window size at overview scale (level → level-0 → overview px).
+    let target_ds = slide.level_downsample(level)?;
+    let win_w = ((w as f64 * target_ds / ov_ds).round() as usize).clamp(1, ow);
+    let win_h = ((h as f64 * target_ds / ov_ds).round() as usize).clamp(1, oh);
+
+    let sum = |x: usize, y: usize, bw: usize, bh: usize| {
+        sat[(y + bh) * stride + x + bw] + sat[y * stride + x]
+            - sat[y * stride + x + bw]
+            - sat[(y + bh) * stride + x]
+    };
+    let (mut best, mut best_xy) = (0, (0usize, 0usize));
+    for y in 0..=(oh - win_h) {
+        for x in 0..=(ow - win_w) {
+            let s = sum(x, y, win_w, win_h);
+            if s > best {
+                best = s;
+                best_xy = (x, y);
+            }
+        }
+    }
+    if best == 0 {
+        return None; // no tissue found — let caller use center
+    }
+    // Overview top-left → level-0 coords (what read_region expects).
+    Some((
+        (best_xy.0 as f64 * ov_ds) as i64,
+        (best_xy.1 as f64 * ov_ds) as i64,
+    ))
+}
+
 // ───────────────────────── synthetic fixtures ──────────────────────────────
 
 // Minimal TIFF tag numbers needed to encode an uncompressed tiled RGB image.

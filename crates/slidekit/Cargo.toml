@@ -36,6 +36,11 @@ fs2 = "0.4"
 once_cell = "1"
 zip = "2"
 object_store.workspace = true
-tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs"] }
 wiremock = "0.6"
 png = "0.17"                # decode slidetool's PNG output in the OpenSlide comparison bench
+# Implementing `ObjectStore` for the request-counting wrapper in `bench_remote`
+# needs the same two crates its trait definition is built from. Both are already
+# in the graph via `object_store`, so this adds no compilation.
+async-trait = "0.1"
+futures-util = "0.3"

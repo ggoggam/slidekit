@@ -141,6 +141,26 @@ echo "Installed: $("$prefix/bin/slidetool" --version 2>&1 | head -1) -> $prefix/
 description = "Run the OpenSlide comparison bench (needs slidetool on PATH + warm slide cache)"
 run = "cargo test --release --test bench_openslide -- --ignored --nocapture"
 
+# ── Bench (remote storage) ────────────────────────────────────────────────────
+# The remote bench reads the same slides from an S3-compatible bucket over byte
+# range requests. Credentials come from `.env` (see the [env] block below);
+# `bench:upload-slides` mirrors the warm local cache into the bucket first.
+
+[tasks."bench:warm-cache"]
+description = "Download + verify every manifest slide into target/testdata (several GB)"
+run = "cargo test --release --test test_download -- --ignored --nocapture"
+
+[tasks."bench:upload-slides"]
+description = "Mirror the bench slides into the S3-compatible bucket from .env (several GB, skips what's already there)"
+run = "cargo test --release --test upload_testdata -- --ignored --nocapture"
+
+[tasks."bench:remote"]
+description = "Run the remote-storage bench (needs bench:upload-slides once + warm slide cache)"
+run = "cargo test --release --test bench_remote -- --ignored --nocapture"
+
 [env]
 # Repo-local slidetool from `mise run bench:setup-slidetool` (harmless if absent).
 _.path = [".tools/openslide/bin"]
+# Bucket credentials for the remote bench (`bench:remote`), git-ignored.
+# Optional: absent .env just means the remote bench skips.
+_.file = { path = ".env", redact = true }

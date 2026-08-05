@@ -30,38 +30,24 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Instant;
 
-/// (case path, level) — one representative real slide per vendor.
-///
-/// Most are manifest-relative paths resolved straight from the warm cache. The
-/// ZIP-packaged vendors (Trestle, Mirax, DICOM) use a bare `Vendor/Name` key
-/// that [`resolve`] maps to the file their test suites extract next to the ZIP;
-/// the JP2K Aperio variants are omitted (slidekit has no JPEG-2000 decoder yet).
-/// Both DICOM slides are listed because they exercise different frame layouts
-/// (sparse vs. TILED_FULL), which is exactly the kind of tile-placement bug a
-/// pixel cross-check catches.
-const CASES: &[(&str, i32)] = &[
-    ("Aperio/CMU-1.svs", 0),
-    ("Hamamatsu/CMU-1.ndpi", 0),
-    ("Leica/Leica-1.scn", 0),
-    ("Philips-TIFF/Philips-4.tiff", 0),
-    ("Generic-TIFF/CMU-1.tiff", 0),
-    ("Trestle/CMU-1", 0),
-    ("Mirax/CMU-1", 0),
-    ("Zeiss/Zeiss-5-Uncompressed.czi", 0),
-    ("Ventana/OS-2.bif", 0),
-    ("DICOM/Leica-4", 0),
-    ("DICOM/Hamamatsu-2", 0),
-];
-
 const REGION: i64 = 1024; // side length of the compared square
 const MEAN_DIFF_CEILING: f64 = 15.0; // per-channel; trips only on gross mismatch
+
+/// Below this both-opaque fraction there is no real overlap to compare, so the
+/// pixel diff is reported as `n/a` rather than as a passing 0.00.
+const MIN_OPAQUE_FRAC: f64 = 0.01;
 
 struct Row {
     vendor: String,
     dims: String,
     sk_open_ms: f64,
     sk_read_ms: f64,
+    /// Whole `slidetool region read` process: startup + open + read + PNG encode.
     osl_ms: Option<f64>,
+    /// `slidetool prop list` minus the process floor — open, without a read.
+    osl_open_ms: Option<f64>,
+    /// `region read` minus `prop list` — the read plus its PNG encode.
+    osl_read_ms: Option<f64>,
     mean_diff: Option<f64>,
     max_diff: Option<u32>,
     /// Fraction of pixels opaque in both readers — the RGB diff is measured
@@ -81,6 +67,16 @@ fn bench_vs_openslide() {
         eprintln!("NOTE: `slidetool` not on PATH — reporting slidekit latency only.");
     }
 
+    // slidekit is timed in-process; slidetool can only be timed as a whole
+    // process. Measure the bare process floor (`--version` does no slide work)
+    // so the open/read columns can have it subtracted out — otherwise every
+    // OpenSlide number carries a fixed startup tax that has nothing to do with
+    // the library. Best-of-N: we want the floor, not the scheduler's noise.
+    let floor_ms = have_slidetool.then(process_floor_ms).flatten();
+    if let Some(floor) = floor_ms {
+        eprintln!("slidetool process floor: {floor:.1}ms (subtracted from osl_open)");
+    }
+
     // Optional: dump each reader's region as a PNG for side-by-side inspection.
     //   SLIDEKIT_BENCH_DUMP=/tmp/cmp cargo test --test bench_openslide -- --ignored
     let dump_dir = std::env::var_os("SLIDEKIT_BENCH_DUMP").map(PathBuf::from);
@@ -90,11 +86,12 @@ fn bench_vs_openslide() {
     }
 
     let mut rows = Vec::new();
-    for &(rel, level) in CASES {
-        let Some(path) = resolve(rel) else {
-            eprintln!("SKIP: {rel} not cached (ZIP vendors need their test run once to extract)");
+    for &(rel, level) in common::BENCH_CASES {
+        let Some(fixture) = common::bench_slide(rel) else {
+            eprintln!("SKIP: {rel} not available locally");
             continue;
         };
+        let path = fixture.local_path.clone();
 
         // ── slidekit: open and read timed separately ──
         let t = Instant::now();
@@ -113,7 +110,7 @@ fn bench_vs_openslide() {
         // Top-left of the compared window, in level-0 coords. Prefer a spot with
         // real tissue (many slides have blank centers); fall back to center.
         let ds = slide.level_downsample(level).unwrap_or(1.0);
-        let (x0, y0) = tissue_region(&slide, level, w, h).unwrap_or_else(|| {
+        let (x0, y0) = common::tissue_region(&slide, level, w, h).unwrap_or_else(|| {
             (
                 (((lw - w) / 2) as f64 * ds) as i64,
                 (((lh - h) / 2) as f64 * ds) as i64,
@@ -126,12 +123,7 @@ fn bench_vs_openslide() {
             .expect("slidekit read_region");
         let sk_read_ms = ms(t.elapsed());
 
-        // One row per case. DICOM contributes two, so those keep the slide
-        // name; every other vendor has a single case and needs only its name.
-        let vendor = match rel.split('/').next().unwrap_or(rel) {
-            "DICOM" => rel.to_string(),
-            other => other.to_string(),
-        };
+        let vendor = fixture.name.clone();
         // Dump filenames must stay path-safe.
         let slug = vendor.replace('/', "-");
 
@@ -149,6 +141,21 @@ fn bench_vs_openslide() {
             }
         } else {
             (None, None, None, None)
+        };
+
+        // A second slidetool process that opens the slide but reads no region,
+        // so `region read` minus this isolates the read from the open. Both
+        // carry the same startup tax, which cancels in the subtraction.
+        let osl_props_ms = have_slidetool.then(|| run_slidetool_props(&path)).flatten();
+        let osl_open_ms = match (osl_props_ms, floor_ms) {
+            // Clamp at zero: on a slide that opens in under a millisecond the
+            // floor estimate can exceed the measurement.
+            (Some(props), Some(floor)) => Some((props - floor).max(0.0)),
+            _ => None,
+        };
+        let osl_read_ms = match (osl_ms, osl_props_ms) {
+            (Some(total), Some(props)) => Some((total - props).max(0.0)),
+            _ => None,
         };
 
         // Dump slidekit's region too, for side-by-side visual comparison.
@@ -169,6 +176,15 @@ fn bench_vs_openslide() {
                     "WARN {rel}: mean per-channel diff {mean:.2} over opaque tissue >= {MEAN_DIFF_CEILING}"
                 );
             }
+            // Say so out loud: a near-zero diff over no overlapping opaque
+            // pixels verifies nothing, and reads far too much like a pass.
+            if frac < MIN_OPAQUE_FRAC {
+                eprintln!(
+                    "NOTE {rel}: only {:.1}% of pixels opaque in both readers — \
+                     pixel diff not meaningful for this slide",
+                    frac * 100.0
+                );
+            }
         }
 
         rows.push(Row {
@@ -177,6 +193,8 @@ fn bench_vs_openslide() {
             sk_open_ms,
             sk_read_ms,
             osl_ms,
+            osl_open_ms,
+            osl_read_ms,
             mean_diff,
             max_diff,
             opaque_frac,
@@ -220,103 +238,37 @@ fn dump_png(path: &Path, rgba: &[u8], w: i64, h: i64) {
     }
 }
 
-/// Find the WxH window (at `level`, returned as level-0 top-left coords) that
-/// covers the most tissue, by scanning the coarsest pyramid level for non-white
-/// opaque pixels. Returns None if the overview can't be read, so the caller
-/// falls back to slide center.
-///
-/// ponytail: builds a summed-area table over the overview so the best-window
-/// search is O(pixels) instead of O(pixels * window). The coarsest level is a
-/// small thumbnail on real pyramids, so memory/time are trivial.
-fn tissue_region(slide: &OpenSlide, level: i32, w: i64, h: i64) -> Option<(i64, i64)> {
-    let ov = slide.level_count() - 1;
-    let (ow, oh) = slide.level_dimensions(ov)?;
-    if ow <= 0 || oh <= 0 {
-        return None;
-    }
-    let ov_ds = slide.level_downsample(ov)?;
-    let px = slide.read_region(0, 0, ov, ow, oh).ok()?;
-
-    // Tissue mask: opaque and not near-white (dark OR saturated → stain).
-    let (ow, oh) = (ow as usize, oh as usize);
-    let mut sat = vec![0u32; (ow + 1) * (oh + 1)]; // summed-area table, 1px pad
-    let stride = ow + 1;
-    for y in 0..oh {
-        for x in 0..ow {
-            let p = px[y * ow + x];
-            let (r, g, b, a) = ((p >> 16) & 0xff, (p >> 8) & 0xff, p & 0xff, p >> 24);
-            let bright = r.max(g).max(b);
-            let saturation = bright - r.min(g).min(b);
-            let tissue = (a & 0xff) == 0xff && (bright < 210 || saturation > 25);
-            let v = tissue as u32;
-            sat[(y + 1) * stride + (x + 1)] =
-                v + sat[y * stride + (x + 1)] + sat[(y + 1) * stride + x] - sat[y * stride + x];
+/// Wall time of the cheapest possible `slidetool` invocation — `--version` does
+/// no slide work, so this is the fork+exec+dynamic-link cost every other
+/// measurement inherits. Returns the minimum of several runs (the floor is what
+/// we want to subtract, not an average inflated by scheduling noise).
+fn process_floor_ms() -> Option<f64> {
+    let mut best: Option<f64> = None;
+    for _ in 0..5 {
+        let t = Instant::now();
+        let ok = Command::new("slidetool")
+            .arg("--version")
+            .output()
+            .is_ok_and(|o| o.status.success());
+        if !ok {
+            return None;
         }
+        let elapsed = ms(t.elapsed());
+        best = Some(best.map_or(elapsed, |b: f64| b.min(elapsed)));
     }
-
-    // Window size at overview scale (level → level-0 → overview px).
-    let target_ds = slide.level_downsample(level)?;
-    let win_w = ((w as f64 * target_ds / ov_ds).round() as usize).clamp(1, ow);
-    let win_h = ((h as f64 * target_ds / ov_ds).round() as usize).clamp(1, oh);
-
-    let sum = |x: usize, y: usize, bw: usize, bh: usize| {
-        sat[(y + bh) * stride + x + bw] + sat[y * stride + x]
-            - sat[y * stride + x + bw]
-            - sat[(y + bh) * stride + x]
-    };
-    let (mut best, mut best_xy) = (0, (0usize, 0usize));
-    for y in 0..=(oh - win_h) {
-        for x in 0..=(ow - win_w) {
-            let s = sum(x, y, win_w, win_h);
-            if s > best {
-                best = s;
-                best_xy = (x, y);
-            }
-        }
-    }
-    if best == 0 {
-        return None; // no tissue found — let caller use center
-    }
-    // Overview top-left → level-0 coords (what read_region expects).
-    Some((
-        (best_xy.0 as f64 * ov_ds) as i64,
-        (best_xy.1 as f64 * ov_ds) as i64,
-    ))
+    best
 }
 
-/// Resolve a case to an on-disk slide. Plain single-file slides come straight
-/// from the manifest cache; the two ZIP-packaged vendors are resolved to the
-/// file their test suites extract next to the cached ZIP. The bench assumes a
-/// warm cache, so this only *reads* the extraction — it never creates it (run
-/// `test_trestle` / `test_mirax` once to populate `extracted/`).
-fn resolve(rel: &str) -> Option<PathBuf> {
-    match rel {
-        "Trestle/CMU-1" => extracted("Trestle/CMU-1.zip", "CMU-1.tif"),
-        "Mirax/CMU-1" => extracted("Mirax/CMU-1.zip", "CMU-1.mrxs"),
-        // A DICOM slide is a directory of instances; opening any one of them
-        // opens the slide, so hand the driver the first.
-        "DICOM/Leica-4" => first_instance(&extracted("DICOM/Leica-4.zip", "Leica-4")?),
-        "DICOM/Hamamatsu-2" => first_instance(&extracted("DICOM/Hamamatsu-2.zip", "Hamamatsu-2")?),
-        _ => common::test_slide_path(rel),
-    }
-}
-
-/// Path to `extracted/<name>` beside a cached ZIP, if it's already been unpacked.
-fn extracted(zip_rel: &str, name: &str) -> Option<PathBuf> {
-    let zip = common::test_slide_path(zip_rel)?;
-    let path = zip.parent()?.join("extracted").join(name);
-    path.exists().then_some(path)
-}
-
-/// The first `.dcm` file in `dir`, in sorted order.
-fn first_instance(dir: &Path) -> Option<PathBuf> {
-    let mut entries: Vec<PathBuf> = std::fs::read_dir(dir)
-        .ok()?
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.extension().is_some_and(|e| e.eq_ignore_ascii_case("dcm")))
-        .collect();
-    entries.sort();
-    entries.into_iter().next()
+/// Wall time of `slidetool prop list` — a process that opens the slide and dumps
+/// its properties, but reads no pixels. Used as the open-side measurement.
+fn run_slidetool_props(path: &Path) -> Option<f64> {
+    let t = Instant::now();
+    let out = Command::new("slidetool")
+        .args(["prop", "list"])
+        .arg(path)
+        .output()
+        .ok()?;
+    out.status.success().then(|| ms(t.elapsed()))
 }
 
 fn run_slidetool(
@@ -412,35 +364,68 @@ fn ms(d: std::time::Duration) -> f64 {
 }
 
 fn print_table(rows: &[Row]) {
+    let opt_ms = |v: Option<f64>| {
+        v.map(|v| format!("{v:.1}ms"))
+            .unwrap_or_else(|| "-".to_string())
+    };
+
+    // ── latency: slidekit against OpenSlide, open and read separated ──
     eprintln!();
     eprintln!(
-        "{:<20} {:>15} {:>10} {:>10} {:>12} {:>10} {:>8} {:>10}",
-        "vendor", "level0", "sk_open", "sk_read", "osl_proc", "mean_d", "max_d", "opaque%"
+        "{:<20} {:>15} {:>9} {:>10} {:>9} {:>11} {:>11}",
+        "vendor", "level0", "sk_open", "osl_open", "sk_read", "osl_read", "osl_proc"
     );
-    eprintln!("{}", "-".repeat(102));
+    eprintln!("{}", "-".repeat(92));
     for r in rows {
-        let osl = r
-            .osl_ms
-            .map(|v| format!("{v:.1}ms"))
-            .unwrap_or_else(|| "-".into());
+        eprintln!(
+            "{:<20} {:>15} {:>7.1}ms {:>10} {:>7.1}ms {:>11} {:>11}",
+            r.vendor,
+            r.dims,
+            r.sk_open_ms,
+            opt_ms(r.osl_open_ms),
+            r.sk_read_ms,
+            opt_ms(r.osl_read_ms),
+            opt_ms(r.osl_ms),
+        );
+    }
+    eprintln!(
+        "\n(sk_* measured in-process. slidetool can only be timed as a whole process, so:\n \
+         osl_open  = `prop list` (opens, reads no pixels) minus the process floor\n \
+         osl_read  = `region read` minus `prop list` — the read plus its PNG encode\n \
+         osl_proc  = the whole `region read` process, floor included.\n \
+         osl_read still carries a PNG encode slidekit never does, so it flatters slidekit;\n \
+         a like-for-like read comparison needs in-process FFI, which is not built yet.)"
+    );
+
+    // ── pixel agreement ──
+    eprintln!();
+    eprintln!(
+        "{:<20} {:>10} {:>10} {:>10}",
+        "vendor", "mean_d", "max_d", "opaque%"
+    );
+    eprintln!("{}", "-".repeat(54));
+    for r in rows {
+        // A diff over (almost) no overlapping opaque pixels measures nothing —
+        // print n/a so it can't be misread as agreement.
+        let meaningful = r.opaque_frac.is_some_and(|f| f >= MIN_OPAQUE_FRAC);
+        let show = |s: String| if meaningful { s } else { "n/a".to_string() };
         let mean = r
             .mean_diff
-            .map(|v| format!("{v:.2}"))
+            .map(|v| show(format!("{v:.2}")))
             .unwrap_or_else(|| "-".into());
         let max = r
             .max_diff
-            .map(|v| v.to_string())
+            .map(|v| show(v.to_string()))
             .unwrap_or_else(|| "-".into());
         let frac = r
             .opaque_frac
             .map(|v| format!("{:.0}%", v * 100.0))
             .unwrap_or_else(|| "-".into());
-        eprintln!(
-            "{:<20} {:>15} {:>8.1}ms {:>8.1}ms {:>12} {:>10} {:>8} {:>10}",
-            r.vendor, r.dims, r.sk_open_ms, r.sk_read_ms, osl, mean, max, frac
-        );
+        eprintln!("{:<20} {mean:>10} {max:>10} {frac:>10}", r.vendor);
     }
     eprintln!(
-        "\n(osl_proc = one cold slidetool process: open+read+encode. sk_open/sk_read measured in-process.)"
+        "\n(mean_d/max_d = per-channel RGB difference over pixels opaque in BOTH readers.\n \
+         Independent JPEG decoders differ by ±1-2, so small values are expected, not exact\n \
+         equality. n/a = too little opaque overlap in the compared window to conclude anything.)"
     );
 }

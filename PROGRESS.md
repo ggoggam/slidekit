@@ -194,10 +194,103 @@
 ## Phase 6: Streaming Optimization
 
 - [ ] Lazy tile loading — only fetch tiles when `read_region` is called
-- [ ] Batched range requests — combine adjacent tile fetches into one request
+- [ ] **Batched range requests** — combine adjacent reads into one request.
+      Measured by `bench_remote.rs` against a real S3-compatible bucket
+      (~50 ms RTT, ~390 ms observed per request): opening `Aperio/CMU-1.svs`
+      (169 MB) fetches only **0.97 MB (0.93%)** — so remote reads are genuinely
+      lazy and nothing is downloaded wholesale — but it takes **272 sequential
+      requests** and ~107 s, because `read_directory` reads each IFD entry, and
+      each out-of-line tag value, as its own few-byte ranged GET. The region read
+      itself is already efficient (25 requests, 0.61 MB). **This is the single
+      biggest remote-performance item: a read-ahead/coalescing reader for
+      `AsyncSlideReader` (serve small reads from ~64 KB–1 MB blocks) should
+      collapse those 272 requests into a handful.** Laziness is not the gap;
+      granularity is.
 - [ ] Adaptive cache sizing for remote vs. local files
-- [ ] Connection pooling for HTTP backend
+- [ ] Connection pooling for HTTP backend — note the client already reuses
+      connections; a keep-alive probe against the bench endpoint measured ~583 ms
+      per request on an *established* connection vs ~50 ms network RTT, so
+      per-request latency there is the endpoint's, not a missing pool
 - [ ] Byte-range efficiency tests (mock HTTP server via `wiremock`)
+
+### Benchmark harness (supporting Phase 6 + the per-vendor bench requirement)
+
+- [x] `tests/bench_openslide.rs` — slidekit vs OpenSlide 4.0.1 `slidetool`, one
+      slide per vendor, with open/read latency separated on both sides (a
+      measured process floor and a `prop list` run are subtracted so slidetool's
+      startup tax is not charged to the library) and a tolerant pixel diff. All
+      11 cases pass: mean per-channel diff ≤ 0.17 except Ventana (2.51)
+- [x] `tests/bench_remote.rs` — the same slides read from an S3-compatible
+      bucket, counting requests/bytes per phase and asserting remote pixels
+      equal local pixels *exactly*. Byte accounting excludes zero-body HEAD
+      probes (`ObjectStoreExt::head` is `get_opts` with `head: true`, whose
+      response still reports the whole-object range — counting it made a lazy
+      open look like a full download)
+- [x] `tests/upload_testdata.rs` — mirrors the bench set into the bucket
+      (multipart above 32 MiB, skips objects already present at the same size,
+      never deletes). The ZIP-packaged vendors are uploaded **extracted**, which
+      is what makes MIRAX and DICOM openable remotely at all
+- [x] Shared fixture resolution in `tests/common/mod.rs` (`BENCH_CASES`,
+      `bench_slide`, `extracted_slide_dir`, `tissue_region`) so the two benches
+      and the uploader agree on one slide set, and the ZIP vendors self-extract
+      instead of requiring their test binaries to have been run first
+
+### Known bugs surfaced by the bench
+
+- [ ] **DICOM remote open transfers the whole slide** — 84–94% of it, in one
+      64 KiB request per frame. `bench_remote` measured `DICOM/Leica-4` opening in
+      796 requests / 100.0 MB of a 107 MB slide (332 s), and
+      `DICOM/Hamamatsu-2` in **2665 requests / 165.8 MB of 198 MB (1171 s —
+      19.5 minutes)**. Every other vendor fetches 0.15–2.1%.
+
+      Cause: the fragment-enumeration loop in `parse_pixel_data`
+      (`decode/dicom.rs`) reads an 8-byte item header per fragment via
+      `Cursor::fill`, which always pulls `WINDOW` (64 KiB); `skip` then jumps past
+      that window, so the next header always misses it. One 64 KiB GET per frame
+      — 2665 × 64 KiB = 166 MB, matching the measurement exactly. Invisible
+      locally (open is ~120–200 ms off page cache), so only the remote bench
+      exposes it.
+
+      The walk itself cannot be avoided: the Basic Offset Table is **empty** in
+      both fixtures (verified), and with no offset table the fragment offsets are
+      a linked list — each position depends on the previous length. So the fix is
+      the read pattern, not the algorithm. Note the two obvious fixes pull in
+      opposite directions and must be weighed against the medium:
+      * reading only the 8 bytes needed drops transfer to ~21 KB but leaves 2665
+        *sequential* round trips (~19 min at the 400 ms/request measured here) —
+        worse remotely;
+      * a large sequential read-ahead (4–16 MB blocks) still transfers the whole
+        pixel region but in ~20 requests — roughly 13 s at the observed
+        throughput, a ~90× improvement.
+      A remote-aware read-ahead size is therefore the right shape, shared with the
+      TIFF coalescing work above.
+
+- [ ] **`open_url` ignores the environment, so it cannot reach a non-AWS
+      S3-compatible endpoint.** Its doc comment promises "Cloud credentials and
+      region/endpoint configuration are taken from the environment", but it calls
+      `object_store::parse_url`, which builds `AmazonS3Builder::new()` (not
+      `from_env()`) and passes no options — so no `AWS_*`/endpoint variable is
+      read. Against the bench bucket it falls through to the EC2 instance
+      metadata service, retries `http://169.254.169.254/latest/api/token` ten
+      times, and fails after ~2.2 s. `open_store` with a hand-built store works
+      fine (that is what `bench_remote` uses). Fix: pass `std::env::vars()`
+      through `parse_url_opts`, and align the doc comment either way.
+      Reproduce: `cargo test --release --test bench_remote -- --ignored
+      open_url_resolves`
+
+### Known parity gap surfaced by the bench
+
+- [ ] **Leica coordinates are not interchangeable with OpenSlide's.** OpenSlide
+      reports `Leica-1.scn` level 0 as the whole collection canvas
+      (53130×153470) with the image placed at `openslide.bounds-x=10778`,
+      `bounds-y=35096`; slidekit reports 36832×38432 — exactly
+      `bounds-width`×`bounds-height` — with the origin at the imaged region, and
+      exposes no `openslide.bounds-*`. Reading `(0, 0)` from OpenSlide returns
+      transparent canvas while slidekit returns tissue, so the same coordinates
+      address different pixels. Fix by expanding level 0 to the collection canvas
+      and placing the region at its offset (matching C), or at minimum by
+      exposing `openslide.bounds-*` so callers can translate. Tracked with
+      multi-region SCN under Phase 5
 
 ---
 

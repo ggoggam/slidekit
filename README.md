@@ -118,6 +118,46 @@ verify SHA-256 checksums. They skip gracefully (rather than fail) when
 downloads are disabled via `OPENSLIDE_SKIP_DOWNLOAD` — used by CI once the
 declared fixture size exceeds its budget.
 
+## Benchmarks
+
+Two benches, both `#[ignore]`d so they never run in the normal suite, and both
+assuming a warm slide cache (`mise run bench:warm-cache`).
+
+```sh
+mise run bench:setup-slidetool  # build OpenSlide 4.0.1 into .tools (once)
+mise run bench:openslide        # slidekit vs OpenSlide, one slide per vendor
+
+mise run bench:upload-slides    # mirror the bench slides into a bucket (once)
+mise run bench:remote           # the same slides read over byte-range requests
+```
+
+`bench:openslide` reports open and read latency for both readers and a tolerant
+pixel cross-check (independent JPEG decoders differ by ±1–2 per channel, so
+exact equality would flake). Note that slidekit is timed in-process while
+`slidetool` can only be timed as a whole process, so its open/read columns are
+derived by subtracting a measured process floor and a `prop list` run; the read
+column still includes a PNG encode slidekit never does. A like-for-like read
+comparison needs the in-process FFI crate, which is not built yet.
+
+`bench:remote` reads the same slides from an S3-compatible bucket, configured
+from a git-ignored `.env` (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`,
+`BUCKET_NAME`, `BUCKET_REGION`, `BUCKET_ENDPOINT_URL`); everything is confined
+to one key prefix (`SLIDEKIT_BENCH_PREFIX`, default `slidekit-bench/testdata`)
+so a shared bucket is safe. It asserts remote pixels equal local pixels
+*exactly* — same decoder over the same bytes — and counts the requests and bytes
+each phase costs. `SLIDEKIT_BENCH_ONLY=Aperio` narrows the run to one vendor and
+`SLIDEKIT_BENCH_TRACE=<KiB>` logs every request at least that large.
+
+Measured on an Aperio SVS (169 MB) over a ~50 ms-RTT endpoint: a remote open
+fetches **0.97 MB — 0.93% of the slide**, so nothing is downloaded wholesale.
+But it costs **272 sequential requests**, because the TIFF directory parse reads
+tag-by-tag and each few-byte read is its own ranged GET. Remote open latency is
+therefore round-trip-bound, not bandwidth-bound: the fix is read coalescing (see
+Phase 6 in [`PROGRESS.md`](PROGRESS.md)), not more laziness.
+
+Full results for every vendor — both benches, with methodology, caveats, and the
+defects they surfaced — are in [`docs/benchmarks.md`](docs/benchmarks.md).
+
 ## Status
 
 Core library, I/O layer, and eleven vendor drivers are implemented. Python
