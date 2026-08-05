@@ -10,7 +10,8 @@ use crate::decode::tiff::TiffLike;
 use crate::error::{OpenSlideError, Result};
 use crate::grid::TileGrid;
 use crate::grid::tilemap::TileMap;
-use crate::io::local::LocalFileReader;
+use crate::io::fs::{Located, Shared, SlideFs, SlideLocation};
+use crate::io::local::{LocalFileReader, LocalFs};
 use crate::io::{AsyncReadAt, SlideReader};
 use crate::properties::Properties;
 use crate::vendor::hamamatsu::NdpiLevel;
@@ -62,6 +63,27 @@ impl OpenSlide {
             Box::new(LocalFileReader::open(path)?),
             Box::new(LocalFileReader::open(path)?),
             path.to_path_buf(),
+            local_location(path),
+        )
+    }
+
+    /// Open a whole slide image from any [`SlideFs`] implementation.
+    ///
+    /// This is the extension point for storage this crate doesn't know about:
+    /// implement [`SlideFs`] over your own backend and multi-file formats
+    /// (MIRAX, DICOM) resolve their sibling files through it like any other.
+    /// `path` is the slide's primary file within `fs`.
+    ///
+    /// Slides opened this way read synchronously; `read_region_async` falls
+    /// back to the blocking path. Use [`open_url`](Self::open_url) or
+    /// [`open_store`](Self::open_store) for a genuinely async remote backend.
+    pub fn open_fs(fs: Arc<dyn SlideFs>, path: &str) -> Result<Self> {
+        let location = SlideLocation::new(fs.clone(), path);
+        Self::open_with_readers(
+            reader_to_box(fs.open(path)?),
+            reader_to_box(fs.open(path)?),
+            std::path::PathBuf::from(path),
+            Some(location),
         )
     }
 
@@ -78,11 +100,9 @@ impl OpenSlide {
     /// context — build the reader yourself and use the async I/O directly.
     #[cfg(feature = "object-store")]
     pub fn open_url(url: &str) -> Result<Self> {
-        use crate::io::object_store::ObjectStoreReader;
-        Self::from_async_reader(
-            ObjectStoreReader::open_url(url)?,
-            std::path::PathBuf::from(url),
-        )
+        use crate::io::object_store::ObjectStoreFs;
+        let (store, path) = ObjectStoreFs::parse_url(url)?;
+        Self::open_store(store, path)
     }
 
     /// Open a whole slide image from an [`object_store::ObjectStore`] handle and
@@ -93,9 +113,13 @@ impl OpenSlide {
         store: std::sync::Arc<dyn object_store::ObjectStore>,
         path: object_store::path::Path,
     ) -> Result<Self> {
-        use crate::io::object_store::ObjectStoreReader;
+        use crate::io::object_store::{ObjectStoreFs, ObjectStoreReader};
         let source = std::path::PathBuf::from(path.as_ref());
-        Self::from_async_reader(ObjectStoreReader::new(store, path)?, source)
+        // The slide's filesystem is the same store it was read from, so a
+        // multi-file format resolves its siblings as neighbouring keys.
+        let fs: Arc<dyn SlideFs> = Arc::new(ObjectStoreFs::new(store.clone()));
+        let location = SlideLocation::new(fs, path.as_ref());
+        Self::from_async_reader(ObjectStoreReader::new(store, path)?, source, location)
     }
 
     /// Async variant of [`open_url`](Self::open_url).
@@ -126,7 +150,11 @@ impl OpenSlide {
     /// also retained as the async backend for `read_region_async`. The single
     /// read implementation lives on the async reader; nothing is duplicated.
     #[cfg(feature = "object-store")]
-    fn from_async_reader<R>(reader: R, source: std::path::PathBuf) -> Result<Self>
+    fn from_async_reader<R>(
+        reader: R,
+        source: std::path::PathBuf,
+        location: SlideLocation,
+    ) -> Result<Self>
     where
         R: crate::io::AsyncSlideReader + Clone + 'static,
     {
@@ -136,6 +164,7 @@ impl OpenSlide {
             Box::new(BlockingReader::new(reader.clone())),
             Box::new(BlockingReader::new(reader)),
             source,
+            Some(location),
         )?;
 
         // Pre-load tile offset tables now (off any async runtime) so that
@@ -158,7 +187,15 @@ impl OpenSlide {
         detect_reader: Box<dyn SlideReader>,
         tiff_reader: Box<dyn SlideReader>,
         source: std::path::PathBuf,
+        location: Option<SlideLocation>,
     ) -> Result<Self> {
+        // Only the reader handed to the driver carries the location: it is the
+        // slide's identity, not a property of every byte stream we open.
+        let detect_reader: Box<dyn SlideReader> = match location {
+            Some(loc) => Box::new(Located::new(detect_reader, loc)),
+            None => detect_reader,
+        };
+
         // Try to parse as TIFF (most formats are TIFF-based)
         let mut tl = TiffLike::try_parse(tiff_reader).ok();
 
@@ -192,7 +229,15 @@ impl OpenSlide {
     /// Detect the vendor for a slide file without fully opening it.
     pub fn detect_vendor(path: impl AsRef<Path>) -> Option<String> {
         let path = path.as_ref();
-        let reader: Box<dyn SlideReader> = Box::new(LocalFileReader::open(path).ok()?);
+        // Carries a location so the multi-file drivers can run their sibling
+        // checks; without it a `.mrxs` file would report as unrecognised.
+        let reader: Box<dyn SlideReader> = {
+            let plain: Box<dyn SlideReader> = Box::new(LocalFileReader::open(path).ok()?);
+            match local_location(path) {
+                Some(loc) => Box::new(Located::new(plain, loc)),
+                None => plain,
+            }
+        };
 
         // Try to parse as TIFF
         let mut tl = TiffLike::try_parse(Box::new(LocalFileReader::open(path).ok()?)).ok();
@@ -676,6 +721,28 @@ impl OpenSlide {
     pub fn version() -> &'static str {
         env!("CARGO_PKG_VERSION")
     }
+}
+
+/// Build the [`SlideLocation`] for a local file: a [`LocalFs`] rooted at the
+/// containing directory, with the file's own name as the path.
+///
+/// Rooting at the parent rather than `/` keeps a slide's sibling lookups inside
+/// its own directory. Returns `None` for a name that isn't UTF-8, which the
+/// `/`-separated path API can't address; single-file formats still open fine
+/// without a location.
+fn local_location(path: &Path) -> Option<SlideLocation> {
+    let name = path.file_name()?.to_str()?;
+    let parent = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    Some(SlideLocation::new(Arc::new(LocalFs::new(parent)), name))
+}
+
+/// Adapt a shared reader from [`SlideFs::open`] into the owned form the open
+/// pipeline takes.
+fn reader_to_box(reader: Arc<dyn SlideReader>) -> Box<dyn SlideReader> {
+    Box::new(Shared::new(reader))
 }
 
 /// Run a synchronous open on a dedicated thread and await its result.

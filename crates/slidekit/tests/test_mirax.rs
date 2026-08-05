@@ -143,3 +143,47 @@ fn cmu1() {
         "smallest level should show the tissue"
     );
 }
+
+/// MIRAX opens through an `ObjectStore`, not just a local path.
+///
+/// The store is `object_store`'s own `LocalFileSystem` rooted at the extracted
+/// slide's directory. That is the same `ObjectStoreFs` code path an S3 or GCS
+/// slide takes — `list_with_delimiter` to size the `CMU-1/` data files, `get`
+/// for `Slidedat.ini` and `Index.dat`, ranged `get` for tiles — so it proves
+/// the multi-file resolution works over blob storage without inventing a mock
+/// or holding a 565 MiB fixture in memory.
+#[test]
+fn opens_over_an_object_store() {
+    let path = require_mirax_slide!();
+    let dir = path.parent().expect("extracted slide has a parent");
+
+    let store: std::sync::Arc<dyn object_store::ObjectStore> = std::sync::Arc::new(
+        object_store::local::LocalFileSystem::new_with_prefix(dir)
+            .expect("root an object store at the extracted slide directory"),
+    );
+    let remote = OpenSlide::open_store(store, object_store::path::Path::from("CMU-1.mrxs"))
+        .expect("should open MIRAX CMU-1 through an object store");
+
+    // The pyramid must be identical to the local open — the data directory was
+    // found and every zoom level parsed out of it.
+    let local = OpenSlide::open(&path).expect("should open MIRAX CMU-1 locally");
+    assert_eq!(remote.level_count(), local.level_count());
+    assert_eq!(remote.level0_dimensions(), local.level0_dimensions());
+    assert_eq!(remote.property_value("openslide.vendor"), Some("mirax"));
+
+    // Tiles come from the `Data####.dat` files, so matching pixels prove the
+    // data-file readers were opened and ranged correctly through the store.
+    let want = local.read_region(20000, 100000, 0, 256, 256).unwrap();
+    let got = remote.read_region(20000, 100000, 0, 256, 256).unwrap();
+    assert_eq!(got, want, "remote tiles should decode identically to local");
+    assert!(got.iter().any(|&p| p != 0), "region should have content");
+
+    // Associated images live in the same data files, via the nonhier records.
+    for name in ["macro", "label", "thumbnail"] {
+        assert_eq!(
+            remote.associated_image_dimensions(name),
+            local.associated_image_dimensions(name),
+            "associated {name} should resolve over the store"
+        );
+    }
+}

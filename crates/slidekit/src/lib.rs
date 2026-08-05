@@ -16,3 +16,7 @@ pub use slide::OpenSlide;
 
 // Re-export key modules for use by tests and downstream crates
 pub use io::SlideReader;
+pub use io::fs::{Entry, SlideFs, SlideLocation};
+pub use io::local::LocalFs;
+#[cfg(feature = "object-store")]
+pub use io::object_store::ObjectStoreFs;

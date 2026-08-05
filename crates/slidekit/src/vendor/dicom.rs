@@ -6,9 +6,10 @@
 //! opens the slide — this driver scans the containing directory, keeps the
 //! files whose series matches, and sorts them into levels (`ImageType[2]` =
 //! `VOLUME`) and associated images (`LABEL` → label, `OVERVIEW` → macro,
-//! `THUMBNAIL` → thumbnail), ignoring flavors it doesn't understand. Being
-//! multi-file, it only works over a local path ([`SlideReader::path`]), like
-//! MIRAX.
+//! `THUMBNAIL` → thumbnail), ignoring flavors it doesn't understand. The scan
+//! runs through the slide's [`SlideFs`], so a DICOM slide opens the same way on
+//! local disk or on blob storage, and it is fanned out across threads because
+//! each instance costs several round trips.
 //!
 //! Within a level, tiles are *frames* of one multi-frame instance. Two layouts
 //! exist: `TILED_FULL`, where frame *n* is simply the *n*-th tile in row-major
@@ -26,8 +27,10 @@
 //! — the same stance `zeiss` takes toward JPEG XR.
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+use parking_lot::Mutex;
 
 use crate::associated::AssociatedImage;
 use crate::decode::dicom::{
@@ -39,7 +42,7 @@ use crate::decode::{TileDecoder, samples_to_argb};
 use crate::error::{OpenSlideError, Result};
 use crate::grid::simple::SimpleGrid;
 use crate::io::SlideReader;
-use crate::io::local::LocalFileReader;
+use crate::io::fs::{Entry, SlideFs, SlideLocation};
 use crate::level::LevelInfo;
 use crate::properties::{Properties, names};
 
@@ -217,11 +220,9 @@ impl VendorDriver for DicomDriver {
         // also parses as TIFF and is *named* like one, defer to generic-tiff —
         // matching the C driver.
         if tl.is_some()
-            && reader.path().is_some_and(|p| {
-                p.extension().is_some_and(|e| {
-                    e.eq_ignore_ascii_case("tif") || e.eq_ignore_ascii_case("tiff")
-                })
-            })
+            && reader
+                .location()
+                .is_some_and(|loc| matches!(loc.extension().as_deref(), Some("tif") | Some("tiff")))
         {
             return Ok(false);
         }
@@ -233,15 +234,15 @@ impl VendorDriver for DicomDriver {
     }
 
     fn open(&self, reader: Box<dyn SlideReader>, _tl: Option<TiffLike>) -> Result<SlideData> {
-        let path = reader
-            .path()
+        let loc = reader
+            .location()
             .ok_or_else(|| {
                 OpenSlideError::Other(
-                    "DICOM slides span several files and require a local path".into(),
+                    "DICOM slides span several files and need a filesystem to resolve them".into(),
                 )
             })?
-            .to_path_buf();
-        open_dicom(&path)
+            .clone();
+        open_dicom(&loc, reader)
     }
 }
 
@@ -249,7 +250,7 @@ impl VendorDriver for DicomDriver {
 
 /// A file that parsed as a WSI instance, before its format is validated.
 struct ParsedFile {
-    path: PathBuf,
+    path: String,
     reader: Arc<dyn SlideReader>,
     object: DicomObject,
 }
@@ -264,13 +265,20 @@ impl ParsedFile {
     }
 }
 
-/// Parse one file, rejecting anything that isn't a WSI instance.
+/// Upper bound on the threads used to scan a slide's directory.
+///
+/// The scan is latency-bound rather than CPU-bound, so more threads than cores
+/// would still help — but a DICOM instance sitting in a folder of hundreds of
+/// files should not spawn a thread storm or a burst of requests that a store
+/// will rate-limit.
+const MAX_SCAN_THREADS: usize = 8;
+
+/// Parse an already-open file, rejecting anything that isn't a WSI instance.
 ///
 /// The SOP class is checked from the file meta group before the dataset is
 /// parsed: a directory can hold a DICOMDIR or unrelated instances, and those
 /// should cost a few hundred bytes to dismiss, not a full parse.
-fn parse_file(path: &Path) -> Result<ParsedFile> {
-    let reader: Arc<dyn SlideReader> = Arc::new(LocalFileReader::open(path)?);
+fn parse_reader(path: String, reader: Arc<dyn SlideReader>) -> Result<ParsedFile> {
     let (meta, _) = dicom::parse_file_meta(&*reader)?;
     let sop_class = meta.text(tags::MEDIA_STORAGE_SOP_CLASS_UID);
     if sop_class != Some(VL_WHOLE_SLIDE_MICROSCOPY_IMAGE_STORAGE) {
@@ -281,37 +289,89 @@ fn parse_file(path: &Path) -> Result<ParsedFile> {
     }
     let object = dicom::parse(&*reader)?;
     Ok(ParsedFile {
-        path: path.to_path_buf(),
+        path,
         reader,
         object,
     })
 }
 
-fn open_dicom(start: &Path) -> Result<SlideData> {
-    let first = parse_file(start)?;
+/// Open and parse one directory entry. The size from the listing is passed
+/// through so the open costs no extra metadata request.
+fn parse_entry(fs: &Arc<dyn SlideFs>, entry: &Entry) -> Result<ParsedFile> {
+    let reader = fs.open_sized(&entry.path, entry.size)?;
+    parse_reader(entry.path.clone(), reader)
+}
+
+/// Parse every entry, concurrently when there is more than one.
+///
+/// Each parse is independent, and on blob storage each is several round trips,
+/// so scanning serially makes open time the *sum* over the directory. Fanning
+/// out makes it roughly the slowest single instance. Results stay in input
+/// order, so a slide always assembles the same way regardless of thread
+/// scheduling.
+///
+/// A file that fails to parse yields `None` rather than an error: anything that
+/// isn't a WSI instance of this slide simply isn't part of it — a DICOMDIR, a
+/// stray file, another slide in the same folder.
+fn parse_entries(fs: &Arc<dyn SlideFs>, entries: &[Entry]) -> Vec<Option<ParsedFile>> {
+    if entries.len() < 2 {
+        return entries.iter().map(|e| parse_entry(fs, e).ok()).collect();
+    }
+
+    let threads = std::thread::available_parallelism()
+        .map(|p| p.get())
+        .unwrap_or(4)
+        .min(MAX_SCAN_THREADS)
+        .min(entries.len());
+
+    let slots: Vec<Mutex<Option<ParsedFile>>> = entries.iter().map(|_| Mutex::new(None)).collect();
+    let cursor = AtomicUsize::new(0);
+
+    std::thread::scope(|scope| {
+        for _ in 0..threads {
+            scope.spawn(|| {
+                loop {
+                    let i = cursor.fetch_add(1, Ordering::Relaxed);
+                    let Some(entry) = entries.get(i) else {
+                        break;
+                    };
+                    if let Ok(parsed) = parse_entry(fs, entry) {
+                        *slots[i].lock() = Some(parsed);
+                    }
+                }
+            });
+        }
+    });
+
+    slots.into_iter().map(Mutex::into_inner).collect()
+}
+
+fn open_dicom(loc: &SlideLocation, primary: Box<dyn SlideReader>) -> Result<SlideData> {
+    let fs = loc.fs();
+
+    // Reuse the reader detection already opened instead of opening the primary
+    // instance a second time.
+    let first = parse_reader(loc.path().to_string(), Arc::from(primary))?;
     let series = first
         .series_uid()
         .ok_or_else(|| OpenSlideError::Decode("DICOM has no SeriesInstanceUID".into()))?
         .to_string();
 
-    let mut files = vec![first];
-    let dir = start.parent().unwrap_or_else(|| Path::new("."));
-    let mut siblings: Vec<PathBuf> = std::fs::read_dir(dir)
-        .map_err(OpenSlideError::Io)?
-        .filter_map(|entry| entry.ok().map(|e| e.path()))
-        .filter(|p| p != start && p.is_file())
+    let mut entries: Vec<Entry> = fs
+        .list(loc.parent())?
+        .into_iter()
+        .filter(|e| e.path != loc.path())
         .collect();
-    // Directory order is arbitrary; sort so a slide always opens the same way.
-    siblings.sort();
+    // Listing order is arbitrary; sort so a slide always opens the same way.
+    entries.sort_by(|a, b| a.path.cmp(&b.path));
 
-    for path in siblings {
-        // Anything that isn't a WSI instance of this slide is simply not part
-        // of it — a DICOMDIR, a stray file, another slide in the same folder.
-        match parse_file(&path) {
-            Ok(file) if file.series_uid() == Some(series.as_str()) => files.push(file),
-            _ => continue,
-        }
-    }
+    let mut files = vec![first];
+    files.extend(
+        parse_entries(fs, &entries)
+            .into_iter()
+            .flatten()
+            .filter(|f| f.series_uid() == Some(series.as_str())),
+    );
 
     let mut properties = Properties::new();
     properties.insert(names::VENDOR, "dicom");
@@ -440,7 +500,7 @@ impl LevelGroup {
                     self.concatenation_uid.as_deref().unwrap_or("<none>"),
                     index + 1,
                     slot + 1,
-                    file.path.display()
+                    file.path
                 )));
             }
         }

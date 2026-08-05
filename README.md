@@ -46,7 +46,7 @@ Mirrors the OpenSlide C API. All methods below are implemented on `OpenSlide`.
 
 | Area | Methods |
 |------|---------|
-| Open | `open`, `open_url`, `open_store`, `open_url_async`, `open_store_async`, `detect_vendor` |
+| Open | `open`, `open_url`, `open_store`, `open_fs`, `open_url_async`, `open_store_async`, `detect_vendor` |
 | Levels | `level_count`, `level0_dimensions`, `level_dimensions`, `level_downsample`, `best_level_for_downsample` |
 | Read | `read_region`, `read_region_async`, `read_region_into` |
 | Properties | `property_names`, `property_value` |
@@ -76,10 +76,34 @@ Mirrors the OpenSlide C API. All methods below are implemented on `OpenSlide`.
 |---------|:------:|-------|
 | Local file | ✅ | `pread`-based positioned reads |
 | S3 / GCS / Azure / HTTP | ✅ | Byte-range requests via `object_store`; no full download |
+| Custom (`SlideFs`) | ✅ | Implement the trait for any other storage |
 | `mmap` local reader | ❌ | Planned optimization |
 
 Enabled by default via the `object-store` feature (disable for a
 local-file-only build with no async/cloud dependencies).
+
+### Multi-file formats
+
+MIRAX (`.mrxs` plus a sibling data directory) and DICOM (a directory of
+instances sharing a SeriesInstanceUID) need to resolve and enumerate files, not
+just read one. They do that through `SlideFs`, an `fsspec`-style namespace with
+`open` / `read` / `list` / `exists` over `/`-separated relative paths, so both
+formats open from blob storage on the same `open_url` / `open_store` call as
+any single-file slide:
+
+```rust
+let slide = OpenSlide::open_url("s3://bucket/slides/CMU-1.mrxs")?;
+```
+
+Opening is kept to as few requests as the format allows: one directory listing
+supplies the size of every data file, so readers are built without a `HEAD`
+each, metadata files are fetched whole in a single `GET`, and DICOM's directory
+scan runs concurrently rather than one instance at a time. The filesystem is
+consulted only while opening — `read_region` reads through the readers the
+driver already holds, so nothing changes on the local path.
+
+To read from storage this crate doesn't know about, implement `SlideFs` and
+open with `OpenSlide::open_fs(fs, "slides/CMU-1.mrxs")`.
 
 ## Building
 

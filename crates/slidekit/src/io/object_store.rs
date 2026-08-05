@@ -8,6 +8,7 @@ use tokio::runtime::Runtime;
 use url::Url;
 
 use crate::error::{OpenSlideError, Result};
+use crate::io::fs::{Entry, SlideFs, validate};
 use crate::io::{AsyncSlideReader, SlideReader};
 
 /// Shared multi-threaded Tokio runtime used to drive async I/O from
@@ -102,6 +103,17 @@ impl ObjectStoreReader {
         })
     }
 
+    /// Build a reader for an object whose size is already known, skipping the
+    /// HEAD request [`connect`](Self::connect) would issue.
+    ///
+    /// A directory listing reports the size of every object in it, so a
+    /// multi-file slide can open all of its data files off one `LIST` instead
+    /// of one `HEAD` each. The size must be correct: reads are clamped to it,
+    /// so an undersized value silently truncates.
+    pub fn with_size(store: Arc<dyn ObjectStore>, path: StorePath, size: u64) -> Self {
+        Self { store, path, size }
+    }
+
     /// Synchronous wrapper around [`connect`](Self::connect).
     pub fn new(store: Arc<dyn ObjectStore>, path: StorePath) -> Result<Self> {
         runtime().block_on(Self::connect(store, path))
@@ -156,6 +168,114 @@ impl AsyncSlideReader for ObjectStoreReader {
 
     async fn size(&self) -> Result<u64> {
         Ok(self.size)
+    }
+}
+
+/// A [`SlideFs`] over an [`ObjectStore`] — the remote counterpart to
+/// [`LocalFs`](crate::io::local::LocalFs).
+///
+/// The filesystem is rooted at the store itself, so paths are object keys
+/// (`slides/CMU-1.mrxs`). This is what makes multi-file formats work on blob
+/// storage: MIRAX resolves its `CMU-1/` data directory as a key prefix, and
+/// DICOM enumerates a slide's instances with one `LIST`.
+///
+/// Every method drives async store calls to completion on the shared
+/// [`runtime`], so — like [`BlockingReader`] — it must not be called from
+/// inside an async context. The async open entry points on `OpenSlide` already
+/// run the whole open off-runtime.
+#[derive(Clone)]
+pub struct ObjectStoreFs {
+    store: Arc<dyn ObjectStore>,
+}
+
+impl ObjectStoreFs {
+    pub fn new(store: Arc<dyn ObjectStore>) -> Self {
+        Self { store }
+    }
+
+    /// Parse a URL into a store handle and the object's path within it.
+    ///
+    /// Supported schemes mirror `object_store`: `file://`, `s3://`, `gs://`,
+    /// `az://`, `http(s)://`. Returned separately so the caller can build both
+    /// a reader for the object and a filesystem over its store.
+    pub fn parse_url(url: &str) -> Result<(Arc<dyn ObjectStore>, StorePath)> {
+        let parsed = Url::parse(url)
+            .map_err(|e| OpenSlideError::InvalidArgument(format!("invalid URL '{url}': {e}")))?;
+        let (store, path) = object_store::parse_url(&parsed)?;
+        Ok((Arc::from(store), path))
+    }
+
+    /// The underlying store handle.
+    pub fn store(&self) -> &Arc<dyn ObjectStore> {
+        &self.store
+    }
+
+    fn resolve(&self, path: &str) -> Result<StorePath> {
+        validate(path)?;
+        Ok(StorePath::from(path))
+    }
+}
+
+impl SlideFs for ObjectStoreFs {
+    fn open(&self, path: &str) -> Result<Arc<dyn SlideReader>> {
+        let path = self.resolve(path)?;
+        let reader = ObjectStoreReader::new(self.store.clone(), path)?;
+        Ok(Arc::new(BlockingReader::new(reader)))
+    }
+
+    fn open_sized(&self, path: &str, size: u64) -> Result<Arc<dyn SlideReader>> {
+        let path = self.resolve(path)?;
+        let reader = ObjectStoreReader::with_size(self.store.clone(), path, size);
+        Ok(Arc::new(BlockingReader::new(reader)))
+    }
+
+    fn list(&self, dir: &str) -> Result<Vec<Entry>> {
+        let prefix = self.resolve(dir)?;
+        // `list_with_delimiter` keeps this non-recursive: a MIRAX data
+        // directory beside 200 other slides costs one request for its own keys,
+        // not a walk of the whole bucket.
+        let listing = runtime().block_on(async {
+            let prefix = (!dir.is_empty()).then_some(&prefix);
+            self.store.list_with_delimiter(prefix).await
+        })?;
+
+        Ok(listing
+            .objects
+            .into_iter()
+            .filter_map(|meta| {
+                let path = meta.location.as_ref().to_string();
+                // Some stores expose a zero-length marker object for the
+                // prefix itself; it is not a file in the slide.
+                if path == dir {
+                    return None;
+                }
+                Some(Entry {
+                    path,
+                    size: meta.size,
+                })
+            })
+            .collect())
+    }
+
+    fn read(&self, path: &str) -> Result<Vec<u8>> {
+        let path = self.resolve(path)?;
+        // One whole-object GET. The default impl would cost a size lookup plus
+        // a range read; these files (Slidedat.ini, Index.dat) are small enough
+        // that the extra round trip dominates.
+        let bytes = runtime().block_on(async {
+            let result = self.store.get(&path).await?;
+            result.bytes().await
+        })?;
+        Ok(bytes.to_vec())
+    }
+
+    fn exists(&self, path: &str) -> Result<bool> {
+        let path = self.resolve(path)?;
+        match runtime().block_on(self.store.head(&path)) {
+            Ok(_) => Ok(true),
+            Err(object_store::Error::NotFound { .. }) => Ok(false),
+            Err(e) => Err(e.into()),
+        }
     }
 }
 
@@ -236,6 +356,72 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    /// A store holding a MIRAX-shaped layout: `CMU-1.mrxs` beside a `CMU-1/`
+    /// prefix of data files.
+    fn multi_file_store() -> ObjectStoreFs {
+        let store = InMemory::new();
+        let put = |path: &str, data: &[u8]| {
+            runtime()
+                .block_on(store.put(&StorePath::from(path), PutPayload::from(data.to_vec())))
+                .unwrap();
+        };
+        put("CMU-1.mrxs", b"mrxs-stub");
+        put("CMU-1/Slidedat.ini", b"[GENERAL]\nSLIDE_ID=x\n");
+        put("CMU-1/Index.dat", b"01.02");
+        put("CMU-1/Data0000.dat", &[7u8; 64]);
+        put("other-slide.svs", b"unrelated");
+        ObjectStoreFs::new(Arc::new(store))
+    }
+
+    #[test]
+    fn lists_one_prefix_without_walking_the_bucket() {
+        let fs = multi_file_store();
+        let mut entries = fs.list("CMU-1").unwrap();
+        entries.sort_by(|a, b| a.path.cmp(&b.path));
+
+        let names: Vec<&str> = entries.iter().map(|e| e.file_name()).collect();
+        assert_eq!(names, ["Data0000.dat", "Index.dat", "Slidedat.ini"]);
+        // Paths are full keys, ready to hand back to `open`/`open_sized`.
+        assert_eq!(entries[0].path, "CMU-1/Data0000.dat");
+        // Sizes come free with the listing — this is what removes the HEADs.
+        assert_eq!(entries[0].size, 64);
+
+        // The sibling slide at the root is not part of this prefix.
+        let root: Vec<String> = fs.list("").unwrap().into_iter().map(|e| e.path).collect();
+        assert!(root.contains(&"CMU-1.mrxs".to_string()));
+        assert!(!root.iter().any(|p| p.starts_with("CMU-1/")));
+    }
+
+    #[test]
+    fn open_sized_skips_the_head_and_still_reads() {
+        let fs = multi_file_store();
+        let reader = fs.open_sized("CMU-1/Data0000.dat", 64).unwrap();
+        assert_eq!(reader.size().unwrap(), 64);
+
+        let mut buf = [0u8; 8];
+        reader.read_exact_at(16, &mut buf).unwrap();
+        assert_eq!(buf, [7u8; 8]);
+    }
+
+    #[test]
+    fn reads_whole_files_and_probes_existence() {
+        let fs = multi_file_store();
+        assert_eq!(fs.read("CMU-1/Index.dat").unwrap(), b"01.02");
+        assert!(fs.exists("CMU-1/Slidedat.ini").unwrap());
+        // A missing object is a clean `false`, not an error — detection relies
+        // on being able to ask cheaply.
+        assert!(!fs.exists("CMU-1/Nope.dat").unwrap());
+        assert!(!fs.exists("Missing/Slidedat.ini").unwrap());
+    }
+
+    #[test]
+    fn refuses_paths_that_escape_the_store() {
+        let fs = multi_file_store();
+        assert!(fs.open("../elsewhere/key").is_err());
+        assert!(fs.read("/absolute/key").is_err());
+        assert!(fs.exists("CMU-1/../../etc/passwd").is_err());
     }
 
     #[test]

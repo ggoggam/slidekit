@@ -9,8 +9,9 @@
 //! Because there is no TIFF container, this driver produces [`MiraxLevel`]s
 //! that own their own data-file readers and a per-tile placement list; the
 //! read path (`slide.rs`) dispatches to [`MiraxLevel::read_region`] instead of
-//! the TIFF tile path. Being multi-file, MIRAX only works over a local path
-//! (`SlideReader::path`).
+//! the TIFF tile path. Sibling files are resolved through the slide's
+//! [`SlideFs`], so a MIRAX slide opens the same way on local disk or on blob
+//! storage.
 //!
 //! The pyramid geometry follows OpenSlide's `mirax.c`: images are downsampled
 //! by 2 and concatenated `image_divisions` at a time; once concatenation
@@ -18,7 +19,6 @@
 //! by an explicit per-camera-position map (`VIMSLIDE_POSITION_BUFFER`).
 
 use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::associated::AssociatedImage;
@@ -28,7 +28,7 @@ use crate::decode::tiff::TiffLike;
 use crate::error::{OpenSlideError, Result};
 use crate::grid::simple::SimpleGrid;
 use crate::io::SlideReader;
-use crate::io::local::LocalFileReader;
+use crate::io::fs::{self, SlideFs, SlideLocation};
 use crate::level::LevelInfo;
 use crate::properties::{Properties, names};
 
@@ -146,47 +146,51 @@ impl VendorDriver for MiraxDriver {
 
     fn detect(&self, reader: &dyn SlideReader, _tl: Option<&mut TiffLike>) -> Result<bool> {
         // MIRAX is defined by a `.mrxs` file with a sibling `Foo/Slidedat.ini`.
-        let Some(path) = reader.path() else {
+        let Some(loc) = reader.location() else {
             return Ok(false);
         };
-        if !has_mrxs_extension(path) {
+        let Some(dir) = data_dir(loc) else {
             return Ok(false);
-        }
-        Ok(slidedat_path(path).is_some_and(|p| p.exists()))
+        };
+        // One existence probe, and only for a `.mrxs` name — no cost to any
+        // other format. `detect_format` reads an `Err` as "not this driver", so
+        // a transient failure is reported as `false` here rather than aborting
+        // detection for every remaining driver.
+        Ok(loc
+            .fs()
+            .exists(&fs::join(&dir, "Slidedat.ini"))
+            .unwrap_or(false))
     }
 
     fn open(&self, reader: Box<dyn SlideReader>, _tl: Option<TiffLike>) -> Result<SlideData> {
-        let path = reader
-            .path()
-            .ok_or_else(|| OpenSlideError::Other("MIRAX requires a local file path".into()))?
-            .to_path_buf();
-        let dir =
-            data_dir(&path).ok_or_else(|| OpenSlideError::Other("not a .mrxs path".into()))?;
-        open_mirax(&dir)
+        let loc = reader.location().ok_or_else(|| {
+            OpenSlideError::Other(
+                "MIRAX slides span several files and need a filesystem to resolve them".into(),
+            )
+        })?;
+        let dir = data_dir(loc).ok_or_else(|| OpenSlideError::Other("not a .mrxs path".into()))?;
+        open_mirax(loc.fs(), &dir)
     }
 }
 
-fn has_mrxs_extension(path: &Path) -> bool {
-    path.extension()
-        .is_some_and(|e| e.eq_ignore_ascii_case("mrxs"))
-}
-
-/// `Foo.mrxs` → `Foo/` data directory.
-fn data_dir(path: &Path) -> Option<PathBuf> {
-    if !has_mrxs_extension(path) {
+/// `Foo.mrxs` → the `Foo/` data directory beside it.
+///
+/// The suffix is stripped by length rather than rebuilt from the lowercased
+/// extension, so `FOO.MRXS` maps to `FOO/` and not `foo/`.
+fn data_dir(loc: &SlideLocation) -> Option<String> {
+    if loc.extension().as_deref() != Some("mrxs") {
         return None;
     }
-    Some(path.with_extension(""))
-}
-
-fn slidedat_path(path: &Path) -> Option<PathBuf> {
-    data_dir(path).map(|d| d.join("Slidedat.ini"))
+    let path = loc.path();
+    Some(path[..path.len() - ".mrxs".len()].to_string())
 }
 
 // ───────────────────────────── open ────────────────────────────────────────
 
-fn open_mirax(dir: &Path) -> Result<SlideData> {
-    let ini_bytes = std::fs::read(dir.join("Slidedat.ini"))?;
+fn open_mirax(fs: &Arc<dyn SlideFs>, dir: &str) -> Result<SlideData> {
+    // One whole-object read rather than open-then-range: over blob storage that
+    // is a single GET instead of a HEAD plus a GET.
+    let ini_bytes = fs.read(&fs::join(dir, "Slidedat.ini"))?;
     let ini = Ini::parse(&ini_bytes);
 
     // [GENERAL]
@@ -223,14 +227,32 @@ fn open_mirax(dir: &Path) -> Result<SlideData> {
         .to_string();
 
     // [DATAFILE] — index → filename, opened as shared readers.
+    //
+    // One directory listing gives every data file's size up front, so each
+    // reader is built with `open_sized` and skips its own metadata lookup. On
+    // blob storage that collapses FILE_COUNT round trips into one; locally it
+    // is the same `read_dir` the open would have done anyway.
     let file_count = ini.get_int("DATAFILE", "FILE_COUNT")? as usize;
+    let sizes: HashMap<String, u64> = fs
+        .list(dir)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|e| (e.file_name().to_string(), e.size))
+        .collect();
+
     let mut readers: Vec<Arc<dyn SlideReader>> = Vec::with_capacity(file_count);
     for i in 0..file_count {
         let name = ini
             .get_str("DATAFILE", &format!("FILE_{i}"))
             .ok_or_else(|| OpenSlideError::Decode(format!("MIRAX missing FILE_{i}")))?;
-        let reader = LocalFileReader::open(dir.join(name))?;
-        readers.push(Arc::new(reader));
+        let path = fs::join(dir, name);
+        // Fall back to a plain open when the listing didn't cover this name —
+        // the file may still exist (an unlistable store, an odd layout).
+        let reader = match sizes.get(name) {
+            Some(&size) => fs.open_sized(&path, size)?,
+            None => fs.open(&path)?,
+        };
+        readers.push(reader);
     }
     let readers = Arc::new(readers);
 
@@ -254,7 +276,7 @@ fn open_mirax(dir: &Path) -> Result<SlideData> {
 
     // Camera-position map (level-0 pixel coords), one (x,y) per photo.
     let npositions = (images_x / image_divisions) * (images_y / image_divisions);
-    let index_bytes = std::fs::read(dir.join(&index_name))?;
+    let index_bytes = fs.read(&fs::join(dir, &index_name))?;
     let index = IndexFile::parse(&index_bytes, &slide_id)?;
     let positions = read_positions(
         &ini,

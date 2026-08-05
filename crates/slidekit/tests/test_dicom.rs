@@ -273,3 +273,55 @@ fn hamamatsu_2_tiled_full() {
     assert_eq!(px.len(), 256 * 256);
     assert!(px.iter().any(|&p| (p >> 24) == 0xFF));
 }
+
+/// A DICOM slide opens through an `ObjectStore`, not just a local directory.
+///
+/// The store is `object_store`'s own `LocalFileSystem` rooted at the extracted
+/// slide's directory — the same `ObjectStoreFs` code path an S3 or GCS slide
+/// takes. This is the interesting case for DICOM specifically, because opening
+/// the slide means *enumerating* the directory to find the instances that share
+/// its SeriesInstanceUID, not merely resolving a known sibling name.
+#[test]
+fn opens_over_an_object_store() {
+    let path = require_dicom_slide!("DICOM/Leica-4.zip");
+    let dir = path.parent().expect("extracted instance has a parent");
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .expect("instance name is UTF-8");
+
+    let store: std::sync::Arc<dyn object_store::ObjectStore> = std::sync::Arc::new(
+        object_store::local::LocalFileSystem::new_with_prefix(dir)
+            .expect("root an object store at the extracted slide directory"),
+    );
+    let remote = OpenSlide::open_store(store, object_store::path::Path::from(name))
+        .expect("should open DICOM Leica-4 through an object store");
+
+    let local = OpenSlide::open(&path).expect("should open DICOM Leica-4 locally");
+
+    // All three VOLUME instances were found by the directory scan; a level
+    // count of 1 would mean only the instance we pointed at was picked up.
+    assert_eq!(remote.level_count(), local.level_count());
+    assert!(
+        remote.level_count() >= 3,
+        "sibling instances should be found"
+    );
+    assert_eq!(remote.level0_dimensions(), local.level0_dimensions());
+    assert_eq!(remote.property_value("openslide.vendor"), Some("dicom"));
+
+    // Frames decode identically, so the per-instance readers range correctly.
+    let (w0, h0) = local.level0_dimensions();
+    let want = local.read_region(w0 / 2, h0 / 2, 0, 256, 256).unwrap();
+    let got = remote.read_region(w0 / 2, h0 / 2, 0, 256, 256).unwrap();
+    assert_eq!(
+        got, want,
+        "remote frames should decode identically to local"
+    );
+
+    // The associated images are separate instances again, found by the scan.
+    let mut remote_names = remote.associated_image_names();
+    let mut local_names = local.associated_image_names();
+    remote_names.sort();
+    local_names.sort();
+    assert_eq!(remote_names, local_names);
+}

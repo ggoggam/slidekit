@@ -1,3 +1,4 @@
+pub mod fs;
 pub mod local;
 #[cfg(feature = "object-store")]
 pub mod object_store;
@@ -9,6 +10,7 @@ use std::pin::Pin;
 use bytes::Bytes;
 
 use crate::error::Result;
+use crate::io::fs::SlideLocation;
 
 /// Abstraction over local files and remote blob storage.
 ///
@@ -22,12 +24,13 @@ pub trait SlideReader: Send + Sync {
     /// Total size of the underlying data source in bytes.
     fn size(&self) -> Result<u64>;
 
-    /// Local filesystem path this reader was opened from, if any.
+    /// Where this slide lives — the filesystem and the path within it.
     ///
-    /// Only local readers know their path; remote/in-memory readers return
-    /// `None`. Multi-file formats (MIRAX) need it to locate sibling files next
-    /// to the primary file, and so only work over a local path.
-    fn path(&self) -> Option<&std::path::Path> {
+    /// Only a slide's *primary* reader carries a location, and only when it was
+    /// opened through an entry point that knows one. Multi-file formats (MIRAX,
+    /// DICOM) use it to reach the rest of the slide; single-file drivers ignore
+    /// it. See [`fs::SlideFs`].
+    fn location(&self) -> Option<&SlideLocation> {
         None
     }
 
