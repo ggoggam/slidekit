@@ -38,8 +38,10 @@
 - [x] `OpenSlide::associated_image_names()`
 - [x] `OpenSlide::associated_image_dimensions(name)`
 - [x] `OpenSlide::read_associated_image(name)`
-- [x] `OpenSlide::icc_profile()`
+- [x] `OpenSlide::icc_profile()` — `Result<Option<&[u8]>>`; read on demand
+- [x] `OpenSlide::icc_profile_size()` — size without reading
 - [x] `OpenSlide::associated_image_icc_profile(name)`
+- [x] `OpenSlide::associated_image_icc_profile_size(name)`
 - [x] `OpenSlide::set_cache(cache)`
 - [x] `OpenSlide::version()`
 - [ ] `OpenSlide::error()` — error-state string (C API compat)
@@ -91,6 +93,12 @@
 - [x] `SlideFs` trait — `fsspec`-style namespace (`open`/`read`/`list`/`exists` over `/`-separated relative paths) that multi-file formats resolve siblings through; `SlideLocation` replaces the old `SlideReader::path()` (`io/fs.rs`). Path validation rejects `..`/absolute paths, since MIRAX takes data-file names from inside `Slidedat.ini`
 - [x] `LocalFs` — directory-rooted `SlideFs` (`io/local.rs`)
 - [x] `ObjectStoreFs` — store-rooted `SlideFs`, so MIRAX/DICOM open from S3/GCS/Azure/HTTP; `open_sized` builds readers from listing sizes to avoid a `HEAD` per file (`io/object_store.rs`)
+- [x] Block read-ahead reader (`io/readahead.rs`) — wraps a `SlideReader` and serves
+      small reads from cached blocks, growing on sequential access; applied to
+      `object_store` readers only. See Phase 6
+- [x] `SlideReader::read_ranges` — batched gather, so a caller that knows every
+      range it needs says so once. Overridden by `BlockingReader` (drives
+      `object_store::get_ranges`) and `ReadAhead`; **wrappers must forward it**
 - [ ] `mmap`-based local reader (performance optimization)
 - [ ] Mock reader for unit tests
 
@@ -182,7 +190,7 @@
 - [x] `trestle` — Trestle TIFF (`vendor/trestle.rs`) — detect + open + properties + tile decode
 - [x] `philips` — Philips TIFF (`vendor/philips.rs`) — detect + open + XML-driven level fixup + properties (mpp, objective) + associated images + tile decode
 - [x] `ventana` — Roche Ventana BIF (`vendor/ventana.rs`) — detect (XMLPacket + iScan) + open + initial-XML properties (objective power, mpp) + level enumeration (level=/mag= validation) + AOI stitch geometry → `TileMap` + associated images (macro/thumbnail) + ICC. Geometry/parse unit-tested; end-to-end `test_ventana.rs` gated on a Ventana fixture not yet in `testdata.yaml` (multi-GB; needs a real sha256/size)
-- [x] `leica` — Leica SCN (`vendor/leica.rs`) — TIFF+XML (not SQLite); detect (`scn` namespace in dir-0 ImageDescription) + open + XML-driven level selection from the main image's `<dimension ifd=…>` children + properties (objective power, mpp, `leica.*` metadata, barcode) + macro associated image (via the new tiled-image decode path) + ICC. Single brightfield main image fully supported; multi-region SCN (multiple main images composited at collection offsets) deferred — the read path keys one IFD per level, so `open` errors clearly. XML parse/classification unit-tested; end-to-end `test_leica.rs` against `Leica/Leica-1.scn` (6 tests passing)
+- [x] `leica` — Leica SCN (`vendor/leica.rs`) — TIFF+XML (not SQLite); detect (`scn` namespace in dir-0 ImageDescription) + open + XML-driven level selection from the main image's `<dimension ifd=…>` children + properties (objective power, mpp, `leica.*` metadata, barcode) + macro associated image (via the new tiled-image decode path) + ICC. Single brightfield main image fully supported. A level is the whole **collection canvas** with the region placed on it at `openslide.bounds-x`/`-y`, matching the C driver, so slidekit and OpenSlide coordinates address the same pixels (nm-per-pixel = `view.sizeX / dimension.sizeX`, x scale for both axes; level = `ceil(collection.size / that)`; origin = `floor(view.offset / that)`); `openslide.bounds-*` and `openslide.region[0].*` are set. Multi-region SCN (several main images composited on that canvas) is still deferred — the read path keys one IFD per level, so `open` errors clearly. XML parse/classification unit-tested; end-to-end `test_leica.rs` against `Leica/Leica-1.scn` (6 tests passing)
 - [ ] `sakura` — Sakura (SQLite-based). **Blocked on test data:** the OpenSlide test-data server has no `Sakura/` directory, so a driver could not meet the per-vendor definition of done (no fixture to integration-test or bench against)
 - [x] `hamamatsu` — Hamamatsu NDPI (`vendor/hamamatsu.rs`) — detect (TIFF + tag 65420) + open + directory classification by source lens (>0 pyramid, -1 macro) + z=0 focal-plane pyramid + **restart-marker JPEG tiling** (each level is one giant single-strip JPEG; tiles reconstructed as header + one restart interval's entropy + EOI, SOF resized, decoded by the stock `JpegDecoder`) via a new `LevelData.ndpi` read path + `NDPI_MCU_STARTS` tag fast-path with lazy restart-marker scan fallback + properties (objective, X/Y offsets, reference, `NDPI_PROPERTY_MAP` → `hamamatsu.*`, mpp) + macro associated image + ICC. JPEG-marker parse / MCU geometry / restart-marker scan / property-map unit-tested; end-to-end `test_hamamatsu.rs` against `Hamamatsu/CMU-1.ndpi` (6 tests passing). **VMS/VMU** (multi-file index formats, need a multi-blob reader), **z-stacks**, and **`scale_denom` derived levels** deferred
 - [x] `mirax` — 3DHistech MRXS (`vendor/mirax.rs`) — multi-file format (`.mrxs` + sibling `Foo/` dir of `Slidedat.ini`, `Index.dat`, `Data####.dat`). Reaches sibling files through the slide's `SlideFs` (`io/fs.rs`), so it opens from a local directory or blob storage alike; one directory listing sizes every `Data####.dat` so the readers are built without a metadata request each. Parses the INI (levels/datafiles/nonhier groups) + the binary `Index.dat` (hier data pages → `(image_index, offset, length, fileno)` tile entries; nonhier records → associated images + `VIMSLIDE_POSITION_BUFFER`) + the 9-byte camera-position buffer. Builds per-level placed-subtile lists via faithful `mirax.c` geometry (cumulative concat exponents, subtile expansion, `get_tile_position` camera-position math, level-0 active-position filtering), rendered through a new `LevelData.mirax` read path (`MiraxLevel` owns the data-file readers + decodes standalone JPEG blobs). Properties (`mirax.*` dump, objective, mpp, background) + macro/label/thumbnail associated images. INI/nonhier-offset/base-dim/position unit-tested; end-to-end `test_mirax.rs` against `Mirax/CMU-1.zip` (6 tests passing; 10 levels, 109240×220696, verified against the thumbnail). **Fluorescence** (multi-channel), **PNG/BMP tiles**, **`StitchingIntensityLayer` (zlib) position fallback**, and **openslide.bounds-\*** deferred; extreme-zoom levels show faint subtile seams from integer (vs cairo subpixel) compositing
@@ -193,25 +201,37 @@
 
 ## Phase 6: Streaming Optimization
 
-- [ ] Lazy tile loading — only fetch tiles when `read_region` is called
-- [ ] **Batched range requests** — combine adjacent reads into one request.
-      Measured by `bench_remote.rs` against a real S3-compatible bucket
-      (~50 ms RTT, ~390 ms observed per request): opening `Aperio/CMU-1.svs`
-      (169 MB) fetches only **0.97 MB (0.93%)** — so remote reads are genuinely
-      lazy and nothing is downloaded wholesale — but it takes **272 sequential
-      requests** and ~107 s, because `read_directory` reads each IFD entry, and
-      each out-of-line tag value, as its own few-byte ranged GET. The region read
-      itself is already efficient (25 requests, 0.61 MB). **This is the single
-      biggest remote-performance item: a read-ahead/coalescing reader for
-      `AsyncSlideReader` (serve small reads from ~64 KB–1 MB blocks) should
-      collapse those 272 requests into a handful.** Laziness is not the gap;
-      granularity is.
-- [ ] Adaptive cache sizing for remote vs. local files
+- [x] **Block read-ahead for remote readers** (`io/readahead.rs`) — small reads
+      are served from cached blocks, so a TIFF directory parse costs one fetch per
+      IFD region instead of one ranged GET per tag. The block doubles on
+      sequential access (up to 4 MiB) and resets to 64 KiB on anything else, which
+      is what lets a DICOM fragment walk or an NDPI restart-marker scan finish
+      remotely at all without a random tile read pulling megabytes. Bounded at
+      16 MiB per reader; clones share one cache; `object_store` readers only —
+      local files already have the page cache. Took remote open from 164–2665
+      requests to 10–29 across the vendor set (see `docs/benchmarks.md`)
+- [x] **Batched range requests** — `SlideReader::read_ranges` gathers a set of
+      ranges into one call; `BlockingReader` hands it to `object_store::get_ranges`
+      (which coalesces neighbours and parallelizes the rest) and `ReadAhead` serves
+      cache hits and batches the misses. Used by `read_region` (TIFF), the DICOM
+      frame path, and the Zeiss subblock-header pass. Region reads across the
+      bench set: 144 → 32 requests; Zeiss open 79.7 s → 11.9 s.
+      **Note for future wrappers:** `Located`/`Shared` must forward it explicitly,
+      or the trait default silently unrolls the batch into one read per range
+- [x] Lazy tile loading — `read_region` fetches tiles and nothing else; DICOM
+      frame offsets are resolved on demand rather than walked at open
+      (`decode/dicom::FrameIndex`), and DICOM ICC profiles are recorded by
+      location rather than loaded (`Value::Bulk`)
+- [ ] Adaptive cache sizing for remote vs. local files — the read-ahead block
+      sizes were chosen to fit the access patterns of the eleven bench slides and
+      validated by request counts, not swept
 - [ ] Connection pooling for HTTP backend — note the client already reuses
       connections; a keep-alive probe against the bench endpoint measured ~583 ms
       per request on an *established* connection vs ~50 ms network RTT, so
       per-request latency there is the endpoint's, not a missing pool
-- [ ] Byte-range efficiency tests (mock HTTP server via `wiremock`)
+- [x] Byte-range efficiency tests (mock HTTP server via `wiremock`) —
+      `tests/test_streaming.rs`, including a request-count assertion that a
+      synchronous region read coalesces its tiles
 
 ### Benchmark harness (supporting Phase 6 + the per-vendor bench requirement)
 
@@ -235,62 +255,102 @@
       and the uploader agree on one slide set, and the ZIP vendors self-extract
       instead of requiring their test binaries to have been run first
 
-### Known bugs surfaced by the bench
+### Defects surfaced by the bench
 
-- [ ] **DICOM remote open transfers the whole slide** — 84–94% of it, in one
-      64 KiB request per frame. `bench_remote` measured `DICOM/Leica-4` opening in
-      796 requests / 100.0 MB of a 107 MB slide (332 s), and
-      `DICOM/Hamamatsu-2` in **2665 requests / 165.8 MB of 198 MB (1171 s —
-      19.5 minutes)**. Every other vendor fetches 0.15–2.1%.
+Fixed, with the measurements that caught them and now guard them:
 
-      Cause: the fragment-enumeration loop in `parse_pixel_data`
-      (`decode/dicom.rs`) reads an 8-byte item header per fragment via
-      `Cursor::fill`, which always pulls `WINDOW` (64 KiB); `skip` then jumps past
-      that window, so the next header always misses it. One 64 KiB GET per frame
-      — 2665 × 64 KiB = 166 MB, matching the measurement exactly. Invisible
-      locally (open is ~120–200 ms off page cache), so only the remote bench
-      exposes it.
+- [x] **DICOM remote open transferred the whole slide** — 84–94% of it, one
+      64 KiB request per frame: `DICOM/Hamamatsu-2` opened in **2665 requests /
+      165.8 MB of 198 MB (1171 s)**. Three causes, all fixed. The fragment walk
+      ran at open for every instance (now deferred to `FrameIndex`, incremental
+      and memoized); it ran even for instances carrying an Extended Offset Table,
+      which the old code only consulted *after* walking to it (Hamamatsu-2 has one
+      for every instance, so it now never walks — 19 requests / 1.32 MB); and a
+      13.1 MB ICC profile embedded in *each* instance was materialised for all of
+      them, 49 MB of duplicates per open (now `Value::Bulk`, read from one
+      instance on demand). Where a walk is genuinely unavoidable — no offset table
+      of either kind, as on `DICOM/Leica-4` — it is now a sequential scan in
+      growing blocks, 11 requests rather than thousands
+- [x] **`open_url` ignored the environment**, so it could not reach a non-AWS
+      S3-compatible endpoint: `object_store::parse_url` builds
+      `AmazonS3Builder::new()` (not `from_env()`) and passes no options, so no
+      `AWS_*` variable was read and the open fell through to the EC2 instance
+      metadata service, failing after ~2.2 s. Now goes through `parse_url_opts`
+      with the environment filtered to the prefixes each builder's own `from_env()`
+      consults (`AWS_`/`AZURE_`/`GOOGLE_`, plus `SERVICE_ACCOUNT`/`MSI_ENDPOINT`).
+      The filter matters: `parse_url_opts` also accepts bare `region`/`bucket`/
+      `endpoint`/`token` keys, so forwarding the whole environment would let an
+      unrelated variable redirect a slide read.
+      `bench_remote::open_url_resolves_config_from_environment` was a diagnostic
+      that printed what happened; it is an assertion now
+- [x] **TIFF open was round-trip-bound** — 164–272 requests for well under 1 MB.
+      Fixed by the read-ahead layer above; bytes rose modestly (0.11 → 0.62 MB on
+      Trestle) in exchange for 180 fewer requests, which is the right trade at
+      ~583 ms per request but is a trade, not a free win
+- [x] **Hamamatsu NDPI had no remote number** — `NdpiLevel::ensure_start` walks a
+      198 MB single-strip JPEG hunting restart markers and had not finished after
+      four minutes, so it was excluded from the remote run. It opens in 7.8 s / 14
+      requests now, on the same read-ahead growth
+- [x] **Leica coordinates were not interchangeable with OpenSlide's.** OpenSlide
+      reports `Leica-1.scn` level 0 as the whole collection canvas (53130×153470)
+      with the image at `openslide.bounds-x=10778`, `bounds-y=35096`; slidekit
+      reported the 36832×38432 region with the origin at the region, so `(0, 0)`
+      addressed different pixels in the two libraries — and the compared bench
+      window had **0%** of its pixels opaque in both readers, which is what a bare
+      passing `0.00` pixel diff would have hidden. A level is now the collection
+      with the region placed on it: nm-per-pixel is `view.sizeX / dimension.sizeX`
+      (x scale for both axes, as in the C driver), the level is
+      `ceil(collection.size / that)`, the origin is `floor(view.offset / that)`.
+      Reproduces all five level sizes, both bounds values, and OpenSlide's
+      averaged downsamples exactly, asserted in `test_leica`.
+      `openslide.bounds-*` and `openslide.region[0].*` are set
+- [x] **Edge tiles painted their encoder padding** — found while fixing the
+      above. A tile at the right or bottom edge of an image runs past it (a
+      36832-wide image in 512-pixel tiles ends 32 pixels into its last column) and
+      the padding was composited. Harmless while a level *was* its image, since
+      the padding fell outside every valid coordinate; a 32-pixel black band once
+      the level got larger. `SimpleGrid::tile_extent` clips tiles to the image, and
+      Leica's opaque overlap went 9% → 100%
 
-      The walk itself cannot be avoided: the Basic Offset Table is **empty** in
-      both fixtures (verified), and with no offset table the fragment offsets are
-      a linked list — each position depends on the previous length. So the fix is
-      the read pattern, not the algorithm. Note the two obvious fixes pull in
-      opposite directions and must be weighed against the medium:
-      * reading only the 8 bytes needed drops transfer to ~21 KB but leaves 2665
-        *sequential* round trips (~19 min at the 400 ms/request measured here) —
-        worse remotely;
-      * a large sequential read-ahead (4–16 MB blocks) still transfers the whole
-        pixel region but in ~20 requests — roughly 13 s at the observed
-        throughput, a ~90× improvement.
-      A remote-aware read-ahead size is therefore the right shape, shared with the
-      TIFF coalescing work above.
+- [x] **ICC profiles were fetched at open, and DICOM fetched one twice.** Even
+      after the parser stopped loading every instance's copy, `DICOM/Leica-4` still
+      pulled the 13.1 MB profile for level 0's instance *and* for the thumbnail's
+      `associated_image_icc_profile`, because both accessors returned borrowed
+      slices captured at open — 24.6 MB of a 30.90 MB open. A profile is now an
+      `IccProfile` (`src/icc.rs`): either bytes already in hand (TIFF tag values
+      the driver has parsed anyway, kilobytes) or a byte range read on first
+      request and cached. The **size** is available without reading, mirroring the
+      C API's `openslide_get_icc_profile_size` / `openslide_read_icc_profile`
+      split, which is why the accessors now return `Result<Option<&[u8]>>` and gain
+      `*_size` companions — returning `None` for both "no profile" and "the fetch
+      failed" would hide an I/O error behind something that looks like metadata.
+      Leica-4's open: 30.90 → 6.25 MB, 13.5 → 7.9 s. Guarded by
+      `test_dicom::open_does_not_read_the_icc_profile`, which counts bytes through
+      a wrapping `SlideFs`. Related: the read-ahead layer no longer caches a fetch
+      larger than half its budget — a 13 MB profile is not a block, and caching it
+      evicted the working set
 
-- [ ] **`open_url` ignores the environment, so it cannot reach a non-AWS
-      S3-compatible endpoint.** Its doc comment promises "Cloud credentials and
-      region/endpoint configuration are taken from the environment", but it calls
-      `object_store::parse_url`, which builds `AmazonS3Builder::new()` (not
-      `from_env()`) and passes no options — so no `AWS_*`/endpoint variable is
-      read. Against the bench bucket it falls through to the EC2 instance
-      metadata service, retries `http://169.254.169.254/latest/api/token` ten
-      times, and fails after ~2.2 s. `open_store` with a hand-built store works
-      fine (that is what `bench_remote` uses). Fix: pass `std::env::vars()`
-      through `parse_url_opts`, and align the doc comment either way.
-      Reproduce: `cargo test --release --test bench_remote -- --ignored
-      open_url_resolves`
+Outstanding (see `docs/benchmarks.md` for the traces):
 
-### Known parity gap surfaced by the bench
-
-- [ ] **Leica coordinates are not interchangeable with OpenSlide's.** OpenSlide
-      reports `Leica-1.scn` level 0 as the whole collection canvas
-      (53130×153470) with the image placed at `openslide.bounds-x=10778`,
-      `bounds-y=35096`; slidekit reports 36832×38432 — exactly
-      `bounds-width`×`bounds-height` — with the origin at the imaged region, and
-      exposes no `openslide.bounds-*`. Reading `(0, 0)` from OpenSlide returns
-      transparent canvas while slidekit returns tissue, so the same coordinates
-      address different pixels. Fix by expanding level 0 to the collection canvas
-      and placing the region at its offset (matching C), or at minimum by
-      exposing `openslide.bounds-*` so callers can translate. Tracked with
-      multi-region SCN under Phase 5
+- [ ] **`DICOM/Leica-4` fetches 28% of the slide**, all of it in the region read
+      (its open is 5.8%). The slide carries no offset table of either kind, so
+      fragment offsets form a linked list and reaching a frame mid-way through an
+      8004-frame level means reading everything before it — 24 MB here. Now 6 large
+      sequential requests instead of thousands of small ones, and memoized per
+      instance (warm read 19 ms), but the bytes are unavoidable without a table the
+      file does not have. Persisting a derived offset table beside the slide would
+      make it once-per-slide rather than once-per-process — a caching layer above
+      this library, not a fix inside it
+- [ ] **Zeiss open costs 151 requests** — more than the other ten vendors
+      combined. The CZI directory says where each subblock is but not where its
+      pixels start, so it takes one 16-byte header read per subblock, and they sit
+      megabytes apart in a 1 GB file with nothing to coalesce. Batched and
+      concurrent now (65.6 → 11.9 s); going further means caching the resolved
+      offsets or finding metadata that removes the second pass
+- [ ] **`bench_openslide` trusts `PATH`** — run outside `mise` it silently picks up
+      Homebrew's `slidetool` 4.0.0 instead of the 4.0.1 in `.tools`, which has no
+      Zeiss driver and reports Zeiss as `n/a` with no hint that the wrong binary
+      was used. It should assert the version it found
 
 ---
 

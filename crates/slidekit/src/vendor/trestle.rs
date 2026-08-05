@@ -23,6 +23,7 @@ use crate::decode::tiff::TiffLike;
 use crate::decode::tiff::tags;
 use crate::error::{OpenSlideError, Result};
 use crate::grid::simple::SimpleGrid;
+use crate::icc::IccProfile;
 use crate::io::SlideReader;
 use crate::level::LevelInfo;
 use crate::properties::{self, Properties};
@@ -226,7 +227,7 @@ impl VendorDriver for TrestleDriver {
             levels,
             properties: props,
             associated_images: vec![],
-            icc_profile: None,
+            icc_profile: IccProfile::absent(),
             tiff: Some(tl),
         })
     }

@@ -9,6 +9,7 @@ use url::Url;
 
 use crate::error::{OpenSlideError, Result};
 use crate::io::fs::{Entry, SlideFs, validate};
+use crate::io::readahead::ReadAhead;
 use crate::io::{AsyncSlideReader, SlideReader};
 
 /// Shared multi-threaded Tokio runtime used to drive async I/O from
@@ -21,6 +22,52 @@ pub(crate) fn runtime() -> &'static Runtime {
     RT.get_or_init(|| {
         Runtime::new().expect("failed to initialize Tokio runtime for object_store I/O")
     })
+}
+
+/// Environment variables that configure a cloud backend, as `(key, value)`
+/// pairs ready for [`object_store::parse_url_opts`].
+///
+/// `object_store::parse_url` builds each backend with `Builder::new()` and
+/// passes no options, so it consults **no** environment variable: an `s3://`
+/// URL against a non-AWS endpoint never sees `AWS_ENDPOINT_URL`, finds no
+/// credentials, and falls through to the EC2 instance metadata service before
+/// failing. Passing the environment through `parse_url_opts` restores the
+/// behaviour each builder's own `from_env()` has.
+///
+/// The filter is deliberate. `parse_url_opts` silently ignores keys it doesn't
+/// recognize, but the ones it *does* recognize include bare names like `region`,
+/// `bucket`, `endpoint`, and `token` — handing it the whole environment would
+/// let an unrelated `TOKEN` or `ENDPOINT` variable redirect a slide read. So
+/// only the prefixes that `AmazonS3Builder::from_env`,
+/// `MicrosoftAzureBuilder::from_env`, and `GoogleCloudStorageBuilder::from_env`
+/// look at are forwarded, plus the two exact names those builders special-case.
+pub fn env_config() -> impl Iterator<Item = (String, String)> {
+    backend_config(std::env::vars())
+}
+
+/// The [`env_config`] filter, over any set of variables — testable without
+/// mutating the process environment.
+fn backend_config(
+    vars: impl Iterator<Item = (String, String)>,
+) -> impl Iterator<Item = (String, String)> {
+    /// Prefixes each cloud builder's `from_env()` scans for.
+    const PREFIXES: &[&str] = &["AWS_", "AZURE_", "GOOGLE_"];
+    /// Unprefixed names the GCP and Azure builders read directly.
+    const EXACT: &[&str] = &["SERVICE_ACCOUNT", "MSI_ENDPOINT"];
+
+    vars.filter(|(key, _)| {
+        let key = key.to_ascii_uppercase();
+        PREFIXES.iter().any(|p| key.starts_with(p)) || EXACT.contains(&key.as_str())
+    })
+}
+
+/// Parse a URL into a store configured from [`env_config`], plus the object's
+/// path within that store.
+fn parse_url_from_env(url: &str) -> Result<(Arc<dyn ObjectStore>, StorePath)> {
+    let parsed = Url::parse(url)
+        .map_err(|e| OpenSlideError::InvalidArgument(format!("invalid URL '{url}': {e}")))?;
+    let (store, path) = object_store::parse_url_opts(&parsed, env_config())?;
+    Ok((Arc::from(store), path))
 }
 
 /// Adapts any [`AsyncSlideReader`] into a synchronous [`SlideReader`] by
@@ -63,6 +110,17 @@ impl<R: AsyncSlideReader> SlideReader for BlockingReader<R> {
         let n = bytes.len().min(buf.len());
         buf[..n].copy_from_slice(&bytes[..n]);
         Ok(n)
+    }
+
+    /// Hands the whole batch to the async backend, which coalesces neighbouring
+    /// ranges into single requests and fetches the rest concurrently. This is why
+    /// a synchronous region read costs a handful of requests rather than one per
+    /// tile: the tiles of a region are usually neighbours in the file.
+    fn read_ranges(&self, ranges: &[Range<u64>]) -> Result<Vec<Bytes>> {
+        if ranges.is_empty() {
+            return Ok(Vec::new());
+        }
+        runtime().block_on(self.inner.read_ranges(ranges))
     }
 
     fn size(&self) -> Result<u64> {
@@ -124,12 +182,11 @@ impl ObjectStoreReader {
     /// Supported schemes mirror `object_store`:
     /// `file:///path/to/slide.svs`, `s3://bucket/key`, `gs://bucket/key`,
     /// `az://container/key`, and `http(s)://host/path`. Cloud credentials and
-    /// region/endpoint configuration are taken from the environment.
+    /// region/endpoint configuration are taken from the environment — see
+    /// [`env_config`].
     pub async fn open_url_async(url: &str) -> Result<Self> {
-        let parsed = Url::parse(url)
-            .map_err(|e| OpenSlideError::InvalidArgument(format!("invalid URL '{url}': {e}")))?;
-        let (store, path) = object_store::parse_url(&parsed)?;
-        Self::connect(Arc::from(store), path).await
+        let (store, path) = parse_url_from_env(url)?;
+        Self::connect(store, path).await
     }
 
     /// Synchronous wrapper around [`open_url_async`](Self::open_url_async).
@@ -196,13 +253,11 @@ impl ObjectStoreFs {
     /// Parse a URL into a store handle and the object's path within it.
     ///
     /// Supported schemes mirror `object_store`: `file://`, `s3://`, `gs://`,
-    /// `az://`, `http(s)://`. Returned separately so the caller can build both
-    /// a reader for the object and a filesystem over its store.
+    /// `az://`, `http(s)://`. Credentials and endpoint configuration come from
+    /// the environment ([`env_config`]). Returned separately so the caller can
+    /// build both a reader for the object and a filesystem over its store.
     pub fn parse_url(url: &str) -> Result<(Arc<dyn ObjectStore>, StorePath)> {
-        let parsed = Url::parse(url)
-            .map_err(|e| OpenSlideError::InvalidArgument(format!("invalid URL '{url}': {e}")))?;
-        let (store, path) = object_store::parse_url(&parsed)?;
-        Ok((Arc::from(store), path))
+        parse_url_from_env(url)
     }
 
     /// The underlying store handle.
@@ -216,17 +271,24 @@ impl ObjectStoreFs {
     }
 }
 
+/// Wrap a store reader in the layers every remote slide file wants: blocking
+/// adaptation for the synchronous parse pipeline, then block read-ahead so a
+/// parser's few-byte reads don't each become their own ranged GET.
+fn buffered(reader: ObjectStoreReader) -> Result<Arc<dyn SlideReader>> {
+    Ok(Arc::new(ReadAhead::new(BlockingReader::new(reader))?))
+}
+
 impl SlideFs for ObjectStoreFs {
     fn open(&self, path: &str) -> Result<Arc<dyn SlideReader>> {
         let path = self.resolve(path)?;
         let reader = ObjectStoreReader::new(self.store.clone(), path)?;
-        Ok(Arc::new(BlockingReader::new(reader)))
+        buffered(reader)
     }
 
     fn open_sized(&self, path: &str, size: u64) -> Result<Arc<dyn SlideReader>> {
         let path = self.resolve(path)?;
         let reader = ObjectStoreReader::with_size(self.store.clone(), path, size);
-        Ok(Arc::new(BlockingReader::new(reader)))
+        buffered(reader)
     }
 
     fn list(&self, dir: &str) -> Result<Vec<Entry>> {
@@ -292,6 +354,70 @@ mod tests {
             .block_on(store.put(&path, PutPayload::from(data.to_vec())))
             .unwrap();
         ObjectStoreReader::new(Arc::new(store), path).unwrap()
+    }
+
+    fn vars(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        backend_config(
+            pairs
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), (*v).to_string())),
+        )
+        .collect()
+    }
+
+    #[test]
+    fn env_config_forwards_only_backend_variables() {
+        let kept = vars(&[
+            ("AWS_ENDPOINT_URL", "https://example.invalid"),
+            ("AWS_ACCESS_KEY_ID", "id"),
+            ("AZURE_STORAGE_ACCOUNT_NAME", "acct"),
+            ("GOOGLE_SERVICE_ACCOUNT", "/key.json"),
+            ("SERVICE_ACCOUNT", "/key.json"),
+            ("MSI_ENDPOINT", "http://169.254.169.254/metadata"),
+        ]);
+        assert_eq!(kept.len(), 6, "{kept:?}");
+    }
+
+    #[test]
+    fn env_config_ignores_lookalike_variables() {
+        // `parse_url_opts` accepts bare `region`/`bucket`/`endpoint`/`token`
+        // keys, so forwarding the whole environment would let an unrelated
+        // variable redirect a slide read. None of these may survive the filter.
+        let dropped = vars(&[
+            ("REGION", "eu-west-1"),
+            ("BUCKET", "someone-elses-bucket"),
+            ("BUCKET_ENDPOINT_URL", "https://wrong.invalid"),
+            ("ENDPOINT", "https://wrong.invalid"),
+            ("TOKEN", "unrelated-secret"),
+            ("PATH", "/usr/bin"),
+        ]);
+        assert!(dropped.is_empty(), "{dropped:?}");
+    }
+
+    /// The point of the whole exercise: a non-AWS endpoint in the environment
+    /// must reach the builder. Before this, `parse_url` built
+    /// `AmazonS3Builder::new()` with no options, so the endpoint was ignored,
+    /// no credentials were found, and the open fell through to EC2 instance
+    /// metadata. Asserted through the store's `Display`, which reports the
+    /// bucket it was configured with — building at all is the signal, since a
+    /// credential-less S3 builder errors out.
+    #[test]
+    fn parse_url_opts_applies_the_environment() {
+        let url = Url::parse("s3://slides/CMU-1.svs").expect("url");
+        let opts = [
+            ("AWS_ENDPOINT_URL", "https://storage.example.invalid"),
+            ("AWS_REGION", "auto"),
+            ("AWS_ACCESS_KEY_ID", "id"),
+            ("AWS_SECRET_ACCESS_KEY", "secret"),
+            ("PATH", "/usr/bin"),
+        ];
+        let (store, path) = object_store::parse_url_opts(
+            &url,
+            backend_config(opts.iter().map(|(k, v)| (k.to_string(), v.to_string()))),
+        )
+        .expect("configured store");
+        assert_eq!(path.as_ref(), "CMU-1.svs");
+        assert!(store.to_string().contains("slides"), "{store}");
     }
 
     #[test]

@@ -175,6 +175,49 @@ async fn open_url_reads_region_over_http() {
     drop(server);
 }
 
+/// A synchronous region read must ask for all of its tiles at once.
+///
+/// Reading them one at a time is correct but costs a round trip each, and on
+/// blob storage the round trip is the whole cost — the tiles of a region are
+/// neighbours in the file, so they coalesce into a couple of requests. This is
+/// the read-time counterpart of the batching `read_region_async` has always done.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_synchronous_region_read_coalesces_its_tiles() {
+    let body = common::build_tiled_rgb_tiff(TILE, TILES_X, TILES_Y, tile_color);
+    let (server, base) = serve(body).await;
+
+    let slide = Arc::new(open_http_slide(&base).await);
+    let before = count_method(&server, "GET").await;
+
+    // A 4x4 tile window: 16 tiles. `read_region` blocks on the shared runtime,
+    // so it must not run on this test's async context.
+    let reader = slide.clone();
+    let span = 4 * TILE as i64;
+    let pixels = tokio::task::spawn_blocking(move || reader.read_region(0, 0, 0, span, span))
+        .await
+        .expect("join")
+        .expect("read region");
+
+    let gets = count_method(&server, "GET").await - before;
+    assert!(
+        gets <= 4,
+        "16 tiles should coalesce into a few requests, took {gets}"
+    );
+
+    // And the coalescing must not scramble which bytes went where.
+    for (tx, ty) in [(0u32, 0u32), (3, 0), (0, 3), (3, 3)] {
+        let (r, g, b) = tile_color(tx, ty);
+        let at = (ty * TILE) as i64 * span + (tx * TILE) as i64;
+        assert_eq!(
+            pixels[at as usize],
+            color::argb(0xFF, r, g, b),
+            "tile ({tx}, {ty})"
+        );
+    }
+
+    drop(server);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn small_region_streams_only_relevant_tiles() {
     let body = common::build_tiled_rgb_tiff(TILE, TILES_X, TILES_Y, tile_color);

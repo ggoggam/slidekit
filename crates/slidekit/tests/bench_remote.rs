@@ -216,22 +216,33 @@ impl ObjectStore for CountingStore {
 
 /// Does the *documented* remote entry point work from the environment alone?
 ///
-/// `OpenSlide::open_url` says "Cloud credentials and region/endpoint
-/// configuration are taken from the environment", and it is the API a user
-/// reaches for first. It routes through `object_store::parse_url`, which builds
+/// `OpenSlide::open_url` says credentials and region/endpoint configuration are
+/// taken from the environment, and it is the API a user reaches for first. It
+/// used to route through `object_store::parse_url`, which builds
 /// `AmazonS3Builder::new()` — **not** `from_env()` — and passes no options, so
-/// no `AWS_*` variable is consulted. This test records what actually happens
-/// rather than asserting a behaviour: it prints whether the same URL that the
-/// bench opens successfully via `open_store` also opens via `open_url`.
+/// against a non-AWS endpoint no `AWS_*` variable was consulted at all: the open
+/// fell through to the EC2 instance metadata service and failed after ~2.2 s.
+/// `parse_url` now goes through `parse_url_opts` with the environment, so this
+/// asserts the same URL the bench opens via `open_store` also resolves here.
 ///
 /// A HEAD is enough — the question is whether credentials and endpoint resolve,
 /// not whether the slide parses, and a full remote open costs a minute.
 #[test]
-#[ignore = "diagnostic: needs the bucket configured + slides mirrored"]
+#[ignore = "needs the bucket configured + slides mirrored"]
 fn open_url_resolves_config_from_environment() {
     let Some(bucket) = common::remote_bucket() else {
         return;
     };
+    // Only the standard spellings are what `open_url` reads. A `.env` carrying
+    // just the `BUCKET_*` aliases configures the bench store but says nothing
+    // about the public entry point, so there is nothing to assert.
+    if std::env::var("AWS_ENDPOINT_URL").is_err() {
+        eprintln!(
+            "SKIP: AWS_ENDPOINT_URL is not set — `open_url` reads the `AWS_*` names, \
+             so set AWS_ENDPOINT_URL (and AWS_REGION) in .env to exercise it."
+        );
+        return;
+    }
     let Some(slide) = common::bench_slide("Aperio/CMU-1.svs") else {
         eprintln!("SKIP: Aperio fixture not available");
         return;
@@ -239,29 +250,19 @@ fn open_url_resolves_config_from_environment() {
     let url = bucket.url(&slide.open_key);
     eprintln!("open_url target: {url}");
 
-    match slidekit::ObjectStoreFs::parse_url(&url) {
-        Err(e) => eprintln!(
-            "parse_url failed outright: {e}\n\
-             → `open_url` cannot reach this endpoint from env vars alone."
-        ),
-        Ok((store, path)) => {
-            let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
-            match rt.block_on(async { object_store::ObjectStoreExt::head(&store, &path).await }) {
-                Ok(meta) => eprintln!(
-                    "open_url path works: HEAD returned {} bytes — the environment \
-                     was honoured after all.",
-                    meta.size
-                ),
-                Err(e) => eprintln!(
-                    "HEAD via parse_url failed: {e}\n\
-                     → confirms `open_url` ignores AWS_ENDPOINT_URL/credentials in the \
-                     environment; use `open_store` with a configured store, or teach \
-                     `open_url` to pass `std::env::vars()` through `parse_url_opts`.\n\
-                     The doc comment on `OpenSlide::open_url` overpromises today."
-                ),
-            }
-        }
-    }
+    let (store, path) = slidekit::ObjectStoreFs::parse_url(&url)
+        .unwrap_or_else(|e| panic!("parse_url could not build a store for {url}: {e}"));
+    let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+    let meta = rt
+        .block_on(async { object_store::ObjectStoreExt::head(&store, &path).await })
+        .unwrap_or_else(|e| {
+            panic!(
+                "HEAD via parse_url failed for {url}: {e}\n\
+                 → `open_url` is not honouring the endpoint/credentials in the environment."
+            )
+        });
+    assert!(meta.size > 0, "HEAD reported an empty object for {url}");
+    eprintln!("open_url path works: HEAD returned {} bytes", meta.size);
 }
 
 struct Row {

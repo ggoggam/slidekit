@@ -66,9 +66,74 @@ fn leica_1() {
         "objective-power {op:?} not numeric"
     );
 
-    // ── read_region: level 0 is well-formed ──
+    // ── Geometry matches OpenSlide exactly ──
+    // A level is the whole collection canvas (the glass slide), with the scanned
+    // region placed at `bounds-*`. These are `slidetool prop list` values from
+    // OpenSlide 4.0.1 on this fixture: if slidekit sized level 0 to the region
+    // instead, the same (x, y) would address different pixels in the two
+    // libraries — silently, for every Leica slide.
+    assert_eq!(slide.level_count(), 5);
+    assert_eq!((w0, h0), (53130, 153470));
+    let expected = [
+        (53130, 153470),
+        (13283, 38368),
+        (3321, 9592),
+        (831, 2401),
+        (208, 601),
+    ];
+    for (level, dims) in expected.iter().enumerate() {
+        assert_eq!(
+            slide.level_dimensions(level as i32).unwrap(),
+            *dims,
+            "level {level} dimensions"
+        );
+    }
+    // OpenSlide averages the per-axis ratios; check one against its own report.
+    let ds1 = slide.level_downsample(1).unwrap();
+    assert!(
+        (ds1 - 3.999_898_652_415_998).abs() < 1e-9,
+        "level 1 downsample {ds1}"
+    );
+
+    for (name, value) in [
+        ("openslide.bounds-x", "10778"),
+        ("openslide.bounds-y", "35096"),
+        ("openslide.bounds-width", "36832"),
+        ("openslide.bounds-height", "38432"),
+        ("openslide.region[0].x", "10778"),
+        ("openslide.region[0].y", "35096"),
+        ("openslide.region[0].width", "36832"),
+        ("openslide.region[0].height", "38432"),
+    ] {
+        assert_eq!(slide.property_value(name), Some(value), "{name}");
+    }
+
+    // ── read_region: the canvas origin is empty glass, the bounds origin is not ──
+    // This is the pair that fails if the coordinate spaces disagree. OpenSlide
+    // returns a uniformly transparent tile at (0, 0) and real image at the bounds
+    // origin; so must we.
     let pixels = slide.read_region(0, 0, 0, 512, 512).unwrap();
     assert_eq!(pixels.len(), 512 * 512);
+    assert!(
+        pixels.iter().all(|&p| p == 0),
+        "level 0 (0, 0) is outside the scanned region and must be transparent"
+    );
+
+    let bx: i64 = slide
+        .property_value("openslide.bounds-x")
+        .unwrap()
+        .parse()
+        .unwrap();
+    let by: i64 = slide
+        .property_value("openslide.bounds-y")
+        .unwrap()
+        .parse()
+        .unwrap();
+    let at_bounds = slide.read_region(bx, by, 0, 512, 512).unwrap();
+    assert!(
+        at_bounds.iter().any(|&p| p != 0),
+        "the bounds origin should hold real image data"
+    );
 
     // ── Smallest level has visible tissue ──
     let last = slide.level_count() - 1;

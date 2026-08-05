@@ -2,6 +2,7 @@ pub mod fs;
 pub mod local;
 #[cfg(feature = "object-store")]
 pub mod object_store;
+pub mod readahead;
 
 use std::future::Future;
 use std::ops::Range;
@@ -50,6 +51,26 @@ pub trait SlideReader: Send + Sync {
             remaining = &mut remaining[n..];
         }
         Ok(())
+    }
+
+    /// Read several byte ranges at once, returning one buffer per range in the
+    /// order requested.
+    ///
+    /// This exists so a caller that already knows every range it needs — the
+    /// tiles of a region, say — can say so in one call instead of a serial
+    /// round trip each. Remote backends override it to coalesce ranges that sit
+    /// close together into single requests and to issue the rest concurrently;
+    /// see [`BlockingReader`](crate::io::object_store::BlockingReader). The
+    /// default reads them one at a time, which is what a local file wants.
+    fn read_ranges(&self, ranges: &[Range<u64>]) -> Result<Vec<Bytes>> {
+        ranges
+            .iter()
+            .map(|r| {
+                let mut buf = vec![0u8; (r.end - r.start) as usize];
+                self.read_exact_at(r.start, &mut buf)?;
+                Ok(Bytes::from(buf))
+            })
+            .collect()
     }
 }
 

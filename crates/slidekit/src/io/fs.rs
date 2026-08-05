@@ -17,7 +17,10 @@
 //! are read through the [`SlideReader`]s the driver already holds, so this
 //! abstraction costs nothing per region read.
 
+use std::ops::Range;
 use std::sync::Arc;
+
+use bytes::Bytes;
 
 use crate::error::{OpenSlideError, Result};
 use crate::io::SlideReader;
@@ -192,6 +195,13 @@ impl SlideReader for Located {
         self.inner.read_exact_at(offset, buf)
     }
 
+    // Must be forwarded, not inherited: the default implementation reads the
+    // ranges one at a time, which silently undoes the batching the backend
+    // underneath is capable of.
+    fn read_ranges(&self, ranges: &[Range<u64>]) -> Result<Vec<Bytes>> {
+        self.inner.read_ranges(ranges)
+    }
+
     fn location(&self) -> Option<&SlideLocation> {
         Some(&self.location)
     }
@@ -220,6 +230,14 @@ impl SlideReader for Shared {
 
     fn read_exact_at(&self, offset: u64, buf: &mut [u8]) -> Result<()> {
         self.0.read_exact_at(offset, buf)
+    }
+
+    fn read_ranges(&self, ranges: &[Range<u64>]) -> Result<Vec<Bytes>> {
+        self.0.read_ranges(ranges)
+    }
+
+    fn location(&self) -> Option<&SlideLocation> {
+        self.0.location()
     }
 }
 

@@ -10,6 +10,7 @@ use crate::decode::tiff::TiffLike;
 use crate::error::{OpenSlideError, Result};
 use crate::grid::TileGrid;
 use crate::grid::tilemap::TileMap;
+use crate::icc::IccProfile;
 use crate::io::fs::{Located, Shared, SlideFs, SlideLocation};
 use crate::io::local::{LocalFileReader, LocalFs};
 use crate::io::{AsyncReadAt, SlideReader};
@@ -22,7 +23,7 @@ pub struct OpenSlide {
     levels: Vec<LevelData>,
     properties: Properties,
     associated_images: Vec<(String, AssociatedImage)>,
-    icc_profile: Option<Vec<u8>>,
+    icc_profile: IccProfile,
     cache: Cache,
     /// TIFF container for reading tile data. Behind a mutex because
     /// TiffLike's deferred loading needs &mut self.
@@ -91,8 +92,12 @@ impl OpenSlide {
     ///
     /// Supported schemes: `file://`, `s3://`, `gs://`, `az://`, and
     /// `http(s)://`. Remote slides are read with byte-range requests, so the
-    /// whole file is never downloaded. Cloud credentials are read from the
-    /// environment.
+    /// whole file is never downloaded. Credentials, region, and endpoint come
+    /// from the `AWS_*` / `AZURE_*` / `GOOGLE_*` environment variables — the
+    /// same ones each `object_store` builder's `from_env()` reads; see
+    /// [`env_config`](crate::io::object_store::env_config). Pass
+    /// [`open_store`](Self::open_store) a store you built yourself for anything
+    /// the environment can't express.
     ///
     /// This is the synchronous entry point; the underlying reads use the async
     /// [`ObjectStoreReader`](crate::io::object_store::ObjectStoreReader) driven
@@ -149,6 +154,13 @@ impl OpenSlide {
     /// synchronous open pipeline can drive its async reads. The same reader is
     /// also retained as the async backend for `read_region_async`. The single
     /// read implementation lives on the async reader; nothing is duplicated.
+    ///
+    /// The synchronous side additionally goes through
+    /// [`ReadAhead`](crate::io::readahead::ReadAhead), which is what keeps a
+    /// remote open from costing one ranged GET per parsed field. Detection and
+    /// TIFF parsing get *clones* of one wrapper, so they share its cache instead
+    /// of each refetching the file header. The async backend stays unwrapped:
+    /// `read_region_async` fetches whole tiles, which need no coalescing.
     #[cfg(feature = "object-store")]
     fn from_async_reader<R>(
         reader: R,
@@ -159,10 +171,12 @@ impl OpenSlide {
         R: crate::io::AsyncSlideReader + Clone + 'static,
     {
         use crate::io::object_store::BlockingReader;
+        use crate::io::readahead::ReadAhead;
         let async_reader: Arc<dyn AsyncReadAt> = Arc::new(reader.clone());
+        let buffered = ReadAhead::new(BlockingReader::new(reader))?;
         let mut slide = Self::open_with_readers(
-            Box::new(BlockingReader::new(reader.clone())),
-            Box::new(BlockingReader::new(reader)),
+            Box::new(buffered.clone()),
+            Box::new(buffered),
             source,
             Some(location),
         )?;
@@ -366,44 +380,57 @@ impl OpenSlide {
             OpenSlideError::Decode("No TIFF data available for tile reading".into())
         })?;
 
-        // Grid tile advance (may differ from TIFF tile size due to overlaps)
-        let grid_tile_w = lvl.grid.tile_w;
-        let grid_tile_h = lvl.grid.tile_h;
-        // Actual TIFF tile dimensions for decoding
+        // Actual TIFF tile dimensions for decoding. The grid's own tile advance
+        // (which may differ, due to overlaps) is applied by `tile_position`.
         let tiff_tile_w = lvl.tiff_tile_width;
         let tiff_tile_h = lvl.tiff_tile_height;
         let tiles_across = tiff_tiles_across(tiff_mutex, lvl.tiff_dir, tiff_tile_w)?;
 
-        for (col, row) in tiles {
-            // Tile's position in level pixel space (using grid advance)
-            let tile_x = col * grid_tile_w;
-            let tile_y = row * grid_tile_h;
+        // Resolve every tile's byte range first, then fetch them in one call, so
+        // a remote read costs a handful of coalesced requests instead of one per
+        // tile. Reading them one at a time made a 1024x1024 region 10-25
+        // sequential round trips — the same mistake, at read time, that the TIFF
+        // directory parse made at open. Same two phases as `read_region_async`.
+        let (placements, tiles_data) = {
+            let mut tiff = tiff_mutex.lock();
+            let mut placements = Vec::with_capacity(tiles.len());
+            let mut ranges = Vec::with_capacity(tiles.len());
+            for (col, row) in tiles {
+                let tile_index = (row * tiles_across + col) as usize;
+                // A missing tile (offset or byte count of 0) is a hole; leaving
+                // it out of the batch leaves it transparent.
+                if let Some((offset, size)) = tiff.tile_location(lvl.tiff_dir, tile_index)? {
+                    // Where the tile goes, and how much of it is image rather
+                    // than encoder padding past the right/bottom edge.
+                    placements.push(lvl.grid.tile_extent(col, row, tiff_tile_w, tiff_tile_h));
+                    ranges.push(offset..offset + size as u64);
+                }
+            }
+            let data = tiff.reader().read_ranges(&ranges)?;
+            (placements, data)
+        };
 
-            // Tile index in TIFF (row-major)
-            let tile_index = (row * tiles_across + col) as usize;
-
-            // Read and decode tile
-            let tile_data = {
-                let mut tiff = tiff_mutex.lock();
-                tiff.read_tile_data(lvl.tiff_dir, tile_index)?
-            };
-
+        for ((tile_x, tile_y, src_w, src_h), tile_data) in placements.into_iter().zip(tiles_data) {
             if tile_data.is_empty() {
-                continue; // Empty tile, leave as transparent
+                continue;
             }
 
-            // Decode at actual TIFF tile dimensions
+            // Decode at actual TIFF tile dimensions.
             let decoded = lvl
                 .decoder
                 .decode(&tile_data, tiff_tile_w as u32, tiff_tile_h as u32)?;
 
-            // Composite using TIFF tile dimensions (the decoded buffer is that size)
-            composite_tile(
+            // The decoded buffer is a whole TIFF tile, so that is its row stride;
+            // only the image part of it is painted.
+            composite_subtile(
                 &decoded,
+                tiff_tile_w,
+                0,
+                0,
+                src_w,
+                src_h,
                 tile_x,
                 tile_y,
-                tiff_tile_w,
-                tiff_tile_h,
                 &mut output,
                 lx as i64,
                 ly as i64,
@@ -509,12 +536,16 @@ impl OpenSlide {
 
         for (col, row) in tiles {
             if let Some(decoded) = ndpi.decode_tile(reader, col, row, &*lvl.decoder)? {
-                composite_tile(
+                let (tile_x, tile_y, src_w, src_h) = lvl.grid.tile_extent(col, row, tw, th);
+                composite_subtile(
                     &decoded,
-                    col * tw,
-                    row * th,
                     tw,
-                    th,
+                    0,
+                    0,
+                    src_w,
+                    src_h,
+                    tile_x,
+                    tile_y,
                     &mut output,
                     ox,
                     oy,
@@ -589,8 +620,6 @@ impl OpenSlide {
             OpenSlideError::Decode("No TIFF data available for tile reading".into())
         })?;
 
-        let grid_tile_w = lvl.grid.tile_w;
-        let grid_tile_h = lvl.grid.tile_h;
         let tiff_tile_w = lvl.tiff_tile_width;
         let tiff_tile_h = lvl.tiff_tile_height;
         let tiles_across = tiff_tiles_across(tiff_mutex, lvl.tiff_dir, tiff_tile_w)?;
@@ -598,14 +627,15 @@ impl OpenSlide {
         // Phase 1 (sync, under lock): resolve each tile's byte range. The mutex
         // guard is released before any await — parking_lot guards are not held
         // across suspension points.
-        let mut placements: Vec<(i64, i64)> = Vec::with_capacity(tiles.len());
+        // `(x, y, w, h)`: where the tile goes, and how much of it is image.
+        let mut placements: Vec<(i64, i64, i64, i64)> = Vec::with_capacity(tiles.len());
         let mut ranges: Vec<std::ops::Range<u64>> = Vec::with_capacity(tiles.len());
         {
             let mut tiff = tiff_mutex.lock();
             for (col, row) in tiles {
                 let tile_index = (row * tiles_across + col) as usize;
                 if let Some((offset, size)) = tiff.tile_location(lvl.tiff_dir, tile_index)? {
-                    placements.push((col * grid_tile_w, row * grid_tile_h));
+                    placements.push(lvl.grid.tile_extent(col, row, tiff_tile_w, tiff_tile_h));
                     ranges.push(offset..offset + size as u64);
                 }
             }
@@ -620,7 +650,7 @@ impl OpenSlide {
         let tiles_data = reader.read_ranges_boxed(&ranges).await?;
 
         // Phase 3 (sync): decode and composite each tile.
-        for ((tile_x, tile_y), tile_data) in placements.into_iter().zip(tiles_data) {
+        for ((tile_x, tile_y, src_w, src_h), tile_data) in placements.into_iter().zip(tiles_data) {
             if tile_data.is_empty() {
                 continue;
             }
@@ -629,12 +659,15 @@ impl OpenSlide {
                 lvl.decoder
                     .decode(tile_data.as_ref(), tiff_tile_w as u32, tiff_tile_h as u32)?;
 
-            composite_tile(
+            composite_subtile(
                 &decoded,
+                tiff_tile_w,
+                0,
+                0,
+                src_w,
+                src_h,
                 tile_x,
                 tile_y,
-                tiff_tile_w,
-                tiff_tile_h,
                 &mut output,
                 lx as i64,
                 ly as i64,
@@ -699,17 +732,44 @@ impl OpenSlide {
             })
     }
 
-    /// Get the ICC color profile for the main slide image.
-    pub fn icc_profile(&self) -> Option<&[u8]> {
-        self.icc_profile.as_deref()
+    /// The ICC colour profile for the main slide image, or `None` if it has none.
+    ///
+    /// **The first call may read from the slide.** Profiles are not loaded at open
+    /// unless they were already on the wire, because a DICOM profile can be 13 MB
+    /// — see [`IccProfile`]. Use [`icc_profile_size`](Self::icc_profile_size) to
+    /// find out how large one is without fetching it. The bytes are cached, so
+    /// later calls are free.
+    pub fn icc_profile(&self) -> Result<Option<&[u8]>> {
+        self.icc_profile.bytes()
     }
 
-    /// Get the ICC color profile for an associated image.
-    pub fn associated_image_icc_profile(&self, name: &str) -> Option<&[u8]> {
+    /// Size of the main slide image's ICC profile, without reading it. `None` if
+    /// the slide has no profile.
+    pub fn icc_profile_size(&self) -> Option<usize> {
+        self.icc_profile.len()
+    }
+
+    /// The ICC colour profile for an associated image. As with
+    /// [`icc_profile`](Self::icc_profile), the first call may read.
+    ///
+    /// `Ok(None)` covers both "no such image" and "that image has no profile".
+    pub fn associated_image_icc_profile(&self, name: &str) -> Result<Option<&[u8]>> {
+        match self.associated_image(name) {
+            Some(img) => img.icc_profile.bytes(),
+            None => Ok(None),
+        }
+    }
+
+    /// Size of an associated image's ICC profile, without reading it.
+    pub fn associated_image_icc_profile_size(&self, name: &str) -> Option<usize> {
+        self.associated_image(name)?.icc_profile.len()
+    }
+
+    fn associated_image(&self, name: &str) -> Option<&AssociatedImage> {
         self.associated_images
             .iter()
             .find(|(n, _)| n == name)
-            .and_then(|(_, img)| img.icc_profile.as_deref())
+            .map(|(_, img)| img)
     }
 
     /// Set or replace the tile cache.
@@ -780,48 +840,17 @@ fn tiff_tiles_across(tiff: &Mutex<TiffLike>, dir: i64, tile_w: i64) -> Result<i6
     Ok((iw + tile_w - 1) / tile_w)
 }
 
-/// Composite a whole decoded tile into the output buffer.
-///
-/// `tile_pixels`: decoded ARGB pixels (tile_w * tile_h)
-/// `tile_x, tile_y`: tile's top-left in level pixel space
-/// `out_pixels`: output buffer (out_w * out_h)
-/// `out_x, out_y`: output region's top-left in level pixel space
-#[allow(clippy::too_many_arguments)]
-fn composite_tile(
-    tile_pixels: &[u32],
-    tile_x: i64,
-    tile_y: i64,
-    tile_w: i64,
-    tile_h: i64,
-    out_pixels: &mut [u32],
-    out_x: i64,
-    out_y: i64,
-    out_w: i64,
-    out_h: i64,
-) {
-    composite_subtile(
-        tile_pixels,
-        tile_w,
-        0,
-        0,
-        tile_w,
-        tile_h,
-        tile_x,
-        tile_y,
-        out_pixels,
-        out_x,
-        out_y,
-        out_w,
-        out_h,
-    );
-}
-
 /// Composite a sub-rectangle of a decoded tile into the output buffer.
 ///
 /// Copies the `src_w * src_h` block at `(src_x, src_y)` within `tile_pixels`
 /// (row stride `tile_stride`) to `(dest_x, dest_y)` in the output region,
-/// clipping to the output bounds. [`composite_tile`] is the whole-tile case
-/// (source origin `(0,0)`, stride = tile width).
+/// clipping to the output bounds.
+///
+/// Every caller passes a sub-rectangle rather than the whole tile: a tile at the
+/// right or bottom edge of an image runs past it, and the encoder padding out
+/// there is not image (see [`SimpleGrid::tile_extent`]).
+///
+/// [`SimpleGrid::tile_extent`]: crate::grid::simple::SimpleGrid::tile_extent
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn composite_subtile(
     tile_pixels: &[u32],

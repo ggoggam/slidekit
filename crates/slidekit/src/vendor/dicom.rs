@@ -27,6 +27,7 @@
 //! — the same stance `zeiss` takes toward JPEG XR.
 
 use std::collections::HashMap;
+use std::ops::Range;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -34,13 +35,14 @@ use parking_lot::Mutex;
 
 use crate::associated::AssociatedImage;
 use crate::decode::dicom::{
-    self, DataSet, DicomObject, Frame, VL_WHOLE_SLIDE_MICROSCOPY_IMAGE_STORAGE, Value, tags,
+    self, DataSet, DicomObject, FrameIndex, VL_WHOLE_SLIDE_MICROSCOPY_IMAGE_STORAGE, Value, tags,
 };
 use crate::decode::jpeg::JpegDecoder;
 use crate::decode::tiff::TiffLike;
 use crate::decode::{TileDecoder, samples_to_argb};
 use crate::error::{OpenSlideError, Result};
 use crate::grid::simple::SimpleGrid;
+use crate::icc::IccProfile;
 use crate::io::SlideReader;
 use crate::io::fs::{Entry, SlideFs, SlideLocation};
 use crate::level::LevelInfo;
@@ -104,24 +106,36 @@ impl TileIndex {
 struct DicomInstance {
     reader: Arc<dyn SlideReader>,
     encoding: Encoding,
-    frames: Vec<Frame>,
+    frames: FrameIndex,
     tiles: TileIndex,
     tile_w: i64,
     tile_h: i64,
 }
 
 impl DicomInstance {
-    /// Decode the tile at `(col, row)`, or `None` if this instance has no frame
+    /// Where the tile at `(col, row)` is, or `None` if this instance has no frame
     /// there (a hole in a sparse level, or another concatenation member's tile).
-    fn decode_tile(&self, col: i64, row: i64) -> Result<Option<Vec<u32>>> {
+    ///
+    /// Locating a frame can itself read — a fragment walk, when the instance
+    /// carries no offset table — which is why it happens here at read time and
+    /// not at open.
+    fn locate_tile(&self, col: i64, row: i64) -> Result<Option<Range<u64>>> {
         let Some(index) = self.tiles.frame_for(col, row) else {
             return Ok(None);
         };
-        let frame = self.frames.get(index).ok_or_else(|| {
-            OpenSlideError::Decode(format!("DICOM frame {index} is out of range"))
-        })?;
-        let mut buf = vec![0u8; frame.length as usize];
-        self.reader.read_exact_at(frame.offset, &mut buf)?;
+        let frame = self.frames.frame(index, &*self.reader)?;
+        Ok(Some(frame.offset..frame.offset + u64::from(frame.length)))
+    }
+
+    /// Decode the tile at `(col, row)`, fetching it on its own. Used for
+    /// single-frame instances (label, macro, thumbnail); a region read batches
+    /// its frames instead, via [`DicomLevel::read_region`].
+    fn decode_tile(&self, col: i64, row: i64) -> Result<Option<Vec<u32>>> {
+        let Some(range) = self.locate_tile(col, row)? else {
+            return Ok(None);
+        };
+        let mut buf = vec![0u8; (range.end - range.start) as usize];
+        self.reader.read_exact_at(range.start, &mut buf)?;
         self.decode_frame(&buf, self.tile_w, self.tile_h).map(Some)
     }
 
@@ -152,6 +166,11 @@ pub struct DicomLevel {
 impl DicomLevel {
     /// Read a region of this level. `(ox, oy)` is its top-left in this level's
     /// pixel space. Tiles with no frame stay transparent, as in the C driver.
+    ///
+    /// Every frame the region needs is located first and then fetched in one
+    /// batch per instance, so neighbouring frames — which is what the tiles of a
+    /// region usually are — coalesce into single requests instead of one round
+    /// trip each.
     pub fn read_region(&self, ox: i64, oy: i64, w: i64, h: i64) -> Result<Vec<u32>> {
         let mut out = vec![0u32; (w * h) as usize];
         let across = ceil_div(self.width, self.tile_w);
@@ -162,11 +181,26 @@ impl DicomLevel {
         let row_start = oy.div_euclid(self.tile_h).max(0);
         let row_end = ceil_div(oy + h, self.tile_h).min(down);
 
-        for row in row_start..row_end {
-            for col in col_start..col_end {
-                let Some(pixels) = self.decode_tile(col, row)? else {
-                    continue;
-                };
+        for file in &self.files {
+            // Phase 1: which of this member's frames the region needs, and where.
+            let mut tiles: Vec<(i64, i64)> = Vec::new();
+            let mut ranges: Vec<Range<u64>> = Vec::new();
+            for row in row_start..row_end {
+                for col in col_start..col_end {
+                    if let Some(range) = file.locate_tile(col, row)? {
+                        tiles.push((col, row));
+                        ranges.push(range);
+                    }
+                }
+            }
+            if ranges.is_empty() {
+                continue;
+            }
+
+            // Phase 2: one batched fetch. Phase 3: decode and composite.
+            let frames = file.reader.read_ranges(&ranges)?;
+            for ((col, row), data) in tiles.into_iter().zip(frames) {
+                let pixels = file.decode_frame(&data, file.tile_w, file.tile_h)?;
                 let tile_x = col * self.tile_w;
                 let tile_y = row * self.tile_h;
                 // A tile at the right/bottom edge extends past the level; clip
@@ -191,16 +225,6 @@ impl DicomLevel {
             }
         }
         Ok(out)
-    }
-
-    /// Decode a tile from whichever concatenation member holds it.
-    fn decode_tile(&self, col: i64, row: i64) -> Result<Option<Vec<u32>>> {
-        for file in &self.files {
-            if let Some(pixels) = file.decode_tile(col, row)? {
-                return Ok(Some(pixels));
-            }
-        }
-        Ok(None)
     }
 }
 
@@ -425,7 +449,7 @@ fn open_dicom(loc: &SlideLocation, primary: Box<dyn SlideReader>) -> Result<Slid
     // so they don't depend on directory order.
     let level0_first = &level_groups[0].files[0];
     add_properties(&mut properties, &level0_first.object);
-    let icc_profile = icc_profile(&level0_first.object.dataset).map(<[u8]>::to_vec);
+    let icc_profile = icc_profile(level0_first);
 
     let mut levels = Vec::with_capacity(level_groups.len());
     for group in level_groups {
@@ -652,7 +676,7 @@ fn build_instance(file: &ParsedFile) -> Result<DicomInstance> {
 
     let frames = file
         .object
-        .frame_locations(frame_count, (tile_w * tile_h * 3) as u64)?;
+        .frame_index(frame_count, (tile_w * tile_h * 3) as u64)?;
 
     // DimensionOrganizationType is optional and defaults to sparse.
     let sparse = ds.text(tags::DIMENSION_ORGANIZATION_TYPE) != Some("TILED_FULL");
@@ -747,10 +771,30 @@ fn tile_size(ds: &DataSet) -> Result<(i64, i64)> {
     }
 }
 
-/// The ICC profile of a dataset's first optical path, if it has one.
-fn icc_profile(ds: &DataSet) -> Option<&[u8]> {
+/// The ICC profile of an instance's first optical path, if it has one.
+///
+/// Nothing is read here. The parser records the profile's location rather than
+/// its bytes (see [`Value::Bulk`]) and this hands that location, plus the
+/// instance's reader, to an [`IccProfile`] that fetches on first request.
+///
+/// It matters on exactly this format. Leica writes a **13.1 MB** profile into
+/// every instance of a slide: loading them all cost 49 MB per open, loading only
+/// the ones a slide surfaces still cost 24.6 MB (level 0's and the thumbnail's),
+/// and loading neither costs nothing — for colour data most callers never ask
+/// for. The size is still available without reading, so a caller that does want
+/// it knows what it is about to fetch.
+fn icc_profile(file: &ParsedFile) -> IccProfile {
+    match icc_profile_location(&file.object.dataset) {
+        Some((offset, length)) => {
+            IccProfile::deferred(file.reader.clone(), offset, length as usize)
+        }
+        None => IccProfile::absent(),
+    }
+}
+
+fn icc_profile_location(ds: &DataSet) -> Option<(u64, u64)> {
     ds.item(tags::OPTICAL_PATH_SEQUENCE, 0)?
-        .bytes(tags::ICC_PROFILE)
+        .bulk(tags::ICC_PROFILE)
 }
 
 /// Decode a single-frame instance (label, macro, thumbnail) in full.
@@ -771,7 +815,7 @@ fn read_associated(file: &ParsedFile) -> Result<AssociatedImage> {
         width,
         height,
         argb_data,
-        icc_profile: icc_profile(&file.object.dataset).map(<[u8]>::to_vec),
+        icc_profile: icc_profile(file),
     })
 }
 

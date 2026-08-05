@@ -26,6 +26,7 @@ use crate::decode::tiff::tags;
 use crate::decode::xml::{Node, parse_tree};
 use crate::error::{OpenSlideError, Result};
 use crate::grid::simple::SimpleGrid;
+use crate::icc::IccProfile;
 use crate::io::SlideReader;
 use crate::level::LevelInfo;
 use crate::properties::{self, Properties};
@@ -196,7 +197,7 @@ impl VendorDriver for PhilipsDriver {
                                 width: w,
                                 height: h,
                                 argb_data,
-                                icc_profile: None,
+                                icc_profile: IccProfile::absent(),
                             },
                         ));
                     }
@@ -229,7 +230,7 @@ impl VendorDriver for PhilipsDriver {
             levels,
             properties: props,
             associated_images,
-            icc_profile: None,
+            icc_profile: IccProfile::absent(),
             tiff: Some(tl),
         })
     }

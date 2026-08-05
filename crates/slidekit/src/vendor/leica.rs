@@ -12,16 +12,29 @@
 //!
 //! Ported from `openslide-vendor-leica.c`.
 //!
+//! **Coordinate space.** A level is the whole *collection* — the glass slide the
+//! scanner describes — not the imaged region. `Leica-1.scn` scans a
+//! 36832×38432 window out of a 53130×153470 canvas, and level 0 is the canvas,
+//! with the region placed at `openslide.bounds-x`/`-y` and everything outside it
+//! transparent. This matters for interoperability rather than aesthetics: sizing
+//! level 0 to the region instead would make the same `(x, y)` name different
+//! pixels in slidekit and OpenSlide, silently, for every Leica slide.
+//!
+//! The canvas is derived from the XML, all of it in nanometres: a level's scale
+//! is `view.sizeX / dimension.sizeX` nm per pixel, the level is
+//! `ceil(collection.size / that)`, and the region sits at
+//! `floor(view.offset / that)`. The x scale is used for both axes, which is what
+//! the C driver does — reproduces all five of `Leica-1.scn`'s level sizes and
+//! both bounds values exactly.
+//!
 //! ponytail / deferred vs. the C driver:
-//!  - **Single main image only.** A multi-region SCN composites several main
-//!    images placed at collection offsets into one virtual canvas per level.
-//!    The read path keys one TIFF directory per level (`LevelData.tiff_dir`), so
-//!    a level can't draw tiles from multiple IFDs yet — `open` errors clearly in
-//!    that case. Upgrade: add a per-`PlacedTile` directory to `TileMap` and
-//!    thread it through `read_region_tilemap`, then size each level to the
-//!    collection. The common single-region slide is fully supported.
-//!  - `openslide.bounds-*` / `openslide.region[n].*` are not set (only
-//!    meaningful once multi-region compositing lands).
+//!  - **Single main image only.** A multi-region SCN places several main images
+//!    on that shared canvas. The read path keys one TIFF directory per level
+//!    (`LevelData.tiff_dir`), so a level can't draw tiles from multiple IFDs yet
+//!    — `open` errors clearly in that case. Upgrade: add a per-`PlacedTile`
+//!    directory to `TileMap` and thread it through `read_region_tilemap`; the
+//!    canvas geometry this driver now computes is what such a level would need.
+//!    The common single-region slide is fully supported.
 //!  - Namespace-prefixed SCN documents aren't handled (the real slides use the
 //!    default namespace, so element names are unprefixed); the base64 `<barcode>`
 //!    element of the 2010/10/01 schema is ignored (the `barcode` attribute is
@@ -34,6 +47,7 @@ use crate::decode::tiff::tags;
 use crate::decode::xml::{Node, parse_tree};
 use crate::error::{OpenSlideError, Result};
 use crate::grid::simple::SimpleGrid;
+use crate::icc::IccProfile;
 use crate::io::SlideReader;
 use crate::level::LevelInfo;
 use crate::properties::{self, Properties};
@@ -103,13 +117,20 @@ impl VendorDriver for LeicaDriver {
 
         // Build pyramid levels from the main image's z=0 dimensions. Each
         // dimension is a tiled TIFF directory; sort largest-first like the other
-        // TIFF drivers and derive downsample from the level-0 width.
+        // TIFF drivers.
         struct Lvl {
             dir: i64,
+            /// Imaged region size in this level's pixels.
             w: i64,
             h: i64,
             tw: i64,
             th: i64,
+            /// Level canvas: the whole collection at this level's scale.
+            canvas_w: i64,
+            canvas_h: i64,
+            /// Where the region sits on that canvas.
+            origin_x: i64,
+            origin_y: i64,
             decoder: Box<dyn TileDecoder>,
         }
         let mut lvls: Vec<Lvl> = Vec::with_capacity(main.dim_ifds.len());
@@ -123,30 +144,46 @@ impl VendorDriver for LeicaDriver {
             let th = tl.get_uint(dir, tags::TILE_LENGTH)? as i64;
             // Building the decoder also verifies the compression is supported.
             let decoder = make_decoder_for_dir(&mut tl, dir)?;
+            // Nanometres per pixel at this level, from the region's own physical
+            // extent. The x scale drives both axes, matching the C driver.
+            if w <= 0 {
+                return Err(dec(format!("Leica level directory {dir} has no width")));
+            }
+            let nm_per_px = main.view.size_x as f64 / w as f64;
+            if nm_per_px <= 0.0 || !nm_per_px.is_finite() {
+                return Err(dec("Leica image view has no usable physical width"));
+            }
             lvls.push(Lvl {
                 dir,
                 w,
                 h,
                 tw,
                 th,
+                canvas_w: div_ceil_nm(scn.collection_x, nm_per_px),
+                canvas_h: div_ceil_nm(scn.collection_y, nm_per_px),
+                origin_x: (main.view.offset_x as f64 / nm_per_px).floor() as i64,
+                origin_y: (main.view.offset_y as f64 / nm_per_px).floor() as i64,
                 decoder,
             });
         }
         lvls.sort_by_key(|l| std::cmp::Reverse(l.w));
-        let base_w = lvls[0].w as f64;
+        let base_w = lvls[0].canvas_w as f64;
+        let base_h = lvls[0].canvas_h as f64;
         let level0_dir = lvls[0].dir;
+        let bounds = (lvls[0].origin_x, lvls[0].origin_y, lvls[0].w, lvls[0].h);
 
         let mut levels = Vec::with_capacity(lvls.len());
         for l in lvls {
             levels.push(LevelData {
                 info: LevelInfo {
-                    width: l.w,
-                    height: l.h,
-                    downsample: base_w / l.w as f64,
+                    width: l.canvas_w,
+                    height: l.canvas_h,
+                    // Averaged over both axes, as OpenSlide reports it.
+                    downsample: (base_w / l.canvas_w as f64 + base_h / l.canvas_h as f64) / 2.0,
                     tile_width: l.tw,
                     tile_height: l.th,
                 },
-                grid: SimpleGrid::new(l.w, l.h, l.tw, l.th),
+                grid: SimpleGrid::new(l.w, l.h, l.tw, l.th).at_origin(l.origin_x, l.origin_y),
                 tiff_dir: l.dir,
                 decoder: l.decoder,
                 tiff_tile_width: l.tw,
@@ -186,6 +223,19 @@ impl VendorDriver for LeicaDriver {
         if let Some(bc) = &scn.barcode {
             props.insert("leica.barcode", bc.clone());
         }
+        // Where the scan actually is on the level-0 canvas. Without these a
+        // caller has no way to find the tissue, since (0, 0) is empty glass.
+        let (bx, by, bw, bh) = bounds;
+        props.insert(properties::names::BOUNDS_X, bx.to_string());
+        props.insert(properties::names::BOUNDS_Y, by.to_string());
+        props.insert(properties::names::BOUNDS_WIDTH, bw.to_string());
+        props.insert(properties::names::BOUNDS_HEIGHT, bh.to_string());
+        // The C driver also enumerates the regions it composited. There is
+        // exactly one until multi-region support lands, and it is the bounds.
+        props.insert("openslide.region[0].x", bx.to_string());
+        props.insert("openslide.region[0].y", by.to_string());
+        props.insert("openslide.region[0].width", bw.to_string());
+        props.insert("openslide.region[0].height", bh.to_string());
         set_resolution_props(&mut tl, level0_dir, &mut props);
         set_tiff_string_props(&mut tl, level0_dir, &mut props);
         // Keep the (large) XML document out of the property list.
@@ -211,7 +261,7 @@ impl VendorDriver for LeicaDriver {
                             width: w,
                             height: h,
                             argb_data,
-                            icc_profile: None,
+                            icc_profile: IccProfile::absent(),
                         },
                     ));
                 }
@@ -224,7 +274,7 @@ impl VendorDriver for LeicaDriver {
             levels,
             properties: props,
             associated_images,
-            icc_profile,
+            icc_profile: icc_profile.into(),
             tiff: Some(tl),
         })
     }
@@ -243,10 +293,25 @@ struct ScnImageMeta {
     objective: Option<String>,
 }
 
+/// An image's `<view>`: its position and extent on the collection canvas, in
+/// nanometres.
+///
+/// Only the x extent is kept. It sets the nanometres-per-pixel scale for *both*
+/// axes, which is what the C driver does — and has to be, to reproduce its level
+/// sizes: `Leica-1.scn`'s y extent implies a different scale at coarse levels
+/// and would put level 3 at 2397 pixels tall where OpenSlide reports 2401.
+#[derive(Clone, Copy)]
+struct ScnView {
+    size_x: i64,
+    offset_x: i64,
+    offset_y: i64,
+}
+
 /// One `<image>` from the SCN collection, reduced to what the driver needs.
 struct ScnImage {
     is_macro: bool,
     brightfield: bool,
+    view: ScnView,
     /// TIFF directory indices of this image's z=0 pyramid dimensions.
     dim_ifds: Vec<i64>,
     meta: ScnImageMeta,
@@ -255,7 +320,19 @@ struct ScnImage {
 /// The parsed `<scn>` document.
 struct Scn {
     barcode: Option<String>,
+    /// Collection extent in nanometres — the glass slide every level is sized to.
+    collection_x: i64,
+    collection_y: i64,
     images: Vec<ScnImage>,
+}
+
+/// `ceil(nm / nm_per_px)` as a pixel count, never below 1.
+///
+/// Ceiling, not rounding: a canvas has to contain the collection, and the C
+/// driver's sizes only reproduce under ceiling (level 3 of `Leica-1.scn` is 2401
+/// pixels tall for 2400.04 pixels of glass).
+fn div_ceil_nm(nm: i64, nm_per_px: f64) -> i64 {
+    ((nm as f64 / nm_per_px).ceil() as i64).max(1)
 }
 
 /// Parse the SCN ImageDescription XML into its collection + images.
@@ -324,6 +401,11 @@ fn parse_scn_xml(xml: &str) -> Result<Scn> {
         images.push(ScnImage {
             is_macro,
             brightfield,
+            view: ScnView {
+                size_x: vx,
+                offset_x: ox,
+                offset_y: oy,
+            },
             dim_ifds,
             meta,
         });
@@ -333,7 +415,12 @@ fn parse_scn_xml(xml: &str) -> Result<Scn> {
         return Err(dec("Can't find any images"));
     }
 
-    Ok(Scn { barcode, images })
+    Ok(Scn {
+        barcode,
+        collection_x: coll_x,
+        collection_y: coll_y,
+        images,
+    })
 }
 
 /// Trimmed, non-empty text of the node reached by descending `path`.

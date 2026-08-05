@@ -174,10 +174,26 @@ fn leica_4_sparse() {
     );
 
     // ── ICC profile ──
-    // Level 0's optical path carries one; it is the slide's profile.
-    let icc = slide.icc_profile().expect("slide ICC profile");
-    assert!(icc.len() > 128, "ICC profile looks truncated");
+    // Level 0's optical path carries one; it is the slide's profile. Leica writes
+    // a 13 MB profile into *every* instance of the slide, so the size has to be
+    // available without fetching it — opening a slide must not download 13 MB of
+    // colour data on the chance that someone wants it.
+    let size = slide
+        .icc_profile_size()
+        .expect("slide ICC profile size, without reading it");
+    assert!(size > 128, "ICC profile looks truncated");
+
+    let icc = slide
+        .icc_profile()
+        .expect("read the ICC profile")
+        .expect("slide ICC profile");
+    assert_eq!(icc.len(), size, "size must match what was promised");
     assert_eq!(&icc[36..40], b"acsp", "not an ICC profile header");
+    // Cached: the borrow above is still valid and identical on a second call.
+    assert_eq!(
+        slide.icc_profile().expect("cached").expect("present").len(),
+        size
+    );
 
     // ── Associated images ──
     // LABEL → label (uncompressed RGB), OVERVIEW → macro, THUMBNAIL → thumbnail.
@@ -324,4 +340,115 @@ fn opens_over_an_object_store() {
     remote_names.sort();
     local_names.sort();
     assert_eq!(remote_names, local_names);
+}
+
+/// A [`SlideFs`] that counts the bytes read through it, over a real directory.
+struct CountingFs {
+    inner: slidekit::LocalFs,
+    bytes: std::sync::Arc<std::sync::atomic::AtomicU64>,
+}
+
+struct CountingReader {
+    inner: std::sync::Arc<dyn slidekit::SlideReader>,
+    bytes: std::sync::Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl slidekit::SlideReader for CountingReader {
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> slidekit::Result<usize> {
+        let n = self.inner.read_at(offset, buf)?;
+        self.bytes
+            .fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+        Ok(n)
+    }
+
+    fn size(&self) -> slidekit::Result<u64> {
+        self.inner.size()
+    }
+}
+
+impl CountingFs {
+    fn wrap(
+        &self,
+        reader: std::sync::Arc<dyn slidekit::SlideReader>,
+    ) -> std::sync::Arc<dyn slidekit::SlideReader> {
+        std::sync::Arc::new(CountingReader {
+            inner: reader,
+            bytes: self.bytes.clone(),
+        })
+    }
+}
+
+impl slidekit::SlideFs for CountingFs {
+    fn open(&self, path: &str) -> slidekit::Result<std::sync::Arc<dyn slidekit::SlideReader>> {
+        Ok(self.wrap(self.inner.open(path)?))
+    }
+
+    fn open_sized(
+        &self,
+        path: &str,
+        size: u64,
+    ) -> slidekit::Result<std::sync::Arc<dyn slidekit::SlideReader>> {
+        Ok(self.wrap(self.inner.open_sized(path, size)?))
+    }
+
+    fn list(&self, dir: &str) -> slidekit::Result<Vec<slidekit::Entry>> {
+        self.inner.list(dir)
+    }
+}
+
+/// Opening a slide must not fetch its ICC profile.
+///
+/// Leica writes a ~13 MB profile into *every* instance, so a driver that loaded
+/// them eagerly read 49 MB per open — and even loading only the ones the slide
+/// surfaces (level 0's and the thumbnail's) cost 24.6 MB of the 30.9 MB a remote
+/// open transferred, for colour data most callers never ask for. Counting bytes
+/// through the filesystem is the direct way to state that: the profile's own size
+/// is the yardstick, so this can't drift with the fixture.
+#[test]
+fn open_does_not_read_the_icc_profile() {
+    let path = require_dicom_slide!("DICOM/Leica-4.zip");
+    let dir = path.parent().expect("extracted instance has a parent");
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .expect("instance name is UTF-8");
+
+    let bytes = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let fs: std::sync::Arc<dyn slidekit::SlideFs> = std::sync::Arc::new(CountingFs {
+        inner: slidekit::LocalFs::new(dir),
+        bytes: bytes.clone(),
+    });
+    let read = || bytes.load(std::sync::atomic::Ordering::Relaxed);
+
+    let slide = OpenSlide::open_fs(fs, name).expect("open through the counting filesystem");
+    let at_open = read();
+
+    let profile_size = slide
+        .icc_profile_size()
+        .expect("Leica-4 has a slide ICC profile") as u64;
+    assert!(
+        profile_size > 8 << 20,
+        "expected the big Leica profile, got {profile_size} bytes"
+    );
+    assert!(
+        at_open < profile_size,
+        "open read {at_open} bytes, more than the {profile_size}-byte profile it \
+         was supposed to skip"
+    );
+
+    // Asking for it does read it — the deferral has to be real in both directions.
+    let icc = slide
+        .icc_profile()
+        .expect("read the profile")
+        .expect("present");
+    assert_eq!(icc.len() as u64, profile_size);
+    let after = read();
+    assert!(
+        after >= at_open + profile_size,
+        "reading the profile should have transferred it: {at_open} -> {after}"
+    );
+
+    // And only once: the second call is served from the cache.
+    slide.icc_profile().expect("cached").expect("present");
+    assert_eq!(read(), after, "a cached profile must not read again");
 }

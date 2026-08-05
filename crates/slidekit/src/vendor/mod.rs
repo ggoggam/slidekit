@@ -16,6 +16,7 @@ use crate::decode::tiff::TiffLike;
 use crate::error::Result;
 use crate::grid::simple::SimpleGrid;
 use crate::grid::tilemap::TileMap;
+use crate::icc::IccProfile;
 use crate::io::SlideReader;
 use crate::level::LevelInfo;
 use crate::properties::Properties;
@@ -71,7 +72,7 @@ pub struct SlideData {
     pub levels: Vec<LevelData>,
     pub properties: Properties,
     pub associated_images: Vec<(String, AssociatedImage)>,
-    pub icc_profile: Option<Vec<u8>>,
+    pub icc_profile: IccProfile,
     /// The TIFF container, kept alive for tile reads.
     pub tiff: Option<TiffLike>,
 }

@@ -40,6 +40,7 @@ use crate::decode::tiff::TiffLike;
 use crate::decode::xml::parse_tree;
 use crate::error::{OpenSlideError, Result};
 use crate::grid::simple::SimpleGrid;
+use crate::icc::IccProfile;
 use crate::io::SlideReader;
 use crate::level::LevelInfo;
 use crate::properties::{Properties, names};
@@ -192,10 +193,19 @@ fn open_czi(reader: Arc<dyn SlideReader>) -> Result<SlideData> {
 
     // Second pass: group subblocks by downsample into pyramid levels, placing
     // each at `(start - origin) / downsample` in its level's pixel space.
+    //
+    // Every subblock's 16-byte header is fetched in one batch first. The
+    // directory says where the subblocks are but not where the pixels inside
+    // them start, so this is unavoidably one small read per subblock — and
+    // issued serially it was the whole cost of a remote CZI open (159 requests
+    // for 16 MB of 16-byte headers, ~85 s). As one gather the backend coalesces
+    // and parallelizes them.
+    let headers = subblock_headers(&*reader, &kept)?;
+
     let mut by_downsample: HashMap<i64, Vec<ZeissTile>> = HashMap::new();
-    for (e, downsample) in kept {
+    for ((e, downsample), header) in kept.into_iter().zip(headers) {
         let (data_offset, data_size) =
-            subblock_data_location(&*reader, e.file_position, e.dimension_count)?;
+            subblock_data_location(&header, e.file_position, e.dimension_count)?;
         by_downsample
             .entry(downsample)
             .or_default()
@@ -273,7 +283,7 @@ fn open_czi(reader: Arc<dyn SlideReader>) -> Result<SlideData> {
         levels,
         properties,
         associated_images,
-        icc_profile: None,
+        icc_profile: IccProfile::absent(),
         tiff: None,
     })
 }
@@ -389,24 +399,34 @@ fn parse_dir_entry(buf: &[u8], off: usize) -> Result<DirEntry> {
     })
 }
 
-/// Resolve a subblock's pixel-data `(offset, size)` from its segment.
+/// Fetch every subblock's 16-byte payload header in one batched read.
+fn subblock_headers(
+    reader: &dyn SlideReader,
+    entries: &[(&DirEntry, i64)],
+) -> Result<Vec<bytes::Bytes>> {
+    let ranges: Vec<std::ops::Range<u64>> = entries
+        .iter()
+        .map(|(e, _)| {
+            let start = e.file_position as u64 + 32;
+            start..start + 16
+        })
+        .collect();
+    reader.read_ranges(&ranges)
+}
+
+/// Resolve a subblock's pixel-data `(offset, size)` from its 16-byte header.
 ///
 /// The `ZISRAWSUBBLOCK` payload begins with `MetadataSize (i32)`,
 /// `AttachmentSize (i32)`, `DataSize (i64)`, then the embedded DirectoryEntry.
 /// The metadata+data start after a fixed region of `max(256, 16 + entry_size)`
 /// bytes, where `entry_size = 32 + 20*DimensionCount`.
-///
-/// ponytail: one small header read per subblock at open time. Fine for
-/// correctness; batch into the directory pass if open latency ever matters.
 fn subblock_data_location(
-    reader: &dyn SlideReader,
+    head: &[u8],
     file_position: i64,
     dimension_count: i32,
 ) -> Result<(u64, usize)> {
-    let mut head = [0u8; 16];
-    reader.read_exact_at(file_position as u64 + 32, &mut head)?;
-    let metadata_size = i32le(&head, 0)? as u64;
-    let data_size = i64le(&head, 8)?;
+    let metadata_size = i32le(head, 0)? as u64;
+    let data_size = i64le(head, 8)?;
     if data_size < 0 {
         return Err(OpenSlideError::Decode(
             "CZI: negative subblock data size".into(),
@@ -679,7 +699,7 @@ fn read_one_attachment_jpeg(reader: &dyn SlideReader, pos: u64) -> Option<Associ
         width: w,
         height: h,
         argb_data,
-        icc_profile: None,
+        icc_profile: IccProfile::absent(),
     })
 }
 

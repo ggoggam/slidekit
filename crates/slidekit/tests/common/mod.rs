@@ -501,8 +501,14 @@ fn vendor_label(case: &str) -> String {
 ///
 /// * `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` — credentials
 /// * `BUCKET_NAME` — bucket to write under
-/// * `BUCKET_REGION` — region (`auto` for endpoints that don't care)
-/// * `BUCKET_ENDPOINT_URL` — S3-compatible endpoint
+/// * `AWS_REGION` (or `BUCKET_REGION`) — region (`auto` where it isn't used)
+/// * `AWS_ENDPOINT_URL` (or `BUCKET_ENDPOINT_URL`) — S3-compatible endpoint
+///
+/// The `AWS_*` spellings are the ones [`slidekit::OpenSlide::open_url`] reads,
+/// so a `.env` using them configures the bench store and the public URL entry
+/// point identically — which is what
+/// [`open_url_resolves_config_from_environment`](../bench_remote) asserts. The
+/// `BUCKET_*` aliases are accepted so an older `.env` keeps working.
 ///
 /// Everything is written under one key prefix ([`RemoteBucket::root`]) so the
 /// bench never touches unrelated objects in a shared bucket.
@@ -558,8 +564,12 @@ pub fn remote_bucket() -> Option<RemoteBucket> {
         // Non-AWS S3 implementations generally serve path-style URLs
         // (`endpoint/bucket/key`) and don't provision per-bucket DNS.
         .with_virtual_hosted_style_request(false)
-        .with_region(var("BUCKET_REGION").unwrap_or_else(|| "us-east-1".into()));
-    if let Some(endpoint) = var("BUCKET_ENDPOINT_URL") {
+        .with_region(
+            var("AWS_REGION")
+                .or_else(|| var("BUCKET_REGION"))
+                .unwrap_or_else(|| "us-east-1".into()),
+        );
+    if let Some(endpoint) = var("AWS_ENDPOINT_URL").or_else(|| var("BUCKET_ENDPOINT_URL")) {
         // Allow plain HTTP only for an explicitly non-TLS endpoint (a local
         // MinIO); real endpoints are HTTPS and unaffected.
         let insecure = endpoint.starts_with("http://");

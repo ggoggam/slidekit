@@ -37,6 +37,7 @@ use crate::decode::xml::{Node, parse_tree};
 use crate::error::{OpenSlideError, Result};
 use crate::grid::simple::SimpleGrid;
 use crate::grid::tilemap::{PlacedTile, TileMap};
+use crate::icc::IccProfile;
 use crate::io::SlideReader;
 use crate::level::LevelInfo;
 use crate::properties::{self, Properties};
@@ -236,7 +237,7 @@ impl VendorDriver for VentanaDriver {
             levels,
             properties: props,
             associated_images,
-            icc_profile,
+            icc_profile: icc_profile.into(),
             tiff: Some(tl),
         })
     }
@@ -259,7 +260,7 @@ fn push_associated(
                 width: w,
                 height: h,
                 argb_data,
-                icc_profile: None,
+                icc_profile: IccProfile::absent(),
             },
         ));
     }

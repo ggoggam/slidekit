@@ -95,13 +95,16 @@ fn cmu1() {
     }
 
     // ── ICC profile (main image) ──
-    let icc = slide.icc_profile();
+    // Aperio's profile comes out of a TIFF tag the driver has already parsed, so
+    // it is in hand at open; the size must agree either way.
+    let icc = slide.icc_profile().expect("read the ICC profile");
     assert!(icc.is_some(), "CMU-1.svs should have an ICC profile");
     assert_eq!(
         icc.unwrap().len(),
         141992,
         "ICC profile size should be 141992"
     );
+    assert_eq!(slide.icc_profile_size(), Some(141992));
 
     // ── Associated images ──
     let assoc = slide.associated_image_names();
@@ -124,11 +127,24 @@ fn cmu1() {
     assert_eq!(
         slide
             .associated_image_icc_profile("thumbnail")
+            .expect("read the thumbnail ICC profile")
             .expect("thumbnail should have an ICC profile")
             .len(),
         141992,
         "thumbnail ICC profile size should be 141992"
     );
+    assert_eq!(
+        slide.associated_image_icc_profile_size("thumbnail"),
+        Some(141992)
+    );
+    // An image that isn't there has no profile, and that is not an error.
+    assert_eq!(
+        slide
+            .associated_image_icc_profile("nope")
+            .expect("absent is not a failure"),
+        None
+    );
+    assert_eq!(slide.associated_image_icc_profile_size("nope"), None);
     let thumb = slide.read_associated_image("thumbnail").unwrap();
     assert_eq!(
         thumb.len(),

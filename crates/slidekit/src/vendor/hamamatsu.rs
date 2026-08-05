@@ -36,6 +36,7 @@ use crate::decode::jpeg::JpegDecoder;
 use crate::decode::tiff::{TiffLike, tags};
 use crate::error::{OpenSlideError, Result};
 use crate::grid::simple::SimpleGrid;
+use crate::icc::IccProfile;
 use crate::io::SlideReader;
 use crate::level::LevelInfo;
 use crate::properties::{self, Properties};
@@ -181,7 +182,7 @@ impl VendorDriver for HamamatsuDriver {
             levels: level_data,
             properties: props,
             associated_images,
-            icc_profile,
+            icc_profile: icc_profile.into(),
             tiff: Some(tl),
         })
     }
@@ -577,7 +578,7 @@ fn decode_whole_jpeg(tl: &mut TiffLike, dir: i64) -> Result<AssociatedImage> {
         width,
         height,
         argb_data,
-        icc_profile: None,
+        icc_profile: IccProfile::absent(),
     })
 }
 

@@ -17,6 +17,7 @@ use crate::decode::tiff::{TiffLike, tags};
 use crate::decode::{deflate, xml};
 use crate::error::{OpenSlideError, Result};
 use crate::grid::simple::SimpleGrid;
+use crate::icc::IccProfile;
 use crate::io::SlideReader;
 use crate::level::LevelInfo;
 use crate::properties::{self, Properties};
@@ -571,7 +572,7 @@ pub fn open() -> Result<SlideData> {
         levels: vec![level],
         properties: props,
         associated_images: vec![],
-        icc_profile: None,
+        icc_profile: IccProfile::absent(),
         tiff: None,
     })
 }

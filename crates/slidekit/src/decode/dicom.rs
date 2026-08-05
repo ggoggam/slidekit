@@ -24,6 +24,18 @@
 //! ([`PixelData`]), so a multi-GB slide costs a few hundred KiB of metadata and
 //! frames are fetched individually at read time.
 //!
+//! Nor is the fragment run *walked*. Resolving fragment offsets without an
+//! offset table means reading an item header per fragment, and a parse that did
+//! that eagerly turned opening one 197 MB slide over blob storage into 2665
+//! requests and 166 MB — 84% of the file — before a pixel was asked for.
+//! Parsing therefore stops at an encapsulated pixel data element (nothing after
+//! it in tag order is used) and [`FrameIndex`] resolves frames on demand, from
+//! an offset table where one exists and otherwise by walking only as far as the
+//! frame actually requested.
+//!
+//! ICC profiles get the same treatment for the same reason ([`Value::Bulk`]):
+//! Leica writes a 13 MB profile into every instance of a slide.
+//!
 //! `PerFrameFunctionalGroupsSequence` gets the same treatment for a different
 //! reason: a sparsely-tiled level has one item per frame (8000+ on a routine
 //! slide, tens of MiB of XML-ish nesting), and the only thing the read path
@@ -31,6 +43,8 @@
 //! extracted into [`DicomObject::frame_positions`] and the items dropped, which
 //! also keeps them out of the property dump — matching what the C driver gets
 //! from libdicom's metadata subset.
+
+use parking_lot::Mutex;
 
 use crate::error::{OpenSlideError, Result};
 use crate::io::SlideReader;
@@ -318,10 +332,18 @@ pub enum Value {
     Ints(Vec<i64>),
     /// A binary float VR (`FL`/`FD`).
     Floats(Vec<f64>),
-    /// An opaque byte VR (`OB`/`OW`/`UN`/…), e.g. an ICC profile.
+    /// An opaque byte VR (`OB`/`OW`/`UN`/…).
     Bytes(Vec<u8>),
     /// A sequence's items.
     Items(Vec<DataSet>),
+    /// Recorded by location instead of loaded, because it can be enormous and
+    /// is usually not wanted: an ICC profile.
+    ///
+    /// Leica's DICOM instances carry a 13 MB profile — and carry it in *every*
+    /// instance of the slide, so loading it eagerly made opening one slide read
+    /// 49 MB of duplicate colour data. Read it with the instance's own reader
+    /// when it is actually asked for.
+    Bulk { offset: u64, length: u64 },
     /// Present in the file but deliberately not retained: bulk pixel data, and
     /// the per-frame functional groups (see the module docs).
     Elided,
@@ -357,7 +379,7 @@ impl Element {
             Value::Text(text) => text.split('\\').map(|s| s.trim().to_string()).collect(),
             Value::Ints(values) => values.iter().map(i64::to_string).collect(),
             Value::Floats(values) => values.iter().map(f64::to_string).collect(),
-            Value::Bytes(_) | Value::Items(_) | Value::Elided => Vec::new(),
+            Value::Bytes(_) | Value::Items(_) | Value::Bulk { .. } | Value::Elided => Vec::new(),
         }
     }
 }
@@ -429,6 +451,15 @@ impl DataSet {
         }
     }
 
+    /// Location of a [`Value::Bulk`] element — bytes recorded rather than
+    /// loaded, to be read from the instance's reader on demand.
+    pub fn bulk(&self, tag: Tag) -> Option<(u64, u64)> {
+        match self.get(tag)? {
+            Value::Bulk { offset, length } => Some((*offset, *length)),
+            _ => None,
+        }
+    }
+
     pub fn items(&self, tag: Tag) -> Option<&[DataSet]> {
         match self.get(tag)? {
             Value::Items(items) => Some(items),
@@ -466,11 +497,20 @@ pub struct Frame {
 pub enum PixelData {
     /// Uncompressed: one defined-length blob of `frame_count` equal-size frames.
     Native { offset: u64, length: u64 },
-    /// Encapsulated: one item per compressed fragment, plus the Basic Offset
-    /// Table's contents (empty when the BOT item is zero-length, which is
-    /// common — the offsets are then recovered by walking the fragments).
+    /// Encapsulated: a Basic Offset Table item followed by one item
+    /// ("fragment") per compressed frame.
+    ///
+    /// Only the *start* of that fragment run is recorded. Walking it costs a
+    /// read every fragment — 2665 of them on a routine level 0 — and produces
+    /// nothing that isn't derivable later, so the walk is deferred to
+    /// [`FrameIndex`] and skipped entirely when an offset table makes it
+    /// unnecessary.
     Encapsulated {
-        fragments: Vec<Frame>,
+        /// Offset of the first fragment's item tag. Both offset tables are
+        /// relative to this position.
+        first_item: u64,
+        /// Contents of the Basic Offset Table. Empty when the BOT item is
+        /// zero-length, which is common.
         basic_offset_table: Vec<u32>,
     },
 }
@@ -493,14 +533,24 @@ pub struct DicomObject {
 }
 
 impl DicomObject {
-    /// Byte location of each of `frame_count` frames.
+    /// How to find each of `frame_count` frames, resolving as little as possible
+    /// up front.
     ///
-    /// Prefers the Extended Offset Table (`(7FE0,0001)`/`(7FE0,0002)`) when the
-    /// instance carries one; otherwise uses the fragment walk, which requires
-    /// one fragment per frame — the layout WSI encoders produce, and the only
-    /// one resolvable without an offset table. Native (uncompressed) pixel data
-    /// is sliced into `frame_count` equal parts.
-    pub fn frame_locations(&self, frame_count: usize, frame_size: u64) -> Result<Vec<Frame>> {
+    /// Three layouts, in descending order of preference:
+    ///
+    ///  - **Native** (uncompressed): frames are equal-size slices of one blob,
+    ///    so every offset is arithmetic.
+    ///  - **Offset table**: the Extended Offset Table
+    ///    (`(7FE0,0001)`/`(7FE0,0002)`) gives offsets *and* lengths outright; a
+    ///    non-empty Basic Offset Table gives offsets, and consecutive entries
+    ///    give all but the last length.
+    ///  - **Fragment walk**: with no table, a fragment's position is only known
+    ///    from the previous fragment's length, so offsets form a linked list.
+    ///    That walk is deferred and incremental — see [`FrameIndex::Walk`].
+    ///
+    /// `frame_size` is the decoded size of one frame, used to slice native pixel
+    /// data.
+    pub fn frame_index(&self, frame_count: usize, frame_size: u64) -> Result<FrameIndex> {
         let pixel_data = self
             .pixel_data
             .as_ref()
@@ -516,25 +566,27 @@ impl DicomObject {
                         "DICOM pixel data is {length} bytes, need {needed} for {frame_count} frames"
                     )));
                 }
-                Ok((0..frame_count as u64)
-                    .map(|i| Frame {
-                        offset: offset + i * frame_size,
-                        length: frame_size as u32,
-                    })
-                    .collect())
+                Ok(FrameIndex::Native {
+                    offset: *offset,
+                    frame_size,
+                    count: frame_count,
+                })
             }
-            PixelData::Encapsulated { fragments, .. } => {
-                if let Some(frames) = self.extended_offset_table(frame_count)? {
-                    return Ok(frames);
+            PixelData::Encapsulated {
+                first_item,
+                basic_offset_table,
+            } => {
+                if let Some(frames) = self.extended_offset_table(*first_item, frame_count)? {
+                    return Ok(FrameIndex::Table(frames));
                 }
-                if fragments.len() != frame_count {
-                    return Err(OpenSlideError::Decode(format!(
-                        "DICOM pixel data has {} fragments for {frame_count} frames and no \
-                         offset table; multi-fragment frames are unsupported",
-                        fragments.len()
-                    )));
+                if !basic_offset_table.is_empty() {
+                    return basic_offset_table_index(*first_item, basic_offset_table, frame_count);
                 }
-                Ok(fragments.clone())
+                Ok(FrameIndex::Walk(Mutex::new(FragmentWalk {
+                    count: frame_count,
+                    next: *first_item,
+                    found: Vec::new(),
+                })))
             }
         }
     }
@@ -543,21 +595,17 @@ impl DicomObject {
     ///
     /// Offsets in the table are relative to the first fragment's item tag, the
     /// same origin the Basic Offset Table uses.
-    fn extended_offset_table(&self, frame_count: usize) -> Result<Option<Vec<Frame>>> {
+    fn extended_offset_table(
+        &self,
+        first_item: u64,
+        frame_count: usize,
+    ) -> Result<Option<Vec<Frame>>> {
         let (Some(offsets), Some(lengths)) = (
             self.dataset.bytes(tags::EXTENDED_OFFSET_TABLE),
             self.dataset.bytes(tags::EXTENDED_OFFSET_TABLE_LENGTHS),
         ) else {
             return Ok(None);
         };
-        let Some(PixelData::Encapsulated { fragments, .. }) = self.pixel_data.as_ref() else {
-            return Ok(None);
-        };
-        let Some(first) = fragments.first() else {
-            return Ok(None);
-        };
-        // Fragment offsets point at the item tag, 8 bytes before the data.
-        let origin = first.offset - 8;
 
         if offsets.len() != lengths.len() || offsets.len() != frame_count * 8 {
             return Err(OpenSlideError::Decode(format!(
@@ -572,12 +620,215 @@ impl DicomObject {
         Ok(Some(
             (0..frame_count)
                 .map(|i| Frame {
-                    offset: origin + read_u64(offsets, i) + 8,
+                    // Table offsets address the item tag; the frame starts after
+                    // its 8-byte header.
+                    offset: first_item + read_u64(offsets, i) + 8,
                     length: read_u64(lengths, i) as u32,
                 })
                 .collect(),
         ))
     }
+}
+
+/// Frame locations from a non-empty Basic Offset Table.
+///
+/// The BOT gives offsets but no lengths, so each frame's length comes from where
+/// the *next* fragment starts. The last frame has no successor; its length is
+/// read from its own item header on first access, which through a buffered
+/// reader normally lands in the same block as the frame data.
+fn basic_offset_table_index(
+    first_item: u64,
+    table: &[u32],
+    frame_count: usize,
+) -> Result<FrameIndex> {
+    if table.len() != frame_count {
+        return Err(OpenSlideError::Decode(format!(
+            "DICOM basic offset table has {} entries for {frame_count} frames",
+            table.len()
+        )));
+    }
+    let mut frames = Vec::with_capacity(frame_count);
+    for (i, &start) in table.iter().enumerate() {
+        let offset = first_item + start as u64 + 8;
+        // `None` marks "length not known yet" for the final entry.
+        let length = table
+            .get(i + 1)
+            .map(|&next| u64::from(next).saturating_sub(u64::from(start) + 8) as u32);
+        frames.push((offset, length));
+    }
+    Ok(FrameIndex::PartialTable(Mutex::new(frames)))
+}
+
+/// Where each frame of an instance lives, resolved lazily.
+///
+/// This is the shape of the fix for the walk that used to dominate a remote
+/// DICOM open: the eager version read an 8-byte item header per fragment at
+/// open, which on a 2665-frame level meant 2665 requests and — through a
+/// windowed reader — 166 MB, 84% of the slide, before a single pixel was asked
+/// for.
+pub enum FrameIndex {
+    /// Uncompressed frames: equal-size slices of one blob.
+    Native {
+        offset: u64,
+        frame_size: u64,
+        count: usize,
+    },
+    /// Fully resolved from an Extended Offset Table.
+    Table(Vec<Frame>),
+    /// Offsets from a Basic Offset Table; the last frame's length is filled in
+    /// on first access.
+    PartialTable(Mutex<Vec<(u64, Option<u32>)>>),
+    /// No offset table: fragment *n*'s position is `fragment n-1`'s position
+    /// plus its length, so offsets are only knowable by walking the chain.
+    ///
+    /// The walk runs on demand and stops at the frame asked for, remembering how
+    /// far it got. Opening a slide therefore costs nothing, reading a coarse
+    /// level costs its own few frames, and only a read deep into level 0 pays
+    /// for the frames before it — once.
+    Walk(Mutex<FragmentWalk>),
+}
+
+/// Incremental state of a fragment-chain walk. See [`FrameIndex::Walk`].
+pub struct FragmentWalk {
+    /// Frames the instance declares.
+    count: usize,
+    /// Offset of the next unread item header.
+    next: u64,
+    /// Frames resolved so far, in order.
+    found: Vec<Frame>,
+}
+
+impl FrameIndex {
+    /// Locate frame `index`, reading only what that requires.
+    pub fn frame(&self, index: usize, reader: &dyn SlideReader) -> Result<Frame> {
+        match self {
+            FrameIndex::Native {
+                offset,
+                frame_size,
+                count,
+            } => {
+                Self::in_range(index, *count)?;
+                Ok(Frame {
+                    offset: offset + index as u64 * frame_size,
+                    length: *frame_size as u32,
+                })
+            }
+            FrameIndex::Table(frames) => frames
+                .get(index)
+                .copied()
+                .ok_or_else(|| Self::out_of_range(index, frames.len())),
+            FrameIndex::PartialTable(frames) => {
+                let mut frames = frames.lock();
+                let count = frames.len();
+                let (offset, length) = *frames
+                    .get(index)
+                    .ok_or_else(|| Self::out_of_range(index, count))?;
+                let length = match length {
+                    Some(length) => length,
+                    None => {
+                        let length = read_item_length(reader, offset - 8)?;
+                        frames[index].1 = Some(length);
+                        length
+                    }
+                };
+                Ok(Frame { offset, length })
+            }
+            FrameIndex::Walk(walk) => walk.lock().frame(index, reader),
+        }
+    }
+
+    /// Frames this index can locate.
+    pub fn count(&self) -> usize {
+        match self {
+            FrameIndex::Native { count, .. } => *count,
+            FrameIndex::Table(frames) => frames.len(),
+            FrameIndex::PartialTable(frames) => frames.lock().len(),
+            FrameIndex::Walk(walk) => walk.lock().count,
+        }
+    }
+
+    fn in_range(index: usize, count: usize) -> Result<()> {
+        (index < count)
+            .then_some(())
+            .ok_or_else(|| Self::out_of_range(index, count))
+    }
+
+    fn out_of_range(index: usize, count: usize) -> OpenSlideError {
+        OpenSlideError::Decode(format!(
+            "DICOM frame {index} is out of range ({count} frames)"
+        ))
+    }
+}
+
+impl FragmentWalk {
+    /// Walk far enough to locate frame `index`, then stop.
+    fn frame(&mut self, index: usize, reader: &dyn SlideReader) -> Result<Frame> {
+        FrameIndex::in_range(index, self.count)?;
+        let size = reader.size()?;
+        while self.found.len() <= index {
+            if self.next + 8 > size {
+                return Err(OpenSlideError::Decode(format!(
+                    "DICOM pixel data ends after {} of {} fragments",
+                    self.found.len(),
+                    self.count
+                )));
+            }
+            let mut header = [0u8; 8];
+            reader.read_exact_at(self.next, &mut header)?;
+            let tag = tag(
+                u16::from_le_bytes([header[0], header[1]]),
+                u16::from_le_bytes([header[2], header[3]]),
+            );
+            let length = u32::from_le_bytes([header[4], header[5], header[6], header[7]]);
+            match tag {
+                ITEM => {}
+                // Running out of fragments early means frames span several
+                // fragments (or the file is short) — either way the 1:1
+                // fragment-per-frame mapping this walk assumes doesn't hold.
+                SEQUENCE_DELIMITER => {
+                    return Err(OpenSlideError::Decode(format!(
+                        "DICOM pixel data has {} fragments for {} frames and no offset \
+                         table; multi-fragment frames are unsupported",
+                        self.found.len(),
+                        self.count
+                    )));
+                }
+                other => {
+                    return Err(OpenSlideError::Decode(format!(
+                        "expected DICOM pixel data fragment, found tag ({:04X},{:04X})",
+                        other >> 16,
+                        other & 0xFFFF
+                    )));
+                }
+            }
+            self.found.push(Frame {
+                offset: self.next + 8,
+                length,
+            });
+            self.next = self.next + 8 + u64::from(length);
+        }
+        Ok(self.found[index])
+    }
+}
+
+/// Length field of the item header at `offset`.
+fn read_item_length(reader: &dyn SlideReader, offset: u64) -> Result<u32> {
+    let mut header = [0u8; 8];
+    reader.read_exact_at(offset, &mut header)?;
+    let tag = tag(
+        u16::from_le_bytes([header[0], header[1]]),
+        u16::from_le_bytes([header[2], header[3]]),
+    );
+    if tag != ITEM {
+        return Err(OpenSlideError::Decode(format!(
+            "DICOM offset table points at tag ({:04X},{:04X}), not a pixel data fragment",
+            tag >> 16,
+            tag & 0xFFFF
+        )));
+    }
+    Ok(u32::from_le_bytes([
+        header[4], header[5], header[6], header[7],
+    ]))
 }
 
 /// Read and validate the preamble and the file meta group.
@@ -742,12 +993,21 @@ fn parse_dataset(
         // data is an `OB` element with an undefined length, which otherwise
         // looks exactly like an item stream.
         if ctx.top_level && header.tag == tags::PIXEL_DATA {
-            ctx.pixel_data = Some(parse_pixel_data(cur, header.length)?);
+            let (pixel_data, unskipped) = parse_pixel_data(cur, header.length)?;
+            ctx.pixel_data = Some(pixel_data);
             out.push(Element {
                 tag: header.tag,
                 vr: header.vr,
                 value: Value::Elided,
             });
+            if unskipped {
+                // Nothing after encapsulated pixel data is readable without
+                // walking it, and nothing after it is wanted: a dataset's
+                // elements are in ascending tag order, so both offset tables
+                // ((7FE0,0001) and (7FE0,0002)) have already been read, and what
+                // can follow (7FE0,0011+, the (FFFC,FFFC) padding) is not used.
+                return Ok(());
+            }
             continue;
         }
 
@@ -770,6 +1030,28 @@ fn parse_dataset(
                     value: Value::Items(items),
                 });
             }
+            continue;
+        }
+
+        // An ICC profile is recorded by location, not loaded: a Leica instance
+        // carries a 13 MB one and every instance of the slide repeats it, so
+        // reading them all would cost 49 MB of duplicate colour data before the
+        // caller has asked for any of it. Nested, not top-level — the profile
+        // lives inside `OpticalPathSequence`.
+        if header.tag == tags::ICC_PROFILE && header.length != UNDEFINED_LENGTH {
+            let offset = cur.pos();
+            let length = header.length as u64;
+            if offset + length > cur.size {
+                return Err(OpenSlideError::Decode(
+                    "DICOM ICC profile runs past the end of the file".into(),
+                ));
+            }
+            cur.skip(length);
+            out.push(Element {
+                tag: header.tag,
+                vr: header.vr,
+                value: Value::Bulk { offset, length },
+            });
             continue;
         }
 
@@ -882,14 +1164,22 @@ fn collect_frame_positions(cur: &mut Cursor, length: u32, ctx: &mut ParseContext
 }
 
 /// Record where the pixel data is without reading any of it.
-fn parse_pixel_data(cur: &mut Cursor, length: u32) -> Result<PixelData> {
+///
+/// Returns whether the element was left unskipped — true for encapsulated pixel
+/// data, whose undefined length can only be resolved by walking every fragment
+/// to the sequence delimiter. That walk is exactly what this avoids, so the
+/// caller must stop parsing instead of trying to continue past the element.
+fn parse_pixel_data(cur: &mut Cursor, length: u32) -> Result<(PixelData, bool)> {
     if length != UNDEFINED_LENGTH {
         let offset = cur.pos();
         cur.skip(length as u64);
-        return Ok(PixelData::Native {
-            offset,
-            length: length as u64,
-        });
+        return Ok((
+            PixelData::Native {
+                offset,
+                length: length as u64,
+            },
+            false,
+        ));
     }
 
     // Encapsulated: a Basic Offset Table item, then one item per fragment.
@@ -905,31 +1195,13 @@ fn parse_pixel_data(cur: &mut Cursor, length: u32) -> Result<PixelData> {
         .map(|c| u32::from_le_bytes(c.try_into().expect("4-byte chunk")))
         .collect();
 
-    let mut fragments = Vec::new();
-    while cur.remaining() >= 8 {
-        let header = read_element_header(cur)?;
-        match header.tag {
-            SEQUENCE_DELIMITER => break,
-            ITEM => {}
-            other => {
-                return Err(OpenSlideError::Decode(format!(
-                    "expected DICOM pixel data fragment, found tag ({:04X},{:04X})",
-                    other >> 16,
-                    other & 0xFFFF
-                )));
-            }
-        }
-        fragments.push(Frame {
-            offset: cur.pos(),
-            length: header.length,
-        });
-        cur.skip(header.length as u64);
-    }
-
-    Ok(PixelData::Encapsulated {
-        fragments,
-        basic_offset_table,
-    })
+    Ok((
+        PixelData::Encapsulated {
+            first_item: cur.pos(),
+            basic_offset_table,
+        },
+        true,
+    ))
 }
 
 /// Decode an element's raw bytes according to its VR.
@@ -1080,10 +1352,23 @@ impl<'r> Cursor<'r> {
 mod tests {
     use super::*;
 
-    struct MemReader(Vec<u8>);
+    /// In-memory file, counting the reads that reach it — that count is how the
+    /// laziness of [`FrameIndex`] is asserted.
+    struct MemReader(Vec<u8>, std::sync::atomic::AtomicU64);
+
+    impl MemReader {
+        fn new(data: Vec<u8>) -> Self {
+            Self(data, std::sync::atomic::AtomicU64::new(0))
+        }
+
+        fn reads(&self) -> u64 {
+            self.1.load(std::sync::atomic::Ordering::Relaxed)
+        }
+    }
 
     impl SlideReader for MemReader {
         fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize> {
+            self.1.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let start = (offset as usize).min(self.0.len());
             let n = buf.len().min(self.0.len() - start);
             buf[..n].copy_from_slice(&self.0[start..start + n]);
@@ -1183,7 +1468,7 @@ mod tests {
         out.extend_from_slice(&group_length.take());
         out.extend_from_slice(&meta);
         out.extend_from_slice(dataset);
-        MemReader(out)
+        MemReader::new(out)
     }
 
     /// DICOM values are even-length; UIDs pad with NUL.
@@ -1235,10 +1520,10 @@ mod tests {
 
     #[test]
     fn rejects_non_dicom_and_unsupported_encodings() {
-        let junk = MemReader(vec![0u8; 4096]);
+        let junk = MemReader::new(vec![0u8; 4096]);
         assert!(parse(&junk).is_err(), "no DICM magic");
 
-        let short = MemReader(vec![0u8; 8]);
+        let short = MemReader::new(vec![0u8; 8]);
         assert!(parse(&short).is_err(), "too short");
 
         // Implicit VR little-endian: the dataset carries no VRs to parse.
@@ -1328,10 +1613,10 @@ mod tests {
         );
     }
 
-    #[test]
-    fn locates_encapsulated_frames_by_fragment_walk() {
-        // Empty basic offset table, two JPEG-ish fragments: the common layout.
-        let mut payload = item(&[]);
+    /// Encapsulated pixel data with an empty basic offset table and one fragment
+    /// per frame — the common layout, and the one that needs a walk.
+    fn encapsulated_fixture(bot: &[u8]) -> MemReader {
+        let mut payload = item(bot);
         payload.extend_from_slice(&item(&[0xFF, 0xD8, 1, 2]));
         payload.extend_from_slice(&item(&[0xFF, 0xD8, 3, 4, 5, 6]));
         payload.extend_from_slice(&sequence_delimiter());
@@ -1342,23 +1627,159 @@ mod tests {
             b"OB",
             &payload,
         );
-        let reader = file("1.2.840.10008.1.2.4.50", &ds.take());
+        file("1.2.840.10008.1.2.4.50", &ds.take())
+    }
+
+    #[test]
+    fn locates_encapsulated_frames_by_fragment_walk() {
+        let reader = encapsulated_fixture(&[]);
 
         let obj = parse(&reader).expect("parse");
-        let frames = obj.frame_locations(2, 0).expect("frame locations");
-        assert_eq!(frames.len(), 2);
-        assert_eq!(frames[0].length, 4);
-        assert_eq!(frames[1].length, 6);
+        let index = obj.frame_index(2, 0).expect("frame index");
+        assert_eq!(index.count(), 2);
+
+        let first = index.frame(0, &reader).expect("frame 0");
+        let second = index.frame(1, &reader).expect("frame 1");
+        assert_eq!(first.length, 4);
+        assert_eq!(second.length, 6);
         // The recorded offsets point at the fragment payload, past the item tag.
-        let bytes = reader.0;
         assert_eq!(
-            &bytes[frames[1].offset as usize..frames[1].offset as usize + 6],
+            &reader.0[second.offset as usize..second.offset as usize + 6],
             &[0xFF, 0xD8, 3, 4, 5, 6]
         );
 
-        // A frame count that doesn't match the fragment count is an error, not
-        // a silently wrong tile mapping.
-        assert!(obj.frame_locations(3, 0).is_err());
+        // Asking past the declared frame count is an error, not a wrapped-around
+        // tile. Running *out* of fragments before the count is reached is too:
+        // that means frames span several fragments, which the 1:1 mapping can't
+        // express.
+        assert!(index.frame(2, &reader).is_err());
+        let over = obj.frame_index(3, 0).expect("frame index");
+        let err = over
+            .frame(2, &reader)
+            .expect_err("only two fragments exist");
+        assert!(err.to_string().contains("multi-fragment"), "{err}");
+    }
+
+    /// The point of [`FrameIndex`]: parsing an instance must not walk the
+    /// fragment chain. The eager walk cost one read per frame at open, which on
+    /// a real level 0 was 2665 requests and 166 MB before any pixel was asked
+    /// for.
+    #[test]
+    fn parsing_reads_no_pixel_data() {
+        let reader = encapsulated_fixture(&[]);
+        let obj = parse(&reader).expect("parse");
+
+        let PixelData::Encapsulated {
+            first_item,
+            basic_offset_table,
+        } = obj.pixel_data.as_ref().expect("pixel data")
+        else {
+            panic!("expected encapsulated pixel data");
+        };
+        assert!(basic_offset_table.is_empty());
+        // Recorded position only — the fragment run itself is untouched.
+        assert!(*first_item > 0);
+
+        let after_parse = reader.reads();
+        let index = obj.frame_index(2, 0).expect("frame index");
+        assert_eq!(
+            reader.reads(),
+            after_parse,
+            "building the index must not read either"
+        );
+
+        // The walk is incremental: frame 0 does not resolve frame 1, and a
+        // second lookup of an already-walked frame is free.
+        index.frame(0, &reader).expect("frame 0");
+        let after_first = reader.reads();
+        assert!(after_first > after_parse);
+        index.frame(0, &reader).expect("frame 0 again");
+        assert_eq!(reader.reads(), after_first, "memoized");
+        index.frame(1, &reader).expect("frame 1");
+        assert!(reader.reads() > after_first);
+    }
+
+    /// A non-empty basic offset table makes the walk unnecessary: offsets come
+    /// straight from the table, and all but the last length from the gaps
+    /// between them.
+    #[test]
+    fn uses_a_non_empty_basic_offset_table() {
+        // Fragment 0's item tag is the origin; fragment 1 starts 12 bytes later
+        // (8-byte header + 4-byte payload).
+        let mut bot = Vec::new();
+        bot.extend_from_slice(&0u32.to_le_bytes());
+        bot.extend_from_slice(&12u32.to_le_bytes());
+        let reader = encapsulated_fixture(&bot);
+
+        let obj = parse(&reader).expect("parse");
+        let index = obj.frame_index(2, 0).expect("frame index");
+        assert!(
+            matches!(index, FrameIndex::PartialTable(_)),
+            "a populated BOT should skip the walk"
+        );
+
+        let after_parse = reader.reads();
+        let first = index.frame(0, &reader).expect("frame 0");
+        assert_eq!(first.length, 4);
+        assert_eq!(
+            reader.reads(),
+            after_parse,
+            "a length derived from the next offset needs no read"
+        );
+
+        // Only the final frame, with no successor to measure against, reads its
+        // own item header — and only once.
+        let second = index.frame(1, &reader).expect("frame 1");
+        assert_eq!(second.length, 6);
+        assert_eq!(
+            &reader.0[second.offset as usize..second.offset as usize + 6],
+            &[0xFF, 0xD8, 3, 4, 5, 6]
+        );
+        let after_last = reader.reads();
+        index.frame(1, &reader).expect("frame 1 again");
+        assert_eq!(reader.reads(), after_last, "memoized");
+
+        // A table that doesn't describe every frame is rejected rather than
+        // half-used.
+        assert!(obj.frame_index(3, 0).is_err());
+    }
+
+    /// An ICC profile is located, not loaded. Leica's DICOM instances carry a
+    /// 13 MB profile each, so loading every instance's cost 49 MB per open.
+    #[test]
+    fn records_the_icc_profile_by_location() {
+        let profile: Vec<u8> = (0..4096u32).map(|i| (i % 256) as u8).collect();
+        let mut optical_path = Builder::default();
+        optical_path.element(tags::ICC_PROFILE, b"OB", &profile);
+        let mut ds = Builder::default();
+        ds.element(
+            tags::OPTICAL_PATH_SEQUENCE,
+            b"SQ",
+            &item(&optical_path.take()),
+        );
+        let reader = file("1.2.840.10008.1.2.1", &ds.take());
+
+        let obj = parse(&reader).expect("parse");
+        let path = obj
+            .dataset
+            .item(tags::OPTICAL_PATH_SEQUENCE, 0)
+            .expect("optical path");
+        let (offset, length) = path.bulk(tags::ICC_PROFILE).expect("profile location");
+        assert_eq!(length as usize, profile.len());
+        assert_eq!(
+            &reader.0[offset as usize..offset as usize + profile.len()],
+            &profile[..]
+        );
+
+        // The bytes were skipped, not read: `bytes()` finds nothing, and the
+        // property dump has no string form to emit for it either.
+        assert!(path.bytes(tags::ICC_PROFILE).is_none());
+        assert!(
+            path.element(tags::ICC_PROFILE)
+                .expect("element")
+                .value_strings()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -1375,12 +1796,17 @@ mod tests {
         };
         assert_eq!(*length, 24);
 
-        // Two 2x2 RGB frames of 12 bytes each.
-        let frames = obj.frame_locations(2, 12).expect("frame locations");
-        assert_eq!(frames[1].offset, frames[0].offset + 12);
-        assert_eq!(frames[0].length, 12);
+        // Two 2x2 RGB frames of 12 bytes each, located arithmetically.
+        let index = obj.frame_index(2, 12).expect("frame index");
+        let after_parse = reader.reads();
+        let first = index.frame(0, &reader).expect("frame 0");
+        let second = index.frame(1, &reader).expect("frame 1");
+        assert_eq!(second.offset, first.offset + 12);
+        assert_eq!(first.length, 12);
+        assert_eq!(reader.reads(), after_parse);
+        assert!(index.frame(2, &reader).is_err());
         // Asking for more than fits is an error.
-        assert!(obj.frame_locations(3, 12).is_err());
+        assert!(obj.frame_index(3, 12).is_err());
     }
 
     #[test]
@@ -1407,15 +1833,22 @@ mod tests {
         let reader = file("1.2.840.10008.1.2.4.50", &ds.take());
 
         let obj = parse(&reader).expect("parse");
-        let frames = obj.frame_locations(2, 0).expect("frame locations");
-        let bytes = &reader.0;
+        let index = obj.frame_index(2, 0).expect("frame index");
+        let after_parse = reader.reads();
+        let first = index.frame(0, &reader).expect("frame 0");
+        let second = index.frame(1, &reader).expect("frame 1");
         assert_eq!(
-            &bytes[frames[0].offset as usize..frames[0].offset as usize + 4],
+            reader.reads(),
+            after_parse,
+            "a full offset table needs no reads at all"
+        );
+        assert_eq!(
+            &reader.0[first.offset as usize..first.offset as usize + 4],
             &[5, 6, 7, 8],
             "frame 0 should come from the extended offset table"
         );
         assert_eq!(
-            &bytes[frames[1].offset as usize..frames[1].offset as usize + 4],
+            &reader.0[second.offset as usize..second.offset as usize + 4],
             &[1, 2, 3, 4]
         );
     }

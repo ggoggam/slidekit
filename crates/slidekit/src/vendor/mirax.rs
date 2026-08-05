@@ -27,6 +27,7 @@ use crate::decode::jpeg::JpegDecoder;
 use crate::decode::tiff::TiffLike;
 use crate::error::{OpenSlideError, Result};
 use crate::grid::simple::SimpleGrid;
+use crate::icc::IccProfile;
 use crate::io::SlideReader;
 use crate::io::fs::{self, SlideFs, SlideLocation};
 use crate::level::LevelInfo;
@@ -347,7 +348,7 @@ fn open_mirax(fs: &Arc<dyn SlideFs>, dir: &str) -> Result<SlideData> {
         levels,
         properties,
         associated_images,
-        icc_profile: None,
+        icc_profile: IccProfile::absent(),
         tiff: None,
     })
 }
@@ -796,7 +797,7 @@ fn read_one_associated(
         width: w,
         height: h,
         argb_data: argb,
-        icc_profile: None,
+        icc_profile: IccProfile::absent(),
     })
 }
 

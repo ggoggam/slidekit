@@ -51,10 +51,16 @@ Mirrors the OpenSlide C API. All methods below are implemented on `OpenSlide`.
 | Read | `read_region`, `read_region_async`, `read_region_into` |
 | Properties | `property_names`, `property_value` |
 | Associated images | `associated_image_names`, `associated_image_dimensions`, `read_associated_image` |
-| Color profiles | `icc_profile`, `associated_image_icc_profile` |
+| Color profiles | `icc_profile`, `icc_profile_size`, `associated_image_icc_profile`, `associated_image_icc_profile_size` |
 | Misc | `set_cache`, `version` |
 
 `error()` (C-API error-state string) is the one API not yet ported.
+
+The colour-profile accessors return `Result<Option<&[u8]>>` rather than a plain
+`Option`, because they may read: a DICOM profile can be 13 MB and is not fetched
+at open. `*_size` reports how large one is without fetching it — the same split
+the C API makes between `openslide_get_icc_profile_size` and
+`openslide_read_icc_profile`.
 
 ## Compression / decoders
 
@@ -141,22 +147,23 @@ comparison needs the in-process FFI crate, which is not built yet.
 
 `bench:remote` reads the same slides from an S3-compatible bucket, configured
 from a git-ignored `.env` (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`,
-`BUCKET_NAME`, `BUCKET_REGION`, `BUCKET_ENDPOINT_URL`); everything is confined
+`BUCKET_NAME`, `AWS_REGION`, `AWS_ENDPOINT_URL`); everything is confined
 to one key prefix (`SLIDEKIT_BENCH_PREFIX`, default `slidekit-bench/testdata`)
 so a shared bucket is safe. It asserts remote pixels equal local pixels
 *exactly* — same decoder over the same bytes — and counts the requests and bytes
 each phase costs. `SLIDEKIT_BENCH_ONLY=Aperio` narrows the run to one vendor and
 `SLIDEKIT_BENCH_TRACE=<KiB>` logs every request at least that large.
 
-Measured on an Aperio SVS (169 MB) over a ~50 ms-RTT endpoint: a remote open
-fetches **0.97 MB — 0.93% of the slide**, so nothing is downloaded wholesale.
-But it costs **272 sequential requests**, because the TIFF directory parse reads
-tag-by-tag and each few-byte read is its own ranged GET. Remote open latency is
-therefore round-trip-bound, not bandwidth-bound: the fix is read coalescing (see
-Phase 6 in [`PROGRESS.md`](PROGRESS.md)), not more laziness.
+Measured over a ~583 ms-per-request endpoint: opening a slide and reading a
+1024×1024 region fetches **0.18–2.4% of it** on ten of eleven vendors —
+including 0.18% of a 2.5 GB Ventana — so nothing is downloaded wholesale. The
+cost that remains is round trips rather than bytes, so the reads are batched and
+block-buffered rather than issued field-by-field: a remote open takes **10–29
+requests** where it used to take 164–2665.
 
-Full results for every vendor — both benches, with methodology, caveats, and the
-defects they surfaced — are in [`docs/benchmarks.md`](docs/benchmarks.md).
+Full results for every vendor — both benches, with methodology, caveats, the
+defects they surfaced, and what is still outstanding — are in
+[`docs/benchmarks.md`](docs/benchmarks.md).
 
 ## Status
 

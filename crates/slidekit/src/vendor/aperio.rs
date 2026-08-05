@@ -172,7 +172,7 @@ impl VendorDriver for AperioDriver {
                                     width: w,
                                     height: h,
                                     argb_data,
-                                    icc_profile,
+                                    icc_profile: icc_profile.into(),
                                 },
                             ));
                         }
@@ -204,7 +204,7 @@ impl VendorDriver for AperioDriver {
             levels,
             properties: props,
             associated_images,
-            icc_profile,
+            icc_profile: icc_profile.into(),
             tiff: Some(tl),
         })
     }
