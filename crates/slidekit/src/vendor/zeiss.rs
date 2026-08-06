@@ -30,8 +30,11 @@
 //! (only the first C/Z/T plane is used), JPEG XR tiles, and embedded-CZI
 //! associated images (only JPEG label/preview/thumbnail attachments decode).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::ops::Range;
 use std::sync::Arc;
+
+use bytes::Bytes;
 
 use crate::associated::AssociatedImage;
 use crate::color::argb;
@@ -62,17 +65,112 @@ const PT_BGR24: i32 = 3;
 const PT_BGR48: i32 = 4;
 const PT_BGRA32: i32 = 9;
 
-/// One placed subblock: where its pixel bytes live, how they're encoded, and
+/// Bytes fetched past a subblock's fixed region to cover its metadata block.
+///
+/// The pixel data sits behind a variable-length XML metadata block whose size is
+/// only stated in the subblock's own payload header, so a read that wants both
+/// in one request has to guess. Guessing high wastes a few kilobytes of a
+/// transfer that is already megabytes; guessing low costs one extra request and
+/// is still correct. Real subblock metadata is a few hundred bytes.
+const METADATA_SLACK: u64 = 16 * 1024;
+
+/// One placed subblock: where its segment lives, how its pixels are encoded, and
 /// where the decoded `stored_w × stored_h` image sits in this level's space.
+///
+/// The pixel data's offset and length are deliberately *not* stored. They are
+/// not in the directory — resolving them costs a 16-byte read of the subblock's
+/// own payload header — and nothing outside [`ZeissLevel::read_region`] needs
+/// them, so they are resolved there, for the handful of subblocks a region
+/// actually touches, rather than for all of them at open. See
+/// [`ZeissTile::probe_len`].
 struct ZeissTile {
-    data_offset: u64,
-    data_size: usize,
+    /// Absolute offset of this subblock's `ZISRAWSUBBLOCK` segment header.
+    file_position: u64,
+    /// `DimensionCount` from the directory entry, which sizes the fixed region
+    /// between the payload header and the metadata block.
+    dimension_count: i32,
     compression: i32,
     pixel_type: i32,
     stored_w: i64,
     stored_h: i64,
     dest_x: i64,
     dest_y: i64,
+}
+
+impl ZeissTile {
+    /// Absolute offset of the subblock payload: `MetadataSize`, `AttachmentSize`,
+    /// `DataSize`, then the embedded DirectoryEntry.
+    fn payload_start(&self) -> u64 {
+        self.file_position + 32
+    }
+
+    /// Bytes between the payload start and the metadata block — a fixed region
+    /// of `max(256, 16 + entry_size)`, where `entry_size = 32 + 20 × dims`.
+    fn fixed_region(&self) -> u64 {
+        let entry_size = 32 + 20 * self.dimension_count.max(0) as u64;
+        (16 + entry_size).max(256)
+    }
+
+    /// Pixel bytes an uncompressed subblock must hold, which the directory entry
+    /// alone determines. Zero when the size is not derivable — a compressed
+    /// subblock is whatever the codec produced, and only its header says how big.
+    fn expected_data_size(&self) -> u64 {
+        if self.compression != COMP_NONE {
+            return 0;
+        }
+        match bytes_per_pixel(self.pixel_type) {
+            Some(bpp) => (self.stored_w.max(0) as u64) * (self.stored_h.max(0) as u64) * bpp,
+            None => 0,
+        }
+    }
+
+    /// How much to read from [`payload_start`](Self::payload_start) so that one
+    /// request carries the payload header *and*, where the size is knowable, the
+    /// pixels behind it. Purely a hint: [`ZeissLevel::subblock_pixels`] reads the
+    /// remainder if it falls short, so a wrong guess costs a request, never
+    /// correctness.
+    fn probe_len(&self) -> u64 {
+        self.fixed_region() + METADATA_SLACK + self.expected_data_size()
+    }
+
+    /// Resolve this subblock's pixel data `(offset relative to the payload
+    /// start, size)` from `payload`, which must begin at
+    /// [`payload_start`](Self::payload_start).
+    ///
+    /// The payload opens with `MetadataSize (i32)`, `AttachmentSize (i32)`,
+    /// `DataSize (i64)`, then the embedded DirectoryEntry; the metadata block —
+    /// and the pixels behind it — start past the fixed region. Only the first 16
+    /// bytes are read, so a longer speculative read can be passed straight in.
+    fn data_location(&self, payload: &[u8]) -> Result<(u64, usize)> {
+        let metadata_size = i32le(payload, 0)?;
+        let data_size = i64le(payload, 8)?;
+        if metadata_size < 0 {
+            return Err(OpenSlideError::Decode(
+                "CZI: negative subblock metadata size".into(),
+            ));
+        }
+        if data_size < 0 {
+            return Err(OpenSlideError::Decode(
+                "CZI: negative subblock data size".into(),
+            ));
+        }
+        Ok((
+            self.fixed_region() + metadata_size as u64,
+            data_size as usize,
+        ))
+    }
+}
+
+/// Bytes per sample-tuple for a CZI pixel type, or `None` if unsupported.
+fn bytes_per_pixel(pixel_type: i32) -> Option<u64> {
+    Some(match pixel_type {
+        PT_GRAY8 => 1,
+        PT_GRAY16 => 2,
+        PT_BGR24 => 3,
+        PT_BGR48 => 6,
+        PT_BGRA32 => 4,
+        _ => return None,
+    })
 }
 
 /// Per-level CZI tile index plus the reader needed to fetch tile bytes.
@@ -87,11 +185,15 @@ impl ZeissLevel {
     /// type, so decoding happens here rather than through a shared decoder.
     pub fn read_region(&self, ox: i64, oy: i64, w: i64, h: i64) -> Result<Vec<u32>> {
         let mut out = vec![0u32; (w * h) as usize];
-        // Decode each subblock at most once per call (keyed by file offset).
-        let mut cache: HashMap<u64, Vec<u32>> = HashMap::new();
 
+        // The subblocks this window touches, each listed once: two directory
+        // entries can name the same subblock, and it should cost one fetch and
+        // one decode.
+        //
         // ponytail: linear scan over all placed tiles — same as the MIRAX path.
         // A per-level spatial bucket would cut this if reads get hot.
+        let mut wanted: Vec<&ZeissTile> = Vec::new();
+        let mut seen: HashSet<u64> = HashSet::new();
         for t in &self.tiles {
             if t.dest_x + t.stored_w <= ox
                 || t.dest_x >= ox + w
@@ -100,23 +202,55 @@ impl ZeissLevel {
             {
                 continue;
             }
+            if seen.insert(t.file_position) {
+                wanted.push(t);
+            }
+        }
+        if wanted.is_empty() {
+            return Ok(out);
+        }
 
-            let px = if let Some(cached) = cache.get(&t.data_offset) {
-                cached
-            } else {
-                let mut buf = vec![0u8; t.data_size];
-                self.reader.read_exact_at(t.data_offset, &mut buf)?;
-                let px = decode_tile(&buf, t)?;
-                cache.insert(t.data_offset, px);
-                &cache[&t.data_offset]
-            };
+        // One batched gather for every subblock in the window. Each range starts
+        // at the payload header and runs long enough to carry the pixels behind
+        // it too, so a subblock normally costs one request rather than a header
+        // read followed by a data read. The backend coalesces neighbours and
+        // issues the rest concurrently; reading them one at a time made a CZI
+        // patch the slowest in the suite.
+        let ranges: Vec<Range<u64>> = wanted
+            .iter()
+            .map(|t| {
+                let start = t.payload_start();
+                start..start + t.probe_len()
+            })
+            .collect();
+        let probes = self.reader.read_ranges(&ranges)?;
 
+        for (t, probe) in wanted.iter().zip(probes) {
+            let pixels = self.subblock_pixels(t, &probe)?;
+            let px = decode_tile(&pixels, t)?;
             crate::slide::composite_subtile(
-                px, t.stored_w, 0, 0, t.stored_w, t.stored_h, t.dest_x, t.dest_y, &mut out, ox, oy,
-                w, h,
+                &px, t.stored_w, 0, 0, t.stored_w, t.stored_h, t.dest_x, t.dest_y, &mut out, ox,
+                oy, w, h,
             );
         }
         Ok(out)
+    }
+
+    /// A subblock's pixel bytes, taken from `probe` — the speculative read that
+    /// began at its payload header — or fetched outright when the probe fell
+    /// short of the metadata block or the data behind it.
+    fn subblock_pixels(&self, t: &ZeissTile, probe: &Bytes) -> Result<Bytes> {
+        let (rel, data_size) = t.data_location(probe)?;
+        let rel = rel as usize;
+        if let Some(end) = rel.checked_add(data_size)
+            && end <= probe.len()
+        {
+            return Ok(probe.slice(rel..end));
+        }
+        let mut buf = vec![0u8; data_size];
+        self.reader
+            .read_exact_at(t.payload_start() + rel as u64, &mut buf)?;
+        Ok(Bytes::from(buf))
     }
 }
 
@@ -180,6 +314,10 @@ fn open_czi(reader: Arc<dyn SlideReader>) -> Result<SlideData> {
         if e.x_stored <= 0 || e.y_stored <= 0 {
             continue;
         }
+        // A negative file position would wrap when read as an offset.
+        if e.file_position < 0 {
+            continue;
+        }
         let downsample = div_round_closest(e.x_size, e.x_stored).max(1);
         min_x = min_x.min(e.x_start);
         min_y = min_y.min(e.y_start);
@@ -194,24 +332,22 @@ fn open_czi(reader: Arc<dyn SlideReader>) -> Result<SlideData> {
     // Second pass: group subblocks by downsample into pyramid levels, placing
     // each at `(start - origin) / downsample` in its level's pixel space.
     //
-    // Every subblock's 16-byte header is fetched in one batch first. The
-    // directory says where the subblocks are but not where the pixels inside
-    // them start, so this is unavoidably one small read per subblock — and
-    // issued serially it was the whole cost of a remote CZI open (159 requests
-    // for 16 MB of 16-byte headers, ~85 s). As one gather the backend coalesces
-    // and parallelizes them.
-    let headers = subblock_headers(&*reader, &kept)?;
-
+    // Everything below comes from the directory alone. Where a subblock's
+    // *pixels* begin does not, and resolving it costs a 16-byte read of that
+    // subblock's own payload header — but no part of opening a slide needs it,
+    // so it is left to `ZeissLevel::read_region`, which resolves only the
+    // subblocks a region touches and folds the read into the tile fetch. Doing
+    // it here instead was the whole cost of a remote CZI open: 151 requests
+    // against 10–27 for every other vendor, 134 of them 16-byte GETs scattered
+    // across a gigabyte, for data the open then never looked at.
     let mut by_downsample: HashMap<i64, Vec<ZeissTile>> = HashMap::new();
-    for ((e, downsample), header) in kept.into_iter().zip(headers) {
-        let (data_offset, data_size) =
-            subblock_data_location(&header, e.file_position, e.dimension_count)?;
+    for (e, downsample) in kept {
         by_downsample
             .entry(downsample)
             .or_default()
             .push(ZeissTile {
-                data_offset,
-                data_size,
+                file_position: e.file_position as u64,
+                dimension_count: e.dimension_count,
                 compression: e.compression,
                 pixel_type: e.pixel_type,
                 stored_w: e.x_stored,
@@ -397,45 +533,6 @@ fn parse_dir_entry(buf: &[u8], off: usize) -> Result<DirEntry> {
         z_start,
         t_start,
     })
-}
-
-/// Fetch every subblock's 16-byte payload header in one batched read.
-fn subblock_headers(
-    reader: &dyn SlideReader,
-    entries: &[(&DirEntry, i64)],
-) -> Result<Vec<bytes::Bytes>> {
-    let ranges: Vec<std::ops::Range<u64>> = entries
-        .iter()
-        .map(|(e, _)| {
-            let start = e.file_position as u64 + 32;
-            start..start + 16
-        })
-        .collect();
-    reader.read_ranges(&ranges)
-}
-
-/// Resolve a subblock's pixel-data `(offset, size)` from its 16-byte header.
-///
-/// The `ZISRAWSUBBLOCK` payload begins with `MetadataSize (i32)`,
-/// `AttachmentSize (i32)`, `DataSize (i64)`, then the embedded DirectoryEntry.
-/// The metadata+data start after a fixed region of `max(256, 16 + entry_size)`
-/// bytes, where `entry_size = 32 + 20*DimensionCount`.
-fn subblock_data_location(
-    head: &[u8],
-    file_position: i64,
-    dimension_count: i32,
-) -> Result<(u64, usize)> {
-    let metadata_size = i32le(head, 0)? as u64;
-    let data_size = i64le(head, 8)?;
-    if data_size < 0 {
-        return Err(OpenSlideError::Decode(
-            "CZI: negative subblock data size".into(),
-        ));
-    }
-    let entry_size = 32 + 20 * dimension_count as u64;
-    let fixed = (16 + entry_size).max(256);
-    let data_offset = file_position as u64 + 32 + fixed + metadata_size;
-    Ok((data_offset, data_size as usize))
 }
 
 // ───────────────────────────── tile decode ──────────────────────────────────
