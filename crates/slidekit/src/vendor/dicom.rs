@@ -33,6 +33,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use parking_lot::Mutex;
 
 use crate::associated::AssociatedImage;
+use crate::cache::{LevelCache, TileId};
 use crate::decode::dicom::{
     self, DataSet, DicomObject, FrameIndex, VL_WHOLE_SLIDE_MICROSCOPY_IMAGE_STORAGE, Value, tags,
 };
@@ -177,6 +178,11 @@ impl DicomInstance {
     }
 }
 
+/// One frame a region read is going to composite, in grid order: its tile
+/// `(col, row)`, and its decoded pixels when the tile cache already held them.
+/// `None` means "take the next frame out of the batched fetch".
+type FramePlan = ((i64, i64), Option<Arc<Vec<u32>>>);
+
 /// A pyramid level: one or more concatenated instances sharing a tile grid.
 pub struct DicomLevel {
     files: Vec<Arc<DicomInstance>>,
@@ -194,7 +200,16 @@ impl DicomLevel {
     /// batch per instance, so neighbouring frames — which is what the tiles of a
     /// region usually are — coalesce into single requests instead of one round
     /// trip each.
-    pub fn read_region(&self, ox: i64, oy: i64, w: i64, h: i64) -> Result<Vec<u32>> {
+    ///
+    /// `cache` is the slide's decoded-tile cache, scoped to this level.
+    pub fn read_region(
+        &self,
+        ox: i64,
+        oy: i64,
+        w: i64,
+        h: i64,
+        cache: LevelCache<'_>,
+    ) -> Result<Vec<u32>> {
         let mut out = vec![0u32; (w * h) as usize];
         let across = ceil_div(self.width, self.tile_w);
         let down = ceil_div(self.height, self.tile_h);
@@ -204,26 +219,65 @@ impl DicomLevel {
         let row_start = oy.div_euclid(self.tile_h).max(0);
         let row_end = ceil_div(oy + h, self.tile_h).min(down);
 
-        for file in &self.files {
-            // Phase 1: which of this member's frames the region needs, and where.
-            let mut tiles: Vec<(i64, i64)> = Vec::new();
+        for (member, file) in self.files.iter().enumerate() {
+            // Phase 0: what the cache already holds, and Phase 1: which of this
+            // member's remaining frames the region needs, and where.
+            //
+            // The cache probe has to come first here for a second reason
+            // besides the round trip: `locate_tile` can itself read, walking
+            // pixel-data fragments on an instance with no offset table, and
+            // that walk is what made DICOM/Leica-4's cold patch cost 3.9 s.
+            //
+            // The key is `(member, frame number)`. A frame number alone is not
+            // enough — a level can be a *concatenation* of instances, and frame
+            // 0 of each member is a different tile — while `frame_for` needs no
+            // I/O, which is what lets this run ahead of `locate_tile`.
+            let mut plan: Vec<FramePlan> = Vec::new();
+            let mut miss_ids: Vec<TileId> = Vec::new();
             let mut ranges: Vec<Range<u64>> = Vec::new();
             for row in row_start..row_end {
                 for col in col_start..col_end {
+                    let Some(frame) = file.tiles.frame_for(col, row) else {
+                        continue;
+                    };
+                    let id = TileId::Index {
+                        stream: member as u64,
+                        index: frame as u64,
+                    };
+                    if let Some(px) = cache.get(id) {
+                        plan.push(((col, row), Some(px)));
+                        continue;
+                    }
                     if let Some(range) = file.locate_tile(col, row)? {
-                        tiles.push((col, row));
+                        plan.push(((col, row), None));
+                        miss_ids.push(id);
                         ranges.push(range);
                     }
                 }
             }
-            if ranges.is_empty() {
+            if plan.is_empty() {
                 continue;
             }
 
             // Phase 2: one batched fetch. Phase 3: decode and composite.
-            let frames = file.reader.read_ranges(&ranges)?;
-            for ((col, row), data) in tiles.into_iter().zip(frames) {
-                let pixels = file.decode_frame(&data, file.tile_w, file.tile_h)?;
+            let frames = if ranges.is_empty() {
+                Vec::new()
+            } else {
+                file.reader.read_ranges(&ranges)?
+            };
+            let mut fetched = frames.into_iter().zip(miss_ids);
+            for ((col, row), cached) in plan {
+                let pixels = match cached {
+                    Some(px) => px,
+                    None => {
+                        let Some((data, id)) = fetched.next() else {
+                            continue;
+                        };
+                        let px = Arc::new(file.decode_frame(&data, file.tile_w, file.tile_h)?);
+                        cache.insert(id, px.clone());
+                        px
+                    }
+                };
                 let tile_x = col * self.tile_w;
                 let tile_y = row * self.tile_h;
                 // A tile at the right/bottom edge extends past the level; clip

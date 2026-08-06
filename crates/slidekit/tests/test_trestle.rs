@@ -452,3 +452,24 @@ fn cmu1() {
         "read_region should return non-transparent pixels"
     );
 }
+
+/// The decoded-tile cache must not change a pixel on an **overlapping** tile
+/// grid, which is the case here most at risk. Trestle's grid advances by less
+/// than a tile, so tiles overlap in the output and the last one composited
+/// wins: a cache that painted its hits ahead of the tiles it fetched would move
+/// the seams. It also indexes tiles by the real TIFF column count rather than
+/// the grid's, so a key taken from the grid position would drift by a tile per
+/// row deep into the slide.
+#[test]
+fn cached_reads_are_pixel_identical() {
+    let path = require_trestle_slide!();
+    common::assert_cache_is_transparent(
+        || OpenSlide::open(&path).expect("should open Trestle CMU-1.tif"),
+        0,
+        &[
+            (10_000, 10_000, 300, 300),
+            (10_150, 10_150, 300, 300),
+            (10_000, 10_150, 300, 300),
+        ],
+    );
+}

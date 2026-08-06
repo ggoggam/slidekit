@@ -883,6 +883,76 @@ mod tiff_tag {
 const TIFF_TYPE_SHORT: u16 = 3;
 const TIFF_TYPE_LONG: u16 = 4;
 
+// ─────────────────────── decoded-tile cache assertions ─────────────────────
+
+/// Assert that the decoded-tile cache is invisible in the output of
+/// `read_region`, for one level of one slide.
+///
+/// This is the regression that matters for [`slidekit::Cache`]: a caching bug
+/// returns *plausible* pixels, so nothing downstream notices until a diagnosis
+/// is made on the wrong tissue. Three properties are checked at once, over
+/// `regions` that should overlap each other so successive reads share tiles:
+///
+/// 1. Every region read through a warm cache equals the same region read
+///    through a **disabled** cache (`Cache::new(0)`), which fetches and decodes
+///    everything afresh. That is the reference for what the pixels were before
+///    any caching existed.
+/// 2. Reading the whole sequence a second time — now with every tile cached —
+///    returns exactly the same bytes again.
+/// 3. The cache actually served something, so a wiring that silently did
+///    nothing cannot pass by accident.
+///
+/// `open` is called twice (once for the reference slide, once for the warm
+/// one), because a slide's cache cannot be un-warmed.
+pub fn assert_cache_is_transparent(
+    open: impl Fn() -> slidekit::OpenSlide,
+    level: i32,
+    regions: &[(i64, i64, i64, i64)],
+) {
+    let mut cold = open();
+    cold.set_cache(slidekit::Cache::new(0));
+    let reference: Vec<Vec<u32>> = regions
+        .iter()
+        .map(|&(x, y, w, h)| {
+            cold.read_region(x, y, level, w, h)
+                .expect("reference read_region")
+        })
+        .collect();
+    assert_eq!(cold.cache().hits(), 0, "a disabled cache served a tile");
+
+    let warm = open();
+    for pass in 0..2 {
+        for (i, &(x, y, w, h)) in regions.iter().enumerate() {
+            let got = warm
+                .read_region(x, y, level, w, h)
+                .expect("cached read_region");
+            assert_pixels_eq(
+                &got,
+                &reference[i],
+                &format!("level {level} region {i} ({x},{y},{w},{h}), pass {pass}"),
+            );
+        }
+    }
+
+    assert!(
+        warm.cache().hits() > 0,
+        "no tile was served from the cache — the read path is not wired to it"
+    );
+}
+
+/// Compare two ARGB buffers, reporting the first difference rather than dumping
+/// a megapixel of `Vec<u32>` into the failure message.
+pub fn assert_pixels_eq(got: &[u32], want: &[u32], what: &str) {
+    assert_eq!(got.len(), want.len(), "{what}: pixel count differs");
+    if let Some((i, (&g, &w))) = got.iter().zip(want).enumerate().find(|(_, (g, w))| g != w) {
+        let differing = got.iter().zip(want).filter(|(g, w)| g != w).count();
+        panic!(
+            "{what}: {differing} of {} pixels differ; first at index {i}: {g:#010x} != {w:#010x}",
+            got.len()
+        );
+    }
+}
+
 fn write_ifd_entry(buf: &mut Vec<u8>, tag: u16, typ: u16, count: u32, value: u32) {
     buf.extend_from_slice(&tag.to_le_bytes());
     buf.extend_from_slice(&typ.to_le_bytes());

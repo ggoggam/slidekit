@@ -290,6 +290,44 @@ fn hamamatsu_2_tiled_full() {
     assert!(px.iter().any(|&p| (p >> 24) == 0xFF));
 }
 
+/// The decoded-tile cache must not change a pixel of a DICOM read, on either
+/// frame layout.
+///
+/// DICOM is where the cache probe has to run earliest: locating a frame can
+/// itself read — a pixel-data fragment walk, on an instance with no offset
+/// table — so a probe placed after location would still pay for the walk it is
+/// meant to skip. The key is `(concatenation member, frame number)`, because a
+/// level can be split across instances and frame 0 of each is a different tile.
+#[test]
+fn cached_reads_are_pixel_identical() {
+    for (case, label) in [
+        ("DICOM/Leica-4.zip", "Leica-4 (TILED_SPARSE)"),
+        ("DICOM/Hamamatsu-2.zip", "Hamamatsu-2 (TILED_FULL)"),
+    ] {
+        let Some(path) = dicom_slide_path(case) else {
+            eprintln!("SKIP: DICOM test slide {case} not available");
+            continue;
+        };
+        let open = || OpenSlide::open(&path).unwrap_or_else(|e| panic!("open {label}: {e}"));
+        let (w0, h0) = open().level0_dimensions();
+
+        common::assert_cache_is_transparent(
+            open,
+            0,
+            &[
+                (w0 / 2, h0 / 2, 300, 300),
+                (w0 / 2 + 150, h0 / 2 + 150, 300, 300),
+                (w0 / 2, h0 / 2 + 150, 300, 300),
+            ],
+        );
+        common::assert_cache_is_transparent(
+            open,
+            1,
+            &[(w0 / 2, h0 / 2, 200, 200), (w0 / 2 + 100, h0 / 2, 200, 200)],
+        );
+    }
+}
+
 /// A DICOM slide opens through an `ObjectStore`, not just a local directory.
 ///
 /// The store is `object_store`'s own `LocalFileSystem` rooted at the extracted

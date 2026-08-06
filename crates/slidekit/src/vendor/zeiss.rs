@@ -37,6 +37,7 @@ use std::sync::Arc;
 use bytes::Bytes;
 
 use crate::associated::AssociatedImage;
+use crate::cache::{LevelCache, TileId};
 use crate::color::argb;
 use crate::decode::jpeg::JpegDecoder;
 use crate::decode::tiff::TiffLike;
@@ -183,7 +184,16 @@ impl ZeissLevel {
     /// Read a region of this level. `(ox, oy)` is the top-left in this level's
     /// pixel space. CZI subblocks each carry their own compression and pixel
     /// type, so decoding happens here rather than through a shared decoder.
-    pub fn read_region(&self, ox: i64, oy: i64, w: i64, h: i64) -> Result<Vec<u32>> {
+    ///
+    /// `tiles` is the slide's decoded-tile cache, scoped to this level.
+    pub fn read_region(
+        &self,
+        ox: i64,
+        oy: i64,
+        w: i64,
+        h: i64,
+        tiles: LevelCache<'_>,
+    ) -> Result<Vec<u32>> {
         let mut out = vec![0u32; (w * h) as usize];
 
         // The subblocks this window touches, each listed once: two directory
@@ -210,24 +220,69 @@ impl ZeissLevel {
             return Ok(out);
         }
 
-        // One batched gather for every subblock in the window. Each range starts
-        // at the payload header and runs long enough to carry the pixels behind
-        // it too, so a subblock normally costs one request rather than a header
-        // read followed by a data read. The backend coalesces neighbours and
-        // issues the rest concurrently; reading them one at a time made a CZI
-        // patch the slowest in the suite.
-        let ranges: Vec<Range<u64>> = wanted
+        // Phase 0: the decoded-tile cache, keyed by `file_position` — the
+        // subblock's own address, and the only thing that names it. Mosaic
+        // subblocks *overlap* in slide space, so a grid cell does not identify
+        // one; two directory entries naming the same `file_position` are the
+        // same tile, which is exactly what `seen` above already relies on.
+        //
+        // `plan` keeps the subblocks in directory order because that order is
+        // the compositing rule in the overlap strips: the last subblock written
+        // wins (see docs/remote-patch-benchmark.md, finding A). A `None` entry
+        // means "take the next probe out of the gather", so cached and freshly
+        // read subblocks paint interleaved, in the order an uncached read used.
+        let mut plan: Vec<(&ZeissTile, Option<Arc<Vec<u32>>>)> = Vec::with_capacity(wanted.len());
+        let mut misses: Vec<&ZeissTile> = Vec::new();
+        for t in wanted {
+            match tiles.get(TileId::Offset {
+                stream: 0,
+                position: t.file_position,
+            }) {
+                Some(px) => plan.push((t, Some(px))),
+                None => {
+                    plan.push((t, None));
+                    misses.push(t);
+                }
+            }
+        }
+
+        // One batched gather for every subblock the cache could not serve. Each
+        // range starts at the payload header and runs long enough to carry the
+        // pixels behind it too, so a subblock normally costs one request rather
+        // than a header read followed by a data read. The backend coalesces
+        // neighbours and issues the rest concurrently; reading them one at a
+        // time made a CZI patch the slowest in the suite.
+        let ranges: Vec<Range<u64>> = misses
             .iter()
             .map(|t| {
                 let start = t.payload_start();
                 start..start + t.probe_len()
             })
             .collect();
-        let probes = self.reader.read_ranges(&ranges)?;
+        let probes = if ranges.is_empty() {
+            Vec::new()
+        } else {
+            self.reader.read_ranges(&ranges)?
+        };
 
-        for (t, probe) in wanted.iter().zip(probes) {
-            let pixels = self.subblock_pixels(t, &probe)?;
-            let px = decode_tile(&pixels, t)?;
+        let mut probes = probes.into_iter();
+        for (t, cached) in plan {
+            let px = match cached {
+                Some(px) => px,
+                None => {
+                    let Some(probe) = probes.next() else { continue };
+                    let pixels = self.subblock_pixels(t, &probe)?;
+                    let px = Arc::new(decode_tile(&pixels, t)?);
+                    tiles.insert(
+                        TileId::Offset {
+                            stream: 0,
+                            position: t.file_position,
+                        },
+                        px.clone(),
+                    );
+                    px
+                }
+            };
             crate::slide::composite_subtile(
                 &px, t.stored_w, 0, 0, t.stored_w, t.stored_h, t.dest_x, t.dest_y, &mut out, ox,
                 oy, w, h,
@@ -891,5 +946,181 @@ mod tests {
     #[test]
     fn unsupported_pixel_type_errors() {
         assert!(samples_to_argb(&[0, 0, 0, 0], 99, 1, 1).is_err());
+    }
+
+    // ───────────────────── the decoded-tile cache ──────────────────────────
+    //
+    // There is no public CZI fixture in the test-data set that CI can rely on
+    // (`Zeiss-5-Uncompressed.czi` is not in the cached set), so the cache
+    // wiring on this path is covered here, against a hand-laid-out container.
+    // That is the right level anyway: what has to be proved is that the
+    // `file_position` key and the directory compositing order survive a cache
+    // hit, and both are decided in `read_region`.
+
+    use crate::cache::{Cache, SlideId};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// In-memory CZI-shaped byte source that counts what reaches it. Reads are
+    /// clamped at end-of-file, as a real backend's are: a subblock probe
+    /// deliberately over-reads past the pixels it wants.
+    struct FakeCzi {
+        data: Vec<u8>,
+        batches: AtomicUsize,
+        reads: AtomicUsize,
+    }
+
+    impl FakeCzi {
+        fn slice(&self, start: u64, end: u64) -> &[u8] {
+            let start = (start as usize).min(self.data.len());
+            let end = (end as usize).clamp(start, self.data.len());
+            &self.data[start..end]
+        }
+    }
+
+    impl SlideReader for FakeCzi {
+        fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize> {
+            self.reads.fetch_add(1, Ordering::Relaxed);
+            let src = self.slice(offset, offset + buf.len() as u64);
+            buf[..src.len()].copy_from_slice(src);
+            Ok(src.len())
+        }
+
+        fn read_ranges(&self, ranges: &[Range<u64>]) -> Result<Vec<Bytes>> {
+            self.batches.fetch_add(1, Ordering::Relaxed);
+            Ok(ranges
+                .iter()
+                .map(|r| Bytes::copy_from_slice(self.slice(r.start, r.end)))
+                .collect())
+        }
+
+        fn size(&self) -> Result<u64> {
+            Ok(self.data.len() as u64)
+        }
+    }
+
+    /// Lay out solid-colour uncompressed subblocks as a CZI-shaped buffer and
+    /// wrap them in a level. Each entry is `(dest_x, dest_y, w, h, rgb)`.
+    #[allow(clippy::type_complexity)]
+    fn fake_level(specs: &[(i64, i64, i64, i64, (u8, u8, u8))]) -> (ZeissLevel, Arc<FakeCzi>) {
+        let mut data: Vec<u8> = Vec::new();
+        let mut tiles = Vec::new();
+        for &(dest_x, dest_y, w, h, (r, g, b)) in specs {
+            // Segment header (32 bytes), then the payload: MetadataSize,
+            // AttachmentSize, DataSize, the fixed region, then the pixels.
+            let file_position = data.len() as u64;
+            data.extend_from_slice(&[0u8; 32]);
+            let n = (w * h) as usize;
+            data.extend_from_slice(&0i32.to_le_bytes()); // MetadataSize
+            data.extend_from_slice(&0i32.to_le_bytes()); // AttachmentSize
+            data.extend_from_slice(&((n * 3) as i64).to_le_bytes()); // DataSize
+            // `fixed_region()` for dimension_count 0 is the 256-byte floor.
+            data.resize(file_position as usize + 32 + 256, 0);
+            for _ in 0..n {
+                data.extend_from_slice(&[b, g, r]); // CZI stores B,G,R
+            }
+            tiles.push(ZeissTile {
+                file_position,
+                dimension_count: 0,
+                compression: COMP_NONE,
+                pixel_type: PT_BGR24,
+                stored_w: w,
+                stored_h: h,
+                dest_x,
+                dest_y,
+            });
+        }
+        let reader = Arc::new(FakeCzi {
+            data,
+            batches: AtomicUsize::new(0),
+            reads: AtomicUsize::new(0),
+        });
+        let level = ZeissLevel {
+            reader: reader.clone(),
+            tiles,
+        };
+        (level, reader)
+    }
+
+    /// Two subblocks overlapping in x 8..16, the second listed painting over the
+    /// first. Cached or not, the pixels — and that priority — must be the same.
+    #[test]
+    fn a_cache_hit_changes_neither_the_pixels_nor_the_overlap_priority() {
+        let (level, reader) =
+            fake_level(&[(0, 0, 16, 16, (30, 20, 10)), (8, 0, 16, 16, (50, 100, 200))]);
+        let region = |cache: crate::cache::LevelCache<'_>| {
+            level.read_region(0, 0, 24, 16, cache).expect("read_region")
+        };
+
+        // Reference: caching disabled, so every subblock is fetched and decoded.
+        let off = Cache::new(0);
+        let want = region(off.level(SlideId::next(), 0));
+        assert_eq!(want[0], argb(0xFF, 30, 20, 10), "left subblock");
+        assert_eq!(want[8], argb(0xFF, 50, 100, 200), "overlap: later wins");
+        assert_eq!(want[23], argb(0xFF, 50, 100, 200), "right subblock");
+
+        let cache = Cache::default();
+        let slide = SlideId::next();
+        assert_eq!(region(cache.level(slide, 0)), want, "cold read");
+        let batches = reader.batches.load(Ordering::Relaxed);
+        assert!(batches > 0, "the cold read should have gathered bytes");
+
+        assert_eq!(region(cache.level(slide, 0)), want, "fully cached read");
+        assert_eq!(
+            reader.batches.load(Ordering::Relaxed),
+            batches,
+            "a fully cached region must issue no gather at all"
+        );
+        assert_eq!(
+            reader.reads.load(Ordering::Relaxed),
+            0,
+            "no subblock should have needed a follow-up read"
+        );
+    }
+
+    /// The half-and-half case, which is what panning actually produces: one
+    /// subblock cached, the other not. The cached tile must still paint in its
+    /// directory position, not first.
+    #[test]
+    fn a_partly_cached_region_keeps_the_directory_order() {
+        let (level, _) =
+            fake_level(&[(0, 0, 16, 16, (30, 20, 10)), (8, 0, 16, 16, (50, 100, 200))]);
+
+        let off = Cache::new(0);
+        let want = level
+            .read_region(0, 0, 24, 16, off.level(SlideId::next(), 0))
+            .expect("reference");
+
+        let cache = Cache::default();
+        let slide = SlideId::next();
+        // Warm only the first subblock: x 0..8 cannot reach the second, whose
+        // destination starts at 8.
+        level
+            .read_region(0, 0, 8, 16, cache.level(slide, 0))
+            .expect("warm the first subblock");
+        assert_eq!(cache.len(), 1, "exactly one subblock should be cached");
+
+        let got = level
+            .read_region(0, 0, 24, 16, cache.level(slide, 0))
+            .expect("mixed read");
+        assert_eq!(got, want);
+    }
+
+    /// The key is the subblock's `file_position`, so a different slide sharing
+    /// the same cache cannot be served this one's subblocks — the two fake
+    /// containers below have subblocks at identical offsets.
+    #[test]
+    fn subblocks_are_not_shared_between_slides() {
+        let (a, _) = fake_level(&[(0, 0, 8, 8, (10, 10, 10))]);
+        let (b, _) = fake_level(&[(0, 0, 8, 8, (200, 200, 200))]);
+        assert_eq!(a.tiles[0].file_position, b.tiles[0].file_position);
+
+        let cache = Cache::default();
+        let (sa, sb) = (SlideId::next(), SlideId::next());
+        let from_a = a.read_region(0, 0, 8, 8, cache.level(sa, 0)).expect("a");
+        let from_b = b.read_region(0, 0, 8, 8, cache.level(sb, 0)).expect("b");
+
+        assert_eq!(from_a[0], argb(0xFF, 10, 10, 10));
+        assert_eq!(from_b[0], argb(0xFF, 200, 200, 200));
+        assert_eq!(cache.len(), 2);
     }
 }

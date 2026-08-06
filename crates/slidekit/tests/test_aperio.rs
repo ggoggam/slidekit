@@ -305,3 +305,39 @@ fn jp2k_33005_rgb() {
     let path = require_slide!("Aperio/CMU-1-JP2K-33005.svs");
     check_jp2k_slide(&path, "CMU-1-JP2K-33005.svs");
 }
+
+/// The decoded-tile cache must not change a single pixel of a tiled-TIFF read,
+/// on the first read or the tenth. The regions overlap, so later reads are
+/// served partly from tiles the earlier ones decoded.
+#[test]
+fn cached_reads_are_pixel_identical() {
+    let path = require_slide!("Aperio/CMU-1-Small-Region.svs");
+    common::assert_cache_is_transparent(
+        || OpenSlide::open(&path).expect("should open CMU-1-Small-Region.svs"),
+        0,
+        &[(0, 0, 300, 300), (150, 150, 300, 300), (0, 150, 300, 300)],
+    );
+}
+
+/// Same, on a JPEG-2000 slide, at two levels.
+///
+/// This is where the cache pays for itself — a JP2K tile costs tens of
+/// milliseconds to decode — and where a wrongly-served tile would be easiest to
+/// mistake for the codec noise the two decoders legitimately produce. The
+/// second level is checked because the key has to separate the levels: tile
+/// (1, 1) of level 0 is not tile (1, 1) of level 1.
+#[test]
+fn cached_reads_are_pixel_identical_on_jp2k() {
+    let path = require_slide!("Aperio/JP2K-33003-1.svs");
+    let open = || OpenSlide::open(&path).expect("should open JP2K-33003-1.svs");
+    common::assert_cache_is_transparent(
+        open,
+        0,
+        &[
+            (4000, 4000, 300, 300),
+            (4150, 4150, 300, 300),
+            (4000, 4150, 300, 300),
+        ],
+    );
+    common::assert_cache_is_transparent(open, 1, &[(4000, 4000, 200, 200), (4100, 4100, 200, 200)]);
+}

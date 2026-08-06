@@ -18,10 +18,12 @@
 //! crosses camera-photo boundaries, images are split back into subtiles placed
 //! by an explicit per-camera-position map (`VIMSLIDE_POSITION_BUFFER`).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::ops::Range;
 use std::sync::Arc;
 
 use crate::associated::AssociatedImage;
+use crate::cache::{LevelCache, TileId};
 use crate::decode::TileDecoder;
 use crate::decode::jpeg::JpegDecoder;
 use crate::decode::png::PngDecoder;
@@ -75,6 +77,20 @@ pub struct MiraxLevel {
 impl MiraxLevel {
     /// Read a region of this level. `(ox, oy)` is the top-left in this level's
     /// pixel space; the decoder is the level's format decoder (JPEG).
+    ///
+    /// Every blob the region needs is located first and then fetched in one
+    /// batch per data file, so neighbouring blobs coalesce into a handful of
+    /// requests instead of a round trip each. MIRAX subtiles are small and
+    /// scattered over several `Data####.dat` files, which made a patch read
+    /// here the most request-hungry in the suite when it fetched them one at a
+    /// time. Same three phases as [`DicomLevel::read_region`], the other
+    /// multi-file format.
+    ///
+    /// `tiles` is the slide's decoded-tile cache, scoped to this level; blobs
+    /// it already holds are neither fetched nor decoded again, and so never
+    /// reach the gather.
+    ///
+    /// [`DicomLevel::read_region`]: crate::vendor::dicom::DicomLevel::read_region
     pub fn read_region(
         &self,
         decoder: &dyn TileDecoder,
@@ -82,15 +98,32 @@ impl MiraxLevel {
         oy: i64,
         w: i64,
         h: i64,
+        tiles: LevelCache<'_>,
     ) -> Result<Vec<u32>> {
         let mut out = vec![0u32; (w * h) as usize];
         // Decode each source blob at most once per call — at higher zoom levels
-        // several subtiles are cropped from the same decoded image.
-        let mut cache: HashMap<(usize, u64), Vec<u32>> = HashMap::new();
+        // several subtiles are cropped from the same decoded image. This stays
+        // even with the shared cache behind it: it keeps that guarantee when the
+        // shared cache is disabled or too small to hold the region.
+        let mut decoded: HashMap<(usize, u64), Arc<Vec<u32>>> = HashMap::new();
 
+        // Phase 1: which subtiles the region touches, and which distinct blobs
+        // back them. A blob shared by several subtiles — at higher zoom levels
+        // several are crops of one decoded image — is fetched and decoded once.
+        // Keyed by fileno because a reader spans one data file, so that is the
+        // coarsest a batch can be; `BTreeMap` only to keep the request order
+        // fixed from run to run.
+        //
+        // Phase 0 rides along: a blob the shared cache already holds is put
+        // straight into `decoded` and left out of `wanted`, so a revisited
+        // region issues no request at all.
+        //
         // ponytail: linear scan over all placed tiles. Region reads touch few
         // tiles but we test every one; a per-level spatial bucket keyed on
         // tile_advance would cut this if reads get hot.
+        let mut placed: Vec<&MiraxTile> = Vec::new();
+        let mut seen: HashSet<(usize, u64)> = HashSet::new();
+        let mut wanted: BTreeMap<usize, Vec<Range<u64>>> = BTreeMap::new();
         for t in &self.tiles {
             // Skip tiles whose destination rect doesn't meet the region.
             if t.dest_x + t.src_w <= ox
@@ -100,23 +133,55 @@ impl MiraxLevel {
             {
                 continue;
             }
+            if seen.insert((t.fileno, t.offset)) {
+                if t.fileno >= self.readers.len() {
+                    return Err(OpenSlideError::Decode(
+                        "MIRAX tile fileno out of range".into(),
+                    ));
+                }
+                // A MIRAX tile is a standalone blob, so `(fileno, offset)` —
+                // not the grid position — is what names its pixels: several
+                // placed subtiles crop the same blob, and the same offset in a
+                // different `Data####.dat` is a different tile entirely.
+                match tiles.get(TileId::Offset {
+                    stream: t.fileno as u64,
+                    position: t.offset,
+                }) {
+                    Some(px) => {
+                        decoded.insert((t.fileno, t.offset), px);
+                    }
+                    None => wanted
+                        .entry(t.fileno)
+                        .or_default()
+                        .push(t.offset..t.offset + t.length as u64),
+                }
+            }
+            placed.push(t);
+        }
 
-            let key = (t.fileno, t.offset);
-            let px = if let Some(cached) = cache.get(&key) {
-                cached
-            } else {
-                let reader = self.readers.get(t.fileno).ok_or_else(|| {
-                    OpenSlideError::Decode("MIRAX tile fileno out of range".into())
-                })?;
-                let mut buf = vec![0u8; t.length];
-                reader.read_exact_at(t.offset, &mut buf)?;
-                let px = decoder.decode(&buf, self.image_w as u32, self.image_h as u32)?;
-                cache.insert(key, px);
-                &cache[&key]
-            };
+        // Phase 2: one batched fetch per data file, for the blobs the cache
+        // could not serve, decoding each as it arrives.
+        for (fileno, ranges) in wanted {
+            let blobs = self.readers[fileno].read_ranges(&ranges)?;
+            for (range, blob) in ranges.iter().zip(blobs) {
+                let px =
+                    Arc::new(decoder.decode(&blob, self.image_w as u32, self.image_h as u32)?);
+                tiles.insert(
+                    TileId::Offset {
+                        stream: fileno as u64,
+                        position: range.start,
+                    },
+                    px.clone(),
+                );
+                decoded.insert((fileno, range.start), px);
+            }
+        }
 
+        // Phase 3: composite in placement order — subtiles overlap, and the one
+        // written last wins, so this must stay the order phase 1 walked.
+        for t in placed {
             crate::slide::composite_subtile(
-                px,
+                &decoded[&(t.fileno, t.offset)],
                 self.image_w,
                 t.src_x,
                 t.src_y,
@@ -972,6 +1037,185 @@ fn i32le(buf: &[u8], off: usize) -> Result<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cache::{Cache, SlideId};
+    use bytes::Bytes;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A disabled cache, so the request-count assertions below measure the
+    /// gather itself rather than a cache hit standing in for it. The cached
+    /// path has its own coverage in `tests/test_cache.rs`.
+    fn no_cache() -> Cache {
+        Cache::new(0)
+    }
+
+    /// What a region read cost, shared by the fake reader and decoder below.
+    #[derive(Default)]
+    struct Counts {
+        /// Single positioned reads — one per tile is the shape this path used
+        /// to have, and the one the batched gather replaces.
+        reads: AtomicUsize,
+        /// Batched gathers: the call a remote backend can coalesce.
+        batches: AtomicUsize,
+        decodes: AtomicUsize,
+    }
+
+    /// One in-memory `Data####.dat`, counting what reaches it.
+    struct Counting {
+        data: Vec<u8>,
+        counts: Arc<Counts>,
+    }
+
+    impl SlideReader for Counting {
+        fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize> {
+            self.counts.reads.fetch_add(1, Ordering::Relaxed);
+            let start = (offset as usize).min(self.data.len());
+            let n = buf.len().min(self.data.len() - start);
+            buf[..n].copy_from_slice(&self.data[start..start + n]);
+            Ok(n)
+        }
+
+        fn size(&self) -> Result<u64> {
+            Ok(self.data.len() as u64)
+        }
+
+        fn read_ranges(&self, ranges: &[Range<u64>]) -> Result<Vec<Bytes>> {
+            self.counts.batches.fetch_add(1, Ordering::Relaxed);
+            Ok(ranges
+                .iter()
+                .map(|r| Bytes::copy_from_slice(&self.data[r.start as usize..r.end as usize]))
+                .collect())
+        }
+    }
+
+    /// Decodes a blob to a solid image of its first byte, so a composited pixel
+    /// names the blob it came from, and counts decodes so the test can see a
+    /// blob shared by two subtiles being decoded once.
+    struct FirstByteDecoder(Arc<Counts>);
+
+    impl TileDecoder for FirstByteDecoder {
+        fn decode(&self, data: &[u8], width: u32, height: u32) -> Result<Vec<u32>> {
+            self.0.decodes.fetch_add(1, Ordering::Relaxed);
+            Ok(vec![data[0] as u32; (width * height) as usize])
+        }
+    }
+
+    #[test]
+    fn region_read_costs_one_gather_per_data_file() {
+        let counts = Arc::new(Counts::default());
+        let file = |data: Vec<u8>| -> Arc<dyn SlideReader> {
+            Arc::new(Counting {
+                data,
+                counts: counts.clone(),
+            })
+        };
+        // File 0 holds two blobs (at 0 and 8), file 1 holds one.
+        let readers = vec![
+            file(vec![10, 0, 0, 0, 0, 0, 0, 0, 20, 0, 0, 0]),
+            file(vec![30, 0, 0, 0]),
+        ];
+
+        let tile = |fileno, offset, dest_x, dest_y| MiraxTile {
+            fileno,
+            offset,
+            length: 4,
+            src_x: 0,
+            src_y: 0,
+            src_w: 2,
+            src_h: 2,
+            dest_x,
+            dest_y,
+        };
+        let level = MiraxLevel {
+            readers: Arc::new(readers),
+            // The first two subtiles are crops of one blob, as they are at the
+            // zoom levels where several tiles share a decoded image.
+            tiles: vec![
+                tile(0, 0, 0, 0),
+                tile(0, 0, 2, 0),
+                tile(0, 8, 0, 2),
+                tile(1, 0, 2, 2),
+            ],
+            image_w: 2,
+            image_h: 2,
+        };
+
+        let cache = no_cache();
+        let out = level
+            .read_region(
+                &FirstByteDecoder(counts.clone()),
+                0,
+                0,
+                4,
+                4,
+                cache.level(SlideId::next(), 0),
+            )
+            .expect("read");
+
+        #[rustfmt::skip]
+        assert_eq!(
+            out,
+            vec![
+                10, 10, 10, 10,
+                10, 10, 10, 10,
+                20, 20, 30, 30,
+                20, 20, 30, 30,
+            ]
+        );
+        assert_eq!(
+            counts.batches.load(Ordering::Relaxed),
+            2,
+            "four subtiles over two data files should cost one gather each"
+        );
+        assert_eq!(
+            counts.reads.load(Ordering::Relaxed),
+            0,
+            "no tile may be fetched with its own positioned read"
+        );
+        assert_eq!(
+            counts.decodes.load(Ordering::Relaxed),
+            3,
+            "the blob two subtiles share is decoded once"
+        );
+    }
+
+    #[test]
+    fn region_touching_no_tile_reads_nothing() {
+        let counts = Arc::new(Counts::default());
+        let level = MiraxLevel {
+            readers: Arc::new(vec![Arc::new(Counting {
+                data: vec![10, 0, 0, 0],
+                counts: counts.clone(),
+            }) as Arc<dyn SlideReader>]),
+            tiles: vec![MiraxTile {
+                fileno: 0,
+                offset: 0,
+                length: 4,
+                src_x: 0,
+                src_y: 0,
+                src_w: 2,
+                src_h: 2,
+                dest_x: 0,
+                dest_y: 0,
+            }],
+            image_w: 2,
+            image_h: 2,
+        };
+
+        let cache = no_cache();
+        let out = level
+            .read_region(
+                &FirstByteDecoder(counts.clone()),
+                100,
+                100,
+                4,
+                4,
+                cache.level(SlideId::next(), 0),
+            )
+            .expect("read");
+        assert!(out.iter().all(|&p| p == 0));
+        assert_eq!(counts.batches.load(Ordering::Relaxed), 0);
+        assert_eq!(counts.reads.load(Ordering::Relaxed), 0);
+    }
 
     #[test]
     fn ini_parses_sections_and_keys() {

@@ -28,6 +28,8 @@
 //!    lock). ponytail: finer granularity only if NDPI becomes a hot concurrent
 //!    path.
 
+use std::ops::Range;
+
 use parking_lot::Mutex;
 
 use crate::associated::AssociatedImage;
@@ -222,41 +224,72 @@ pub struct NdpiLevel {
 }
 
 impl NdpiLevel {
-    /// Decode tile `(col, row)` to ARGB, or `None` if the tile is out of range.
-    ///
-    /// `reader` supplies raw file bytes; `decoder` is this level's `JpegDecoder`.
-    pub fn decode_tile(
-        &self,
-        reader: &dyn SlideReader,
-        col: i64,
-        row: i64,
-        decoder: &dyn TileDecoder,
-    ) -> Result<Option<Vec<u32>>> {
+    /// Flat tile index of `(col, row)`, or `None` if it lies outside the level.
+    fn tile_index(&self, col: i64, row: i64) -> Option<usize> {
         if col < 0 || row < 0 || col >= self.tiles_across {
-            return Ok(None);
+            return None;
         }
         let idx = (row * self.tiles_across + col) as usize;
-        if idx >= self.tile_count {
-            return Ok(None);
-        }
+        (idx < self.tile_count).then_some(idx)
+    }
 
-        let start = self.ensure_start(reader, idx)? as u64;
-        let stop = if idx + 1 < self.tile_count {
-            self.ensure_start(reader, idx + 1)? as u64
-        } else {
-            self.end_in_file
-        };
-        if stop <= start {
-            return Ok(None);
+    /// The entropy byte range of each tile in `tiles`, one slot per entry;
+    /// `None` where the tile lies outside the level or holds no bytes.
+    ///
+    /// This is the half of a tile read that must touch the file *before* the
+    /// pixels can be asked for, and it is why NDPI needs its own two-phase
+    /// shape rather than the tile table the other TIFF vendors have: a tile's
+    /// entropy runs from its own first byte to the next tile's, and both are
+    /// restart markers whose offsets are known only once scanned for (or
+    /// validated against the `NDPI_MCU_STARTS` hint tag). Resolving every
+    /// boundary up front lets the caller fetch the whole region in one batch —
+    /// see `OpenSlide::read_region_ndpi`.
+    ///
+    /// Offsets are memoized per level, so a region whose boundaries an earlier
+    /// read already resolved costs no I/O here at all.
+    pub fn tile_ranges(
+        &self,
+        reader: &dyn SlideReader,
+        tiles: &[(i64, i64)],
+    ) -> Result<Vec<Option<Range<u64>>>> {
+        // N tiles need N+1 boundaries: each tile ends where the next begins.
+        let mut wanted: Vec<usize> = Vec::with_capacity(tiles.len() * 2);
+        for &(col, row) in tiles {
+            if let Some(idx) = self.tile_index(col, row) {
+                wanted.push(idx);
+                if idx + 1 < self.tile_count {
+                    wanted.push(idx + 1);
+                }
+            }
         }
+        self.prime_starts(reader, &wanted)?;
 
+        tiles
+            .iter()
+            .map(|&(col, row)| {
+                let Some(idx) = self.tile_index(col, row) else {
+                    return Ok(None);
+                };
+                let start = self.ensure_start(reader, idx)? as u64;
+                let stop = if idx + 1 < self.tile_count {
+                    self.ensure_start(reader, idx + 1)? as u64
+                } else {
+                    self.end_in_file
+                };
+                Ok((stop > start).then_some(start..stop))
+            })
+            .collect()
+    }
+
+    /// Reconstruct one restart interval into a self-contained JPEG and decode
+    /// it to ARGB. `entropy` is the tile's bytes, as located by
+    /// [`tile_ranges`](Self::tile_ranges); `decoder` is this level's
+    /// `JpegDecoder`.
+    pub fn decode_tile_data(&self, entropy: &[u8], decoder: &dyn TileDecoder) -> Result<Vec<u32>> {
         // header + entropy(one restart interval) + EOI.
-        let entropy_len = (stop - start) as usize;
-        let mut buf = Vec::with_capacity(self.header.len() + entropy_len);
+        let mut buf = Vec::with_capacity(self.header.len() + entropy.len());
         buf.extend_from_slice(&self.header);
-        let entropy_at = buf.len();
-        buf.resize(entropy_at + entropy_len, 0);
-        reader.read_exact_at(start, &mut buf[entropy_at..])?;
+        buf.extend_from_slice(entropy);
 
         // The copied range ends on the next restart marker (or the file's own
         // EOI) — rewrite those trailing 2 bytes to an EOI so the stream is a
@@ -275,9 +308,56 @@ impl NdpiLevel {
         buf[o + 2] = (self.tile_w >> 8) as u8;
         buf[o + 3] = self.tile_w as u8;
 
-        decoder
-            .decode(&buf, self.tile_w as u32, self.tile_h as u32)
-            .map(Some)
+        decoder.decode(&buf, self.tile_w as u32, self.tile_h as u32)
+    }
+
+    /// Confirm the `NDPI_MCU_STARTS` hints for every index in `wanted` in one
+    /// batched read, memoizing the ones that hold up.
+    ///
+    /// A hint is only believed if a restart marker really sits in front of it,
+    /// and [`ensure_start`](Self::ensure_start) checks that one tile at a time
+    /// — a 2-byte round trip per tile, which is precisely the per-tile cost the
+    /// batched read exists to remove. Hints that don't hold up are left
+    /// unknown, and `ensure_start` scans for them exactly as before.
+    fn prime_starts(&self, reader: &dyn SlideReader, wanted: &[usize]) -> Result<()> {
+        let Some(hints) = self.unreliable.as_ref() else {
+            return Ok(()); // no tag: nothing to confirm, the scan finds them
+        };
+
+        let probe: Vec<usize> = {
+            let mut starts = self.mcu_starts.lock();
+            if starts[0] == -1 {
+                // Tile 0's entropy begins right after the header.
+                starts[0] = (self.start_in_file + self.header.len() as u64) as i64;
+            }
+            let mut probe: Vec<usize> = wanted
+                .iter()
+                .copied()
+                .filter(|&i| starts[i] == -1 && hints[i] >= 2)
+                .collect();
+            // The marker probes are two bytes a tile apart, so sorting them is
+            // what lets the backend coalesce a region's worth into one request.
+            probe.sort_unstable();
+            probe.dedup();
+            probe
+        };
+        if probe.is_empty() {
+            return Ok(());
+        }
+
+        let ranges: Vec<Range<u64>> = probe
+            .iter()
+            .map(|&i| hints[i] as u64 - 2..hints[i] as u64)
+            .collect();
+        let markers = reader.read_ranges(&ranges)?;
+
+        let mut starts = self.mcu_starts.lock();
+        for (&i, m) in probe.iter().zip(markers) {
+            if m.len() == 2 && m[0] == 0xFF && (0xD0..=0xD7).contains(&m[1]) {
+                starts[i] = hints[i];
+            }
+        }
+        Ok(())
     }
 
     /// Ensure `mcu_starts[target]` is known and return it, walking restart
@@ -600,6 +680,8 @@ fn dec(msg: impl Into<String>) -> OpenSlideError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::Bytes;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// Build a minimal JPEG-ish header: SOI, SOF0 (dims + sampling), DRI, SOS.
     /// `sof_sampling` is the packed H/V nibble of the (single) component.
@@ -669,17 +751,178 @@ mod tests {
     }
 
     // A fake reader over an in-memory buffer, for the restart-marker scanner.
-    struct MemReader(Vec<u8>);
+    // It also counts what reaches it, split between single positioned reads and
+    // batched gathers, so a test can tell a per-tile round trip from the one
+    // call a remote backend gets to coalesce.
+    #[derive(Default)]
+    struct MemReader {
+        data: Vec<u8>,
+        reads: AtomicUsize,
+        batches: AtomicUsize,
+    }
+
+    impl MemReader {
+        fn new(data: Vec<u8>) -> Self {
+            Self {
+                data,
+                ..Self::default()
+            }
+        }
+    }
+
     impl SlideReader for MemReader {
         fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize> {
+            self.reads.fetch_add(1, Ordering::Relaxed);
             let start = offset as usize;
-            let n = buf.len().min(self.0.len().saturating_sub(start));
-            buf[..n].copy_from_slice(&self.0[start..start + n]);
+            let n = buf.len().min(self.data.len().saturating_sub(start));
+            buf[..n].copy_from_slice(&self.data[start..start + n]);
             Ok(n)
         }
         fn size(&self) -> Result<u64> {
-            Ok(self.0.len() as u64)
+            Ok(self.data.len() as u64)
         }
+        fn read_ranges(&self, ranges: &[Range<u64>]) -> Result<Vec<Bytes>> {
+            self.batches.fetch_add(1, Ordering::Relaxed);
+            Ok(ranges
+                .iter()
+                .map(|r| Bytes::copy_from_slice(&self.data[r.start as usize..r.end as usize]))
+                .collect())
+        }
+    }
+
+    /// A level JPEG of `tiles` restart intervals: the header, then each
+    /// interval's entropy bytes terminated by a restart marker, then the
+    /// stream's own EOI. Returns the file bytes and the absolute offset of
+    /// every interval's first entropy byte.
+    fn make_level_jpeg(tiles: usize) -> (Vec<u8>, Vec<i64>) {
+        let header = make_header(8, 8, 0x11, 1, 1);
+        let mut file = header;
+        let mut starts = vec![file.len() as i64];
+        for i in 0..tiles - 1 {
+            file.extend_from_slice(&[0xAA; 6]);
+            file.extend_from_slice(&[0xFF, 0xD0 + (i % 8) as u8]);
+            starts.push(file.len() as i64);
+        }
+        file.extend_from_slice(&[0xAA; 4]);
+        file.extend_from_slice(&[0xFF, 0xD9]); // the JPEG's own EOI
+        (file, starts)
+    }
+
+    /// A four-tile (2×2) level over `file`, with or without the
+    /// `NDPI_MCU_STARTS` hints the real tag supplies.
+    fn make_level(file: &[u8], hints: Option<Vec<i64>>) -> NdpiLevel {
+        let header = make_header(8, 8, 0x11, 1, 1);
+        let hdr = parse_jpeg_header(&header).unwrap();
+        NdpiLevel {
+            dir: 0,
+            level_w: 16,
+            level_h: 16,
+            header: hdr.header,
+            sof_dims_offset: hdr.sof_dims_offset,
+            start_in_file: 0,
+            end_in_file: file.len() as u64,
+            tile_w: 8,
+            tile_h: 8,
+            tiles_across: 2,
+            tile_count: 4,
+            mcu_starts: Mutex::new(vec![-1; 4]),
+            unreliable: hints,
+        }
+    }
+
+    /// The ranges a whole 2×2 level resolves to, from its interval starts.
+    fn expected_ranges(starts: &[i64], end: u64) -> Vec<Option<Range<u64>>> {
+        (0..4)
+            .map(|i| {
+                let stop = starts.get(i + 1).map_or(end, |&s| s as u64);
+                Some(starts[i] as u64..stop)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn hinted_tile_ranges_confirm_every_marker_in_one_gather() {
+        let (file, starts) = make_level_jpeg(4);
+        let level = make_level(&file, Some(starts.clone()));
+        let reader = MemReader::new(file.clone());
+
+        let tiles = [(0, 0), (1, 0), (0, 1), (1, 1)];
+        let ranges = level.tile_ranges(&reader, &tiles).expect("ranges");
+
+        assert_eq!(ranges, expected_ranges(&starts, file.len() as u64));
+        assert_eq!(
+            reader.batches.load(Ordering::Relaxed),
+            1,
+            "every hint a region needs is confirmed in one gather"
+        );
+        assert_eq!(
+            reader.reads.load(Ordering::Relaxed),
+            0,
+            "no hint may be confirmed with its own positioned read"
+        );
+
+        // Offsets are memoized, so a second read of the same region is free.
+        let again = level.tile_ranges(&reader, &tiles).expect("ranges");
+        assert_eq!(again, ranges);
+        assert_eq!(reader.batches.load(Ordering::Relaxed), 1);
+        assert_eq!(reader.reads.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn unhinted_tile_ranges_scan_to_the_same_answer() {
+        // Without the tag there is nothing to confirm: the offsets can only be
+        // found by scanning, which is serial and reads. What must not change is
+        // the answer.
+        let (file, starts) = make_level_jpeg(4);
+        let level = make_level(&file, None);
+        let reader = MemReader::new(file.clone());
+
+        let ranges = level
+            .tile_ranges(&reader, &[(0, 0), (1, 0), (0, 1), (1, 1)])
+            .expect("ranges");
+
+        assert_eq!(ranges, expected_ranges(&starts, file.len() as u64));
+        assert_eq!(reader.batches.load(Ordering::Relaxed), 0);
+        assert!(reader.reads.load(Ordering::Relaxed) > 0);
+    }
+
+    #[test]
+    fn tiles_outside_the_level_have_no_range() {
+        let (file, _) = make_level_jpeg(4);
+        let level = make_level(&file, None);
+        let reader = MemReader::new(file);
+
+        let ranges = level
+            .tile_ranges(&reader, &[(-1, 0), (2, 0), (0, 2)])
+            .expect("ranges");
+        assert_eq!(ranges, vec![None, None, None]);
+        assert_eq!(reader.reads.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn tile_data_is_reconstructed_into_a_complete_jpeg() {
+        // The decoder sees header + entropy with the trailing marker rewritten
+        // to EOI and the tile's own dimensions patched into the SOF.
+        struct Capture(Mutex<Vec<u8>>);
+        impl TileDecoder for Capture {
+            fn decode(&self, data: &[u8], _w: u32, _h: u32) -> Result<Vec<u32>> {
+                *self.0.lock() = data.to_vec();
+                Ok(Vec::new())
+            }
+        }
+
+        let (file, starts) = make_level_jpeg(4);
+        let level = make_level(&file, Some(starts.clone()));
+        let entropy = &file[starts[0] as usize..starts[1] as usize];
+
+        let capture = Capture(Mutex::new(Vec::new()));
+        level.decode_tile_data(entropy, &capture).expect("decode");
+        let buf = capture.0.lock().clone();
+
+        assert_eq!(&buf[..level.header.len()], &level.header[..]);
+        assert_eq!(&buf[buf.len() - 2..], &[0xFF, 0xD9], "ends on an EOI");
+        let o = level.sof_dims_offset;
+        assert_eq!(&buf[o..o + 4], &[0, 8, 0, 8], "SOF carries the tile size");
     }
 
     #[test]
@@ -691,7 +934,7 @@ mod tests {
             0x56, 0xFF, 0xFF, 0xD1, // fill FF then restart 1 → marker at 8..10, after = 10
             0xFF, 0xD9, // EOI (not a restart) at 10..12
         ];
-        let r = MemReader(data.clone());
+        let r = MemReader::new(data.clone());
         let first = next_restart(&r, 0, data.len() as u64).unwrap();
         assert_eq!(first, Some(6));
         let second = next_restart(&r, first.unwrap(), data.len() as u64).unwrap();

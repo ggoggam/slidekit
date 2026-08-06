@@ -144,6 +144,37 @@ fn cmu1() {
     );
 }
 
+/// The decoded-tile cache must not change a pixel of a MIRAX read.
+///
+/// MIRAX is the format whose tiles least resemble a grid: each is a standalone
+/// blob addressed by `(fileno, offset)` in one of several `Data####.dat` files,
+/// and several *placed subtiles* crop the same blob, so a cache keyed on the
+/// grid position would be both wrong and useless. The regions overlap so later
+/// reads reuse blobs the earlier ones decoded.
+#[test]
+fn cached_reads_are_pixel_identical() {
+    let path = require_mirax_slide!();
+    let open = || OpenSlide::open(&path).expect("should open MIRAX CMU-1");
+
+    common::assert_cache_is_transparent(
+        open,
+        0,
+        &[
+            (20000, 100000, 512, 512),
+            (20200, 100200, 512, 512),
+            (20000, 100200, 512, 512),
+        ],
+    );
+    // A coarser level over the same tissue (region coordinates are level-0
+    // space at every level): it concatenates and re-splits images differently,
+    // and the key has to keep its tiles apart from level 0's.
+    common::assert_cache_is_transparent(
+        open,
+        2,
+        &[(20000, 100000, 256, 256), (20400, 100400, 256, 256)],
+    );
+}
+
 /// MIRAX opens through an `ObjectStore`, not just a local path.
 ///
 /// The store is `object_store`'s own `LocalFileSystem` rooted at the extracted
