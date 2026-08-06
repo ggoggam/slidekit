@@ -453,7 +453,7 @@ The one thing that would help: persisting a derived offset table alongside the
 slide, so the walk is paid once per slide rather than once per process. That is a
 caching layer above this library, not a fix inside it.
 
-### B. Zeiss open costs 151 requests
+### B. Zeiss open costs 151 requests — fixed in `a52ed2f`
 
 More than the other ten vendors put together. The CZI directory says where each
 subblock is but not where the pixels inside it start, so it takes one 16-byte
@@ -461,6 +461,12 @@ header read per subblock, and they sit megabytes apart in a 1 GB file — nothin
 coalesce. They are batched and concurrent now (65.6 → 11.9 s), which is most of
 the available win; going further means either caching the resolved offsets or
 finding the metadata that makes the second pass unnecessary.
+
+**Resolved.** `a52ed2f` took the second option: the offsets are resolved in
+`read_region` for the few subblocks a window actually touches, not at open for all
+134. Open now costs **10 requests** — see
+[finding B in the remote patch report](remote-patch-benchmark.md#b-zeiss-open-no-longer-costs-151-requests-fixed),
+which supersedes this section.
 
 ### C. `bench_openslide` needs `mise` to be correct — fixed 2026-08-06
 
