@@ -24,9 +24,9 @@ let region = slide.read_region(0, 0, 0, 512, 512)?; // ARGB Vec<u32>
 | Ventana BIF | ✅ | AOI stitch geometry → tilemap, associated images, ICC |
 | Leica SCN | ✅ | Single brightfield region; multi-region SCN deferred |
 | Hamamatsu NDPI | ✅ | Restart-marker JPEG tiling; VMS/VMU & z-stacks deferred |
-| 3DHistech MIRAX (`.mrxs`) | ✅ | Multi-file; brightfield JPEG tiles; fluorescence deferred |
+| 3DHistech MIRAX (`.mrxs`) | ✅ | Multi-file; JPEG + PNG tiles; fluorescence deferred |
 | Zeiss CZI (`.czi`) | ✅ | Uncompressed / Zstd0 / Zstd1; **JPEG XR not supported** ¹ |
-| DICOM WSI (`.dcm`) | ✅ | Directory of instances; JPEG + uncompressed, **JPEG 2000 not supported** ² |
+| DICOM WSI (`.dcm`) | ✅ | Directory of instances; JPEG, JPEG 2000, JPEG XL, uncompressed ² |
 | Synthetic | ✅ | Self-test slides, no file needed (`OPENSLIDE_DEBUG=synthetic`) |
 | Sakura | ❌ | Planned (needs a SQLite reader); no public test slide exists |
 
@@ -35,10 +35,9 @@ and rejects JPEG XR. JXR is common for brightfield CZIs but has no pure-Rust
 decoder; such files are detected as Zeiss but fail to open with a clear error
 rather than producing black tiles.
 
-² OpenSlide's C driver decodes JPEG 2000 DICOM through OpenJPEG. slidekit has no
-JPEG 2000 decoder yet, so those instances are detected as DICOM but fail to open
-with a clear error. Baseline-JPEG and uncompressed slides — what current scanners
-write — are fully supported.
+² slidekit also decodes the JPEG XL transfer syntaxes, which OpenSlide 4.0 does
+not. Multi-focal-plane (z-stack) and multi-optical-path (fluorescence) DICOM
+slides remain deferred.
 
 ## API surface
 
@@ -72,9 +71,30 @@ the C API makes between `openslide_get_icc_profile_size` and
 | PackBits (TIFF) | ✅ | in-tree |
 | Zstd v0 / v1 (CZI) | ✅ | `ruzstd` (pure Rust) |
 | Uncompressed (CZI BGR/gray, DICOM RGB) | ✅ | in-tree |
-| JPEG 2000 | ❌ | Planned (needed by JP2K Aperio + DICOM slides) |
+| JPEG 2000 | ✅ | `hayro-jpeg2000` (pure Rust) |
+| JPEG XL | ✅ | `jxl-oxide` (pure Rust) — DICOM `…1.2.4.140`/`.141`/`.142`, TIFF 50002/52546 |
+| PNG | ✅ | `png` (pure Rust) |
 | JPEG XR (CZI) | ❌ | No pure-Rust decoder |
-| PNG / BMP | ❌ | Planned |
+| BMP | ❌ | Planned (rare MIRAX levels) |
+
+Every codec is pure Rust, and none of the codec crates has a build script. So
+`cargo add slidekit` is the whole install: there is no system package for a
+user to find, no `cmake`/`pkg-config` step, and nothing to go wrong when
+cross-compiling. `--no-default-features` resolves to a graph with **zero
+`-sys` crates**.
+
+The only C a *default* build compiles is `aws-lc-sys`, the TLS backend that
+`object_store` brings in for the optional `object-store` feature. It has
+nothing to do with image decoding, and turning that feature off removes it —
+along with the Apple framework bindings (`core-foundation-sys`,
+`security-framework-sys`) the same TLS stack pulls in on macOS, which link
+against the OS rather than building anything.
+
+JPEG 2000 in particular chose `hayro-jpeg2000` over the two OpenJPEG routes.
+`openjpeg-sys` would have meant vendoring and statically linking C (a build
+dependency for every downstream consumer), and `openjp2` — OpenJPEG
+machine-translated to Rust — exposes no in-memory stream constructor and hits
+undefined behaviour tearing down a tile on real Aperio slides.
 
 ## I/O backends
 

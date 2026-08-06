@@ -8,9 +8,12 @@
 use crate::color::argb;
 use crate::decode::TileDecoder;
 use crate::decode::deflate::DeflateDecoder;
+use crate::decode::jp2k::Jp2kDecoder;
 use crate::decode::jpeg::JpegDecoder;
+use crate::decode::jxl::JxlDecoder;
 use crate::decode::lzw::LzwDecoder;
 use crate::decode::packbits::PackBitsDecoder;
+use crate::decode::png::PngDecoder;
 use crate::decode::tiff::TiffLike;
 use crate::decode::tiff::tags;
 use crate::error::{OpenSlideError, Result};
@@ -190,6 +193,11 @@ pub(crate) fn make_decoder_for_dir(tl: &mut TiffLike, dir: i64) -> Result<Box<dy
         tags::COMPRESSION_DEFLATE | tags::COMPRESSION_DEFLATE_OLD => {
             Ok(Box::new(DeflateDecoder::for_dir(tl, dir)?))
         }
+        // Standard TIFF JPEG 2000 keeps its colour in the codestream, unlike
+        // Aperio's private tags, so the components come out as RGB.
+        tags::COMPRESSION_JP2K => Ok(Box::new(Jp2kDecoder::rgb())),
+        tags::COMPRESSION_PNG => Ok(Box::new(PngDecoder::new())),
+        tags::COMPRESSION_JXL | tags::COMPRESSION_JXL_DNG => Ok(Box::new(JxlDecoder::new())),
         tags::COMPRESSION_PACKBITS => Ok(Box::new(PackBitsDecoder::for_dir(tl, dir)?)),
         1 => {
             // Uncompressed — return a passthrough decoder
@@ -287,12 +295,11 @@ pub fn set_tiff_string_props(tl: &mut TiffLike, dir: i64, props: &mut Properties
     ];
 
     for &(tag, prop_name) in mappings {
-        if tl.has_tag(dir, tag) {
-            if let Ok(val) = tl.get_string(dir, tag) {
-                if !val.is_empty() {
-                    props.insert(prop_name, val);
-                }
-            }
+        if tl.has_tag(dir, tag)
+            && let Ok(val) = tl.get_string(dir, tag)
+            && !val.is_empty()
+        {
+            props.insert(prop_name, val);
         }
     }
 }

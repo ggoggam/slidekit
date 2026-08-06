@@ -21,10 +21,9 @@
 //! are [`DicomLevel`]s with their own read path rather than TIFF tile grids.
 //!
 //! **Compression parity:** OpenSlide's C driver decodes baseline JPEG,
-//! JPEG 2000, and uncompressed RGB. This driver does the first and last; JPEG
-//! 2000 instances (transfer syntax `…1.2.4.90`/`.91`) are detected but fail to
-//! open with a clear error, because there is no pure-Rust JPEG 2000 decoder yet
-//! — the same stance `zeiss` takes toward JPEG XR.
+//! JPEG 2000, and uncompressed RGB; this driver does all three, and also the
+//! JPEG XL transfer syntaxes (`…1.2.4.140`/`.141`/`.142`) that OpenSlide 4.0
+//! has no decoder for.
 
 use std::collections::HashMap;
 use std::ops::Range;
@@ -37,7 +36,9 @@ use crate::associated::AssociatedImage;
 use crate::decode::dicom::{
     self, DataSet, DicomObject, FrameIndex, VL_WHOLE_SLIDE_MICROSCOPY_IMAGE_STORAGE, Value, tags,
 };
+use crate::decode::jp2k::Jp2kDecoder;
 use crate::decode::jpeg::JpegDecoder;
+use crate::decode::jxl::JxlDecoder;
 use crate::decode::tiff::TiffLike;
 use crate::decode::{TileDecoder, samples_to_argb};
 use crate::error::{OpenSlideError, Result};
@@ -62,9 +63,14 @@ const ASSOCIATED_FLAVORS: &[(&str, &str)] = &[
 /// Transfer syntaxes whose pixels this driver can decode.
 const TS_EXPLICIT_VR_LITTLE_ENDIAN: &str = "1.2.840.10008.1.2.1";
 const TS_JPEG_BASELINE: &str = "1.2.840.10008.1.2.4.50";
-/// JPEG 2000, lossless-only and lossy: recognized so the error names them.
 const TS_JPEG_2000_LOSSLESS: &str = "1.2.840.10008.1.2.4.90";
 const TS_JPEG_2000: &str = "1.2.840.10008.1.2.4.91";
+/// JPEG XL, added to DICOM in 2023: lossless, JPEG recompression, and plain.
+/// The recompression syntax wraps an original JPEG's coefficients, which a
+/// JPEG XL decoder reconstructs like any other stream.
+const TS_JPEG_XL_LOSSLESS: &str = "1.2.840.10008.1.2.4.140";
+const TS_JPEG_XL_RECOMPRESSION: &str = "1.2.840.10008.1.2.4.141";
+const TS_JPEG_XL: &str = "1.2.840.10008.1.2.4.142";
 
 /// How a frame's bytes are encoded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -74,6 +80,14 @@ enum Encoding {
     Jpeg { rgb: bool },
     /// Uncompressed interleaved 8-bit RGB.
     Rgb,
+    /// JPEG 2000. `ycbcr` is set only for `YBR_FULL`/`YBR_FULL_422`, where the
+    /// components are YCbCr and the codestream carries no transform to say so.
+    /// `YBR_ICT` and `YBR_RCT` name the codestream's *own* transform, which the
+    /// decoder has already undone by the time we see the components, so they
+    /// arrive as RGB.
+    Jp2k { ycbcr: bool },
+    /// JPEG XL, which carries its own colour encoding.
+    Jxl,
 }
 
 /// `ceil(a / b)` for a positive divisor, correct for negative `a` (a region can
@@ -150,6 +164,15 @@ impl DicomInstance {
                 decoder.decode(data, w as u32, h as u32)
             }
             Encoding::Rgb => samples_to_argb(data, w as u32, h as u32, 3),
+            Encoding::Jp2k { ycbcr } => {
+                let decoder = if ycbcr {
+                    Jp2kDecoder::ycbcr()
+                } else {
+                    Jp2kDecoder::rgb()
+                };
+                decoder.decode(data, w as u32, h as u32)
+            }
+            Encoding::Jxl => JxlDecoder::new().decode(data, w as u32, h as u32),
         }
     }
 }
@@ -531,13 +554,12 @@ impl LevelGroup {
         if let Some(total) = ordered
             .first()
             .and_then(|(_, f)| f.object.dataset.int(tags::IN_CONCATENATION_TOTAL_NUMBER))
+            && total != ordered.len() as i64
         {
-            if total != ordered.len() as i64 {
-                return Err(OpenSlideError::Decode(format!(
-                    "DICOM concatenation declares {total} instances, found {}",
-                    ordered.len()
-                )));
-            }
+            return Err(OpenSlideError::Decode(format!(
+                "DICOM concatenation declares {total} instances, found {}",
+                ordered.len()
+            )));
         }
 
         ordered
@@ -654,12 +676,12 @@ fn build_instance(file: &ParsedFile) -> Result<DicomInstance> {
         }
     }
     // Optional, but a multi-focal-plane image would need a plane to be chosen.
-    if let Some(planes) = ds.int(tags::TOTAL_PIXEL_MATRIX_FOCAL_PLANES) {
-        if planes != 1 {
-            return Err(OpenSlideError::Decode(format!(
-                "unsupported DICOM slide with {planes} focal planes"
-            )));
-        }
+    if let Some(planes) = ds.int(tags::TOTAL_PIXEL_MATRIX_FOCAL_PLANES)
+        && planes != 1
+    {
+        return Err(OpenSlideError::Decode(format!(
+            "unsupported DICOM slide with {planes} focal planes"
+        )));
     }
 
     let (width, height) = total_pixel_matrix(ds)?;
@@ -742,9 +764,15 @@ fn encoding(object: &DicomObject) -> Result<Encoding> {
                 "unsupported DICOM photometric interpretation {other} for uncompressed pixels"
             ))),
         },
-        ts @ (TS_JPEG_2000 | TS_JPEG_2000_LOSSLESS) => Err(OpenSlideError::Decode(format!(
-            "DICOM transfer syntax {ts} is JPEG 2000, which slidekit cannot decode yet"
-        ))),
+        TS_JPEG_2000 | TS_JPEG_2000_LOSSLESS => match photometric {
+            // See `Encoding::Jp2k` for why only the YBR_FULL flavours convert.
+            "YBR_FULL_422" | "YBR_FULL" => Ok(Encoding::Jp2k { ycbcr: true }),
+            "RGB" | "YBR_ICT" | "YBR_RCT" | "MONOCHROME2" => Ok(Encoding::Jp2k { ycbcr: false }),
+            other => Err(OpenSlideError::Decode(format!(
+                "unsupported DICOM photometric interpretation {other} for JPEG 2000"
+            ))),
+        },
+        TS_JPEG_XL | TS_JPEG_XL_LOSSLESS | TS_JPEG_XL_RECOMPRESSION => Ok(Encoding::Jxl),
         other => Err(OpenSlideError::Decode(format!(
             "unsupported DICOM transfer syntax {other}"
         ))),
@@ -931,7 +959,27 @@ mod tests {
             (TS_EXPLICIT_VR_LITTLE_ENDIAN, "RGB", Some(Encoding::Rgb)),
             // Uncompressed YBR would need a color transform we don't do.
             (TS_EXPLICIT_VR_LITTLE_ENDIAN, "YBR_FULL_422", None),
-            (TS_JPEG_2000, "YBR_ICT", None),
+            // The codestream undoes ICT/RCT itself, so those arrive as RGB;
+            // only the YBR_FULL flavours still need converting.
+            (
+                TS_JPEG_2000,
+                "YBR_ICT",
+                Some(Encoding::Jp2k { ycbcr: false }),
+            ),
+            (
+                TS_JPEG_2000_LOSSLESS,
+                "YBR_RCT",
+                Some(Encoding::Jp2k { ycbcr: false }),
+            ),
+            (TS_JPEG_2000, "RGB", Some(Encoding::Jp2k { ycbcr: false })),
+            (
+                TS_JPEG_2000,
+                "YBR_FULL_422",
+                Some(Encoding::Jp2k { ycbcr: true }),
+            ),
+            (TS_JPEG_XL, "RGB", Some(Encoding::Jxl)),
+            (TS_JPEG_XL_LOSSLESS, "YBR_FULL", Some(Encoding::Jxl)),
+            (TS_JPEG_XL_RECOMPRESSION, "RGB", Some(Encoding::Jxl)),
             ("1.2.840.10008.1.2.4.70", "RGB", None),
         ];
         for (syntax, photometric, expected) in cases {
@@ -940,11 +988,13 @@ mod tests {
         }
     }
 
+    /// A JPEG 2000 photometric we have no conversion for must name itself in
+    /// the error rather than decode to wrong colour.
     #[test]
-    fn jpeg_2000_is_rejected_by_name() {
-        let object = object_with(TS_JPEG_2000_LOSSLESS, "YBR_RCT");
-        let err = encoding(&object).expect_err("JPEG 2000 is not decodable yet");
-        assert!(err.to_string().contains("JPEG 2000"), "{err}");
+    fn unknown_jp2k_photometric_is_rejected_by_name() {
+        let object = object_with(TS_JPEG_2000, "PALETTE COLOR");
+        let err = encoding(&object).expect_err("unknown photometric must not decode");
+        assert!(err.to_string().contains("PALETTE COLOR"), "{err}");
     }
 
     /// A minimal parsed instance carrying just a transfer syntax and photometric

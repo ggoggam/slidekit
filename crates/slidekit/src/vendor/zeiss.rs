@@ -613,14 +613,13 @@ fn parse_metadata_xml(xml: &str, props: &mut Properties) {
     }
 
     // Objective power: Information/Instrument/Objectives/Objective/NominalMagnification.
-    if let Some(objs) = meta.descend(&["Information", "Instrument", "Objectives"]) {
-        if let Some(obj) = objs.children_named("Objective").next() {
-            if let Some(mag) = obj.find_child("NominalMagnification") {
-                let mag = mag.text.trim();
-                if !mag.is_empty() {
-                    props.insert(names::OBJECTIVE_POWER, mag);
-                }
-            }
+    if let Some(objs) = meta.descend(&["Information", "Instrument", "Objectives"])
+        && let Some(obj) = objs.children_named("Objective").next()
+        && let Some(mag) = obj.find_child("NominalMagnification")
+    {
+        let mag = mag.text.trim();
+        if !mag.is_empty() {
+            props.insert(names::OBJECTIVE_POWER, mag);
         }
     }
 }
@@ -645,10 +644,10 @@ fn read_associated_images(
         ("SlidePreview", "macro"),
         ("Thumbnail", "thumbnail"),
     ] {
-        if let Some(&file_pos) = entries.get(att_name) {
-            if let Some(img) = read_one_attachment_jpeg(reader, file_pos) {
-                out.push((name.to_string(), img));
-            }
+        if let Some(&file_pos) = entries.get(att_name)
+            && let Some(img) = read_one_attachment_jpeg(reader, file_pos)
+        {
+            out.push((name.to_string(), img));
         }
     }
     out

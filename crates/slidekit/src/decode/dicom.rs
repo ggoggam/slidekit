@@ -1299,10 +1299,10 @@ impl<'r> Cursor<'r> {
 
     /// Make at least `n` bytes at `pos` available in the window.
     fn fill(&mut self, n: usize) -> Result<()> {
-        if let Some(off) = self.pos.checked_sub(self.buf_start) {
-            if off as usize + n <= self.buf.len() {
-                return Ok(());
-            }
+        if let Some(off) = self.pos.checked_sub(self.buf_start)
+            && off as usize + n <= self.buf.len()
+        {
+            return Ok(());
         }
         if self.remaining() < n as u64 {
             return Err(Self::eof());
@@ -1473,7 +1473,7 @@ mod tests {
 
     /// DICOM values are even-length; UIDs pad with NUL.
     fn pad(s: &str) -> String {
-        if s.len() % 2 == 0 {
+        if s.len().is_multiple_of(2) {
             s.to_string()
         } else {
             format!("{s}\0")

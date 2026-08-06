@@ -160,20 +160,20 @@ impl VendorDriver for HamamatsuDriver {
         if let Ok(v) = tl.get_sint(0, NDPI_YOFFSET) {
             props.insert("hamamatsu.YOffsetFromSlideCentre", v.to_string());
         }
-        if let Ok(v) = tl.get_string(0, NDPI_REFERENCE) {
-            if !v.is_empty() {
-                props.insert("hamamatsu.Reference", v);
-            }
+        if let Ok(v) = tl.get_string(0, NDPI_REFERENCE)
+            && !v.is_empty()
+        {
+            props.insert("hamamatsu.Reference", v);
         }
         set_property_map(&mut tl, &mut props);
 
         // Macro associated image: decode the whole single-strip JPEG (small,
         // near the file start, so no >4 GiB offset fixup is needed). Non-fatal.
         let mut associated_images: Vec<(String, AssociatedImage)> = Vec::new();
-        if let Some(mdir) = macro_dir {
-            if let Ok(img) = decode_whole_jpeg(&mut tl, mdir) {
-                associated_images.push(("macro".to_string(), img));
-            }
+        if let Some(mdir) = macro_dir
+            && let Ok(img) = decode_whole_jpeg(&mut tl, mdir)
+        {
+            associated_images.push(("macro".to_string(), img));
         }
 
         let icc_profile = tl.read_icc_profile(0).ok().flatten();
@@ -295,13 +295,14 @@ impl NdpiLevel {
         // Walk back to the nearest known offset, promoting a valid tag hint.
         let mut first_good = target;
         while starts[first_good] == -1 {
-            if let Some(hint) = self.unreliable.as_ref().map(|v| v[first_good]) {
-                if hint >= 2 && is_restart_marker(reader, hint as u64 - 2)? {
-                    starts[first_good] = hint;
-                    break;
-                }
-                // Bogus hint → keep walking; the forward scan recomputes it.
+            if let Some(hint) = self.unreliable.as_ref().map(|v| v[first_good])
+                && hint >= 2
+                && is_restart_marker(reader, hint as u64 - 2)?
+            {
+                starts[first_good] = hint;
+                break;
             }
+            // Bogus hint → keep walking; the forward scan recomputes it.
             first_good -= 1; // starts[0] is always known, so this terminates.
         }
 
@@ -560,10 +561,11 @@ fn set_property_map(tl: &mut TiffLike, props: &mut Properties) {
         return;
     };
     for record in raw.split("\r\n") {
-        if let Some((k, v)) = record.split_once('=') {
-            if !k.is_empty() && !v.is_empty() {
-                props.insert(format!("hamamatsu.{k}"), v.to_string());
-            }
+        if let Some((k, v)) = record.split_once('=')
+            && !k.is_empty()
+            && !v.is_empty()
+        {
+            props.insert(format!("hamamatsu.{k}"), v.to_string());
         }
     }
 }
@@ -708,10 +710,11 @@ mod tests {
         let raw = "Objective.Lens.Magnificant=20\r\nblank\r\n=noKey\r\nNoValue=\r\nk=v";
         let mut got: Vec<(String, String)> = Vec::new();
         for record in raw.split("\r\n") {
-            if let Some((k, v)) = record.split_once('=') {
-                if !k.is_empty() && !v.is_empty() {
-                    got.push((k.to_string(), v.to_string()));
-                }
+            if let Some((k, v)) = record.split_once('=')
+                && !k.is_empty()
+                && !v.is_empty()
+            {
+                got.push((k.to_string(), v.to_string()));
             }
         }
         assert_eq!(

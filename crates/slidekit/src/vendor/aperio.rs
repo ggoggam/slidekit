@@ -11,6 +11,7 @@ use crate::associated::AssociatedImage;
 use crate::color::argb;
 use crate::decode::TileDecoder;
 use crate::decode::deflate::DeflateDecoder;
+use crate::decode::jp2k::Jp2kDecoder;
 use crate::decode::lzw::{self, LzwDecoder};
 use crate::decode::packbits::PackBitsDecoder;
 use crate::decode::tiff::TiffLike;
@@ -313,12 +314,10 @@ fn make_decoder_for_dir(tl: &mut TiffLike, dir: i64) -> Result<Box<dyn TileDecod
 
     match compression {
         tags::COMPRESSION_JPEG => Ok(Box::new(jpeg_decoder_for_dir(tl, dir)?)),
-        tags::COMPRESSION_JP2K_YCBCR | tags::COMPRESSION_JP2K_RGB => {
-            // TODO: Add JPEG 2000 decoder support
-            Err(OpenSlideError::Decode(format!(
-                "JPEG 2000 compression ({compression}) not yet supported"
-            )))
-        }
+        // The two Aperio JP2K tags carry the same codestream syntax and differ
+        // only in what the components mean — see `decode::jp2k`.
+        tags::COMPRESSION_JP2K_YCBCR => Ok(Box::new(Jp2kDecoder::ycbcr())),
+        tags::COMPRESSION_JP2K_RGB => Ok(Box::new(Jp2kDecoder::rgb())),
         tags::COMPRESSION_LZW => Ok(Box::new(LzwDecoder::for_dir(tl, dir)?)),
         tags::COMPRESSION_DEFLATE | tags::COMPRESSION_DEFLATE_OLD => {
             Ok(Box::new(DeflateDecoder::for_dir(tl, dir)?))

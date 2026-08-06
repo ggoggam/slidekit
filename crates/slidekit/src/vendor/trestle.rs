@@ -103,16 +103,16 @@ impl VendorDriver for TrestleDriver {
         );
 
         // Parse background color
-        if let Some(bg_str) = props.get(PROP_BACKGROUND_COLOR) {
-            if let Ok(bg) = u64::from_str_radix(bg_str.trim(), 16) {
-                let r = (bg >> 16) & 0xFF;
-                let g = (bg >> 8) & 0xFF;
-                let b = bg & 0xFF;
-                props.insert(
-                    properties::names::BACKGROUND_COLOR,
-                    format!("{r:02X}{g:02X}{b:02X}"),
-                );
-            }
+        if let Some(bg_str) = props.get(PROP_BACKGROUND_COLOR)
+            && let Ok(bg) = u64::from_str_radix(bg_str.trim(), 16)
+        {
+            let r = (bg >> 16) & 0xFF;
+            let g = (bg >> 8) & 0xFF;
+            let b = bg & 0xFF;
+            props.insert(
+                properties::names::BACKGROUND_COLOR,
+                format!("{r:02X}{g:02X}{b:02X}"),
+            );
         }
 
         // Parse overlaps from OverlapsXY property

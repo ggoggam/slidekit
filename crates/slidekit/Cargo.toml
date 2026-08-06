@@ -13,6 +13,9 @@ lru.workspace = true
 parking_lot.workspace = true
 bytes.workspace = true
 jpeg-decoder.workspace = true
+png.workspace = true
+hayro-jpeg2000.workspace = true
+jxl-oxide.workspace = true
 weezl.workspace = true
 miniz_oxide.workspace = true
 ruzstd.workspace = true
@@ -38,7 +41,6 @@ zip = "2"
 object_store.workspace = true
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs"] }
 wiremock = "0.6"
-png = "0.17"                # decode slidetool's PNG output in the OpenSlide comparison bench
 # Implementing `ObjectStore` for the request-counting wrapper in `bench_remote`
 # needs the same two crates its trait definition is built from. Both are already
 # in the graph via `object_store`, so this adds no compilation.

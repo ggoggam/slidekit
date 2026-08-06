@@ -88,7 +88,17 @@ pub mod tags {
     pub const COMPRESSION_JPEG: u16 = 7;
     pub const COMPRESSION_DEFLATE: u16 = 8; // Adobe-style zlib Deflate
     pub const COMPRESSION_DEFLATE_OLD: u16 = 32946; // Deprecated PKZIP/zlib Deflate
+    /// JPEG 2000 in a standard TIFF, as written by libtiff's OpenJPEG codec.
+    /// Distinct from Aperio's private 33003/33005, which also say what the
+    /// components mean; here they are plain RGB.
+    pub const COMPRESSION_JP2K: u16 = 34712;
     pub const COMPRESSION_PACKBITS: u16 = 32773;
+    /// PNG-compressed tiles (Adobe's registered code).
+    pub const COMPRESSION_PNG: u16 = 34933;
+    /// JPEG XL. 52546 is the code libjxl's TIFF support shipped first and DNG
+    /// 1.7 adopted; 50002 is the later libtiff registration. Both are found.
+    pub const COMPRESSION_JXL_DNG: u16 = 52546;
+    pub const COMPRESSION_JXL: u16 = 50002;
 
     // SubfileType flag bits
     pub const FILETYPE_REDUCEDIMAGE: u64 = 0x1;

@@ -207,3 +207,101 @@ fn cmu1_small_region() {
     let (w, h) = slide.level0_dimensions();
     assert!(w > 0 && h > 0);
 }
+
+/// Mean per-channel deviation from neutral gray over a region's opaque pixels.
+///
+/// A JP2K tile decoded in the wrong colour space still looks plausible in the
+/// aggregate — the failure is a *colour cast*, not noise — so a plain "did it
+/// decode" assertion misses it. Reading a 33003 tile's YCbCr components as RGB
+/// leaves luma in red and both chroma planes hovering around 128, which drives
+/// this statistic far above what stained tissue produces.
+///
+/// The ceiling below is measured, not guessed. Over the same tissue window,
+/// `slidetool` reports 33.2 on `JP2K-33003-1` and 21.5 on `CMU-1-JP2K-33005`,
+/// against slidekit's 32.2 and 21.0 — these are genuinely saturated H&E slides.
+/// A YCbCr-as-RGB misread of the same pixels measures upwards of 55.
+const MAX_MEAN_CHROMA: f64 = 45.0;
+
+fn mean_chroma(pixels: &[u32]) -> f64 {
+    let mut total = 0.0;
+    let mut n = 0u64;
+    for &p in pixels {
+        if (p >> 24) & 0xFF == 0 {
+            continue;
+        }
+        let (r, g, b) = (
+            ((p >> 16) & 0xFF) as f64,
+            ((p >> 8) & 0xFF) as f64,
+            (p & 0xFF) as f64,
+        );
+        let mean = (r + g + b) / 3.0;
+        total += ((r - mean).abs() + (g - mean).abs() + (b - mean).abs()) / 3.0;
+        n += 1;
+    }
+    if n == 0 { 0.0 } else { total / n as f64 }
+}
+
+/// Assert a JP2K Aperio slide opens and its level-0 tiles decode to sane pixels.
+fn check_jp2k_slide(path: &std::path::Path, label: &str) {
+    assert_eq!(
+        OpenSlide::detect_vendor(path).as_deref(),
+        Some("aperio"),
+        "{label} should be detected as aperio"
+    );
+
+    let slide = OpenSlide::open(path).unwrap_or_else(|e| panic!("should open {label}: {e}"));
+    assert!(slide.level_count() >= 1, "{label} should have a level");
+
+    // A region well inside the slide, so it lands on real tissue tiles rather
+    // than the padded edge.
+    let (w0, h0) = slide.level0_dimensions();
+    let (x, y) = (w0 / 4, h0 / 4);
+    let region = slide
+        .read_region(x, y, 0, 256, 256)
+        .unwrap_or_else(|e| panic!("{label} level 0 read_region should decode: {e}"));
+    assert_eq!(region.len(), 256 * 256, "{label} region size");
+
+    assert!(
+        region.iter().any(|&p| (p >> 24) & 0xFF != 0),
+        "{label} region should have opaque pixels"
+    );
+    assert!(
+        region
+            .iter()
+            .collect::<std::collections::HashSet<_>>()
+            .len()
+            > 1,
+        "{label} region should not be a single flat colour"
+    );
+
+    let chroma = mean_chroma(&region);
+    assert!(
+        chroma < MAX_MEAN_CHROMA,
+        "{label} mean chroma {chroma:.1} exceeds {MAX_MEAN_CHROMA} — the \
+         components are probably being read in the wrong colour space"
+    );
+
+    // Every level must decode too: the pyramid uses the same codec throughout.
+    for level in 1..slide.level_count() {
+        let (lw, lh) = slide.level_dimensions(level).unwrap();
+        let (rw, rh) = (64.min(lw), 64.min(lh));
+        slide
+            .read_region(0, 0, level, rw, rh)
+            .unwrap_or_else(|e| panic!("{label} level {level} should decode: {e}"));
+    }
+}
+
+/// `JP2K-33003-1.svs`: JPEG 2000 tiles whose components are YCbCr with the
+/// chroma subsampled 2:1 horizontally.
+#[test]
+fn jp2k_33003_ycbcr() {
+    let path = require_slide!("Aperio/JP2K-33003-1.svs");
+    check_jp2k_slide(&path, "JP2K-33003-1.svs");
+}
+
+/// `CMU-1-JP2K-33005.svs`: JPEG 2000 tiles whose components are already RGB.
+#[test]
+fn jp2k_33005_rgb() {
+    let path = require_slide!("Aperio/CMU-1-JP2K-33005.svs");
+    check_jp2k_slide(&path, "CMU-1-JP2K-33005.svs");
+}

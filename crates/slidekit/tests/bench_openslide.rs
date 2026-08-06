@@ -299,10 +299,10 @@ fn run_slidetool(
         eprintln!("slidetool failed on {path:?}");
         return None;
     }
-    let file = std::fs::File::open(&out).ok()?;
+    let file = std::io::BufReader::new(std::fs::File::open(&out).ok()?);
     let decoder = png::Decoder::new(file);
     let mut reader = decoder.read_info().ok()?;
-    let mut buf = vec![0u8; reader.output_buffer_size()];
+    let mut buf = vec![0u8; reader.output_buffer_size()?];
     let info = reader.next_frame(&mut buf).ok()?;
     buf.truncate(info.buffer_size());
     // slidetool writes 8-bit RGBA; anything else we don't compare.

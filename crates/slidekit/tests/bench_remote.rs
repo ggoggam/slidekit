@@ -167,18 +167,18 @@ impl ObjectStore for CountingStore {
         self.bytes.fetch_add(span, Ordering::Relaxed);
         // SLIDEKIT_BENCH_TRACE=<KiB> logs every request at least that large —
         // how you find out *which* reads are responsible for the byte total.
-        if let Some(min_kib) = trace_threshold_kib() {
-            if span >= min_kib * 1024 {
-                eprintln!(
-                    "    GET {}..{} ({:.2} MB) {}",
-                    result.range.start,
-                    result.range.end,
-                    span as f64 / (1024.0 * 1024.0),
-                    location,
-                );
-                if std::env::var_os("SLIDEKIT_BENCH_BT").is_some() {
-                    eprintln!("{}", std::backtrace::Backtrace::force_capture());
-                }
+        if let Some(min_kib) = trace_threshold_kib()
+            && span >= min_kib * 1024
+        {
+            eprintln!(
+                "    GET {}..{} ({:.2} MB) {}",
+                result.range.start,
+                result.range.end,
+                span as f64 / (1024.0 * 1024.0),
+                location,
+            );
+            if std::env::var_os("SLIDEKIT_BENCH_BT").is_some() {
+                eprintln!("{}", std::backtrace::Backtrace::force_capture());
             }
         }
         Ok(result)

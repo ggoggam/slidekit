@@ -24,6 +24,7 @@ use std::sync::Arc;
 use crate::associated::AssociatedImage;
 use crate::decode::TileDecoder;
 use crate::decode::jpeg::JpegDecoder;
+use crate::decode::png::PngDecoder;
 use crate::decode::tiff::TiffLike;
 use crate::error::{OpenSlideError, Result};
 use crate::grid::simple::SimpleGrid;
@@ -303,15 +304,19 @@ fn open_mirax(fs: &Arc<dyn SlideFs>, dir: &str) -> Result<SlideData> {
     // Assemble levels.
     let mut levels = Vec::with_capacity(zoom_levels);
     for (j, (p, tiles)) in params.iter().zip(per_level_tiles).enumerate() {
-        if !sections[j].format.eq_ignore_ascii_case("JPEG") {
-            // ponytail: only JPEG tiles decode today. PNG/BMP levels are rare
-            // and need decoders we don't have yet; fail clearly rather than
-            // return black tiles.
+        // Each zoom level names its own tile codec in the INI. BMP levels are
+        // rare and still undecodable; fail clearly rather than return black
+        // tiles.
+        let format = sections[j].format.as_str();
+        let decoder: Box<dyn TileDecoder> = if format.eq_ignore_ascii_case("JPEG") {
+            Box::new(JpegDecoder::new())
+        } else if format.eq_ignore_ascii_case("PNG") {
+            Box::new(PngDecoder::new())
+        } else {
             return Err(OpenSlideError::Decode(format!(
-                "MIRAX level {j} image format {:?} unsupported (only JPEG)",
-                sections[j].format
+                "MIRAX level {j} image format {format:?} unsupported (only JPEG and PNG)"
             )));
-        }
+        };
         let advance_w = (p.advance_x.round() as i64).max(1);
         let advance_h = (p.advance_y.round() as i64).max(1);
         levels.push(LevelData {
@@ -324,7 +329,7 @@ fn open_mirax(fs: &Arc<dyn SlideFs>, dir: &str) -> Result<SlideData> {
             },
             grid: SimpleGrid::new(p.level_w, p.level_h, advance_w, advance_h),
             tiff_dir: 0,
-            decoder: Box::new(JpegDecoder::new()),
+            decoder,
             tiff_tile_width: sections[0].image_w,
             tiff_tile_height: sections[0].image_h,
             tilemap: None,
@@ -863,10 +868,10 @@ impl Ini {
             }
             if let Some(name) = line.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
                 sections.push((name.trim().to_string(), Vec::new()));
-            } else if let Some((k, v)) = line.split_once('=') {
-                if let Some((_, entries)) = sections.last_mut() {
-                    entries.push((k.trim().to_string(), v.trim().to_string()));
-                }
+            } else if let Some((k, v)) = line.split_once('=')
+                && let Some((_, entries)) = sections.last_mut()
+            {
+                entries.push((k.trim().to_string(), v.trim().to_string()));
             }
         }
         Self { sections }

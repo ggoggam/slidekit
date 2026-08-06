@@ -116,12 +116,49 @@ the known integer-vs-cairo subtile seam noted in `PROGRESS.md`; Ventana's 2.51
 mean is the largest and the one still worth a closer look, though inside
 tolerance.
 
+### Addendum, 2026-08-06 — the JPEG 2000 Aperio slides
+
+The two JP2K Aperio variants were outside the bench set above, because slidekit
+had no JPEG 2000 decoder when it was taken. They are in it now. Same machine,
+same region rule, `slidetool` 4.0.1, measured in one run together with the
+eleven slides above (whose figures moved only by run-to-run noise):
+
+| vendor | level 0 | sk_open | osl_open | sk_read | osl_read | osl_proc |
+|---|---|---|---|---|---|---|
+| Aperio/JP2K-33003-1 | 15374×17497 | 19.0 ms | 2.5 ms | 69.4 ms | 239.0 ms | 253.4 ms |
+| Aperio/CMU-1-JP2K-33005 | 46000×32893 | 20.1 ms | 3.4 ms | 28.9 ms | 281.4 ms | 296.8 ms |
+
+| vendor | mean diff | max diff | opaque overlap |
+|---|---|---|---|
+| Aperio/JP2K-33003-1 | 4.46 | 38 | 100% |
+| Aperio/CMU-1-JP2K-33005 | 3.41 | 33 | 100% |
+
+These are the largest pixel differences in the suite, and they are expected
+rather than a defect. Both slides are lossy 9/7 irreversible codestreams, and
+`hayro-jpeg2000` reconstructs them independently of OpenJPEG; two conforming
+decoders are entitled to disagree by a few counts. What rules out a colour bug
+is the *signed* difference, which is ~0 on every channel (R +0.16, G +0.02,
+B −0.15 on 33003) while the absolute mean is 3–5 — unbiased scatter, not a cast.
+
+33003 is the interesting one. Its chroma is subsampled 2:1 horizontally and its
+codestream flags no multi-component transform, so nothing inside the file says
+the components are YCbCr; only the private TIFF compression tag does. Decoded as
+if they were RGB, the region's mean chroma reads about 55 against `slidetool`'s
+33.2 — the failure looks like a plausible image, which is why
+`test_aperio.rs` asserts on that statistic and the bench compares pixels.
+
+Reads are the slowest in the table (69.4 ms and 28.9 ms against Aperio/CMU-1's
+18.8 ms): JPEG 2000 costs more than baseline JPEG, 33003 additionally pays a
+per-pixel YCbCr conversion, and `hayro-jpeg2000` is younger than
+`jpeg-decoder`. Both still finish inside OpenSlide's whole-process time.
+
 ## Part 2 — remote storage
 
 Same slides, same regions, read from the bucket over byte-range requests. Remote
 output is asserted **exactly** equal to local output: both paths run the same
 decoder over the same bytes, so any difference means the I/O layer misplaced
-data. All eleven vendors matched pixel-for-pixel.
+data. All eleven vendors matched pixel-for-pixel, as did the two JPEG 2000
+slides added later (see the addendum below).
 
 ### Latency
 
@@ -142,6 +179,25 @@ data. All eleven vendors matched pixel-for-pixel.
 Hamamatsu NDPI appears for the first time: the previous run had to exclude it
 because `NdpiLevel::ensure_start` walks a 198 MB single-strip JPEG hunting
 restart markers and had not finished after four minutes. It now opens in 7.0 s.
+
+The two JP2K Aperio slides were added to the bucket and the bench on
+2026-08-06, and behave like the rest — the codec is irrelevant to the I/O layer,
+which is the point:
+
+| vendor | local open | local read | remote open | remote read | warm read | pixels |
+|---|---|---|---|---|---|---|
+| Aperio/JP2K-33003-1 | 34.6 ms | 68.8 ms | 6.1 s | 1.0 s | 0.8 s | match |
+| Aperio/CMU-1-JP2K-33005 | 24.9 ms | 28.9 ms | 7.0 s | 0.8 s | 0.7 s | match |
+
+| vendor | open reqs | open MB | read reqs | read MB | slide MB | fetched % |
+|---|---|---|---|---|---|---|
+| Aperio/JP2K-33003-1 | 14 | 1.05 | 1 | 3.99 | 60.9 | 8.268% |
+| Aperio/CMU-1-JP2K-33005 | 16 | 1.19 | 1 | 2.87 | 126.4 | 3.211% |
+
+Remote pixels are byte-identical to local pixels on both, so the JPEG 2000
+decoder sees exactly the same bytes whether they came off disk or off S3.
+JP2K-33003-1's 8.3% is the highest non-DICOM share in the suite only because
+the slide is small (60.9 MB): the *bytes* fetched, 5 MB, are ordinary.
 
 ### Traffic — the actual result
 

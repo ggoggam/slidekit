@@ -7,9 +7,12 @@
 //! behind an empty filename + the `synthetic` debug flag, so it never triggers
 //! for real input.
 //!
-//! ponytail: this port includes only the items whose decoders exist here (JPEG,
-//! TIFF JPEG/LZW classic+Big, XML, Zstd). Add the bmp/png/j2k/dicom items when
-//! `decode/{bmp,png,jp2k,dicom}.rs` land.
+//! ponytail: this port carries the JPEG, TIFF JPEG/LZW classic+Big, XML and
+//! Zstd items. The png and j2k items are still to be ported — their decoders
+//! now exist (`decode/png.rs`, `decode/jp2k.rs`) and are covered by their own
+//! unit tests and by the real JP2K Aperio slides, so this is a gap in the
+//! self-test rather than in the decoders. The bmp and dicom items remain
+//! blocked on `decode/bmp.rs` and a synthetic DICOM instance.
 
 use crate::decode::TileDecoder;
 use crate::decode::jpeg::JpegDecoder;

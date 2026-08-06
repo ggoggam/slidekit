@@ -158,12 +158,12 @@ impl VendorDriver for VentanaDriver {
                 }
 
                 // All levels must share the level-0 tile size.
-                if let Some(first) = pending.first() {
-                    if first.tile_w != tile_w || first.tile_h != tile_h {
-                        return Err(OpenSlideError::Decode(
-                            "Inconsistent TIFF tile sizes".into(),
-                        ));
-                    }
+                if let Some(first) = pending.first()
+                    && (first.tile_w != tile_w || first.tile_h != tile_h)
+                {
+                    return Err(OpenSlideError::Decode(
+                        "Inconsistent TIFF tile sizes".into(),
+                    ));
                 }
 
                 pending.push(Pending {

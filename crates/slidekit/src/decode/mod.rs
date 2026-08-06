@@ -1,8 +1,11 @@
 pub mod deflate;
 pub mod dicom;
+pub mod jp2k;
 pub mod jpeg;
+pub mod jxl;
 pub mod lzw;
 pub mod packbits;
+pub mod png;
 pub mod tiff;
 pub mod xml;
 

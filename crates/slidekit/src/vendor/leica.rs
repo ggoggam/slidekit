@@ -253,18 +253,18 @@ impl VendorDriver for LeicaDriver {
                     best = Some((w, dir, h));
                 }
             }
-            if let Some((w, dir, h)) = best {
-                if let Ok(argb_data) = decode_associated_image(&mut tl, dir, w, h) {
-                    associated_images.push((
-                        "macro".to_string(),
-                        AssociatedImage {
-                            width: w,
-                            height: h,
-                            argb_data,
-                            icc_profile: IccProfile::absent(),
-                        },
-                    ));
-                }
+            if let Some((w, dir, h)) = best
+                && let Ok(argb_data) = decode_associated_image(&mut tl, dir, w, h)
+            {
+                associated_images.push((
+                    "macro".to_string(),
+                    AssociatedImage {
+                        width: w,
+                        height: h,
+                        argb_data,
+                        icc_profile: IccProfile::absent(),
+                    },
+                ));
             }
         }
 

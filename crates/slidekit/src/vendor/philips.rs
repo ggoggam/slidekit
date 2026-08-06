@@ -144,12 +144,12 @@ impl VendorDriver for PhilipsDriver {
                 let tile_h = tl.get_uint(dir, tags::TILE_LENGTH)? as i64;
 
                 // Levels must be stored largest-first.
-                if let Some(prev) = levels.last() {
-                    if image_w > prev.grid.image_w || image_h > prev.grid.image_h {
-                        return Err(OpenSlideError::Decode(format!(
-                            "Unexpected dimensions for directory {dir}"
-                        )));
-                    }
+                if let Some(prev) = levels.last()
+                    && (image_w > prev.grid.image_w || image_h > prev.grid.image_h)
+                {
+                    return Err(OpenSlideError::Decode(format!(
+                        "Unexpected dimensions for directory {dir}"
+                    )));
                 }
 
                 // Verifying the decoder doubles as the "codec configured?" check.

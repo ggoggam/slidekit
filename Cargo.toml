@@ -15,7 +15,9 @@ opt-level = 3
 version = "0.1.0"
 edition = "2024"
 license = "LGPL-2.1"
-rust-version = "1.85"
+# 1.92 is `hayro-jpeg2000`'s floor (the JPEG 2000 decoder); everything else
+# here builds on 1.85.
+rust-version = "1.92"
 
 [workspace.dependencies]
 thiserror = "2"
@@ -25,6 +27,12 @@ parking_lot = "0.12"
 quick-xml = "0.37"
 bytes = "1"
 jpeg-decoder = "0.3"
+# Image codecs are all pure Rust on purpose: slidekit ships as a plain crate
+# with no C toolchain, no system library and nothing for an end user to
+# install. See `decode/jp2k.rs` for why the transpiled-OpenJPEG crate lost.
+png = "0.18"
+hayro-jpeg2000 = { version = "0.4", default-features = false, features = ["std", "simd"] }
+jxl-oxide = { version = "0.12", default-features = false }
 weezl = "0.1"
 miniz_oxide = "0.8"
 ruzstd = "0.7"

@@ -367,12 +367,16 @@ pub fn first_dcm(dir: &Path) -> Option<PathBuf> {
 /// three agree on what "the bench set" is. The ZIP-packaged vendors use a bare
 /// `Vendor/Name` key that [`bench_slide`] resolves to the extracted files.
 ///
-/// The JP2K Aperio variants and the JXR CZI are omitted: slidekit has no
-/// JPEG-2000 or JPEG XR decoder, so there is nothing to time. Both DICOM
-/// slides are kept because they exercise different frame layouts
+/// The JXR CZI is omitted: slidekit has no JPEG XR decoder, so there is nothing
+/// to time. Both JP2K Aperio variants are included and are the *point* of the
+/// pixel cross-check — 33003 carries subsampled YCbCr that only the container
+/// identifies, so a wrong colour space shows up here and nowhere else. Both
+/// DICOM slides are kept because they exercise different frame layouts
 /// (`TILED_SPARSE` vs `TILED_FULL`) — exactly what a pixel cross-check catches.
 pub const BENCH_CASES: &[(&str, i32)] = &[
     ("Aperio/CMU-1.svs", 0),
+    ("Aperio/JP2K-33003-1.svs", 0),
+    ("Aperio/CMU-1-JP2K-33005.svs", 0),
     ("Hamamatsu/CMU-1.ndpi", 0),
     ("Leica/Leica-1.scn", 0),
     ("Philips-TIFF/Philips-4.tiff", 0),
@@ -488,10 +492,26 @@ pub fn bench_slide(case: &str) -> Option<BenchSlide> {
 /// Bench label for a case: the vendor alone, except for DICOM where two slides
 /// share a vendor and the slide name is what distinguishes them.
 fn vendor_label(case: &str) -> String {
-    match case.split('/').next().unwrap_or(case) {
-        "DICOM" => case.to_string(),
-        other => other.to_string(),
+    let vendor = case.split('/').next().unwrap_or(case);
+    if vendor == "DICOM" {
+        return case.to_string();
     }
+    // A vendor with one slide in the set is named by the vendor alone. Where
+    // several share it — the three Aperio codecs — the slide stem has to come
+    // along, or the results table and the `SLIDEKIT_BENCH_DUMP` filenames both
+    // collapse onto one row and silently overwrite each other.
+    let siblings = BENCH_CASES
+        .iter()
+        .filter(|(c, _)| c.split('/').next() == Some(vendor))
+        .count();
+    if siblings <= 1 {
+        return vendor.to_string();
+    }
+    let stem = Path::new(case)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or(case);
+    format!("{vendor}/{stem}")
 }
 
 // ───────────────────────── remote bench bucket ─────────────────────────────
