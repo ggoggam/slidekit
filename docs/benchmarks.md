@@ -1,5 +1,13 @@
 # Benchmark report
 
+> **A later, more thorough remote measurement supersedes Part 2 of this
+> document:** [remote-patch-benchmark.md](remote-patch-benchmark.md), measured
+> 2026-08-06, compares remote patches against OpenSlide *directly* (this report
+> only compared them against slidekit's own local reads), over ten patches per
+> slide at two localities rather than one window, and reports the per-patch
+> request count. It also resolves finding C below and adds one new finding about
+> Zeiss mosaic seams. The latency and pixel figures in Part 1 here still stand.
+
 Measured 2026-08-05 on the `slidekit/remote-bench` working tree. Two questions:
 
 1. How does slidekit compare to the reference OpenSlide C library, per vendor?
@@ -454,12 +462,16 @@ coalesce. They are batched and concurrent now (65.6 → 11.9 s), which is most o
 the available win; going further means either caching the resolved offsets or
 finding the metadata that makes the second pass unnecessary.
 
-### C. `bench_openslide` needs `mise` to be correct
+### C. `bench_openslide` needs `mise` to be correct — fixed 2026-08-06
 
-Run bare, `cargo test --test bench_openslide` finds Homebrew's `slidetool` 4.0.0
-on `PATH` instead of the 4.0.1 in `.tools`, which has no Zeiss driver and reports
-Zeiss as `n/a` with no indication that the wrong binary was used. The harness
-should assert the version it found rather than trusting `PATH`.
+Run bare, `cargo test --test bench_openslide` found Homebrew's `slidetool` 4.0.0
+on `PATH` instead of the 4.0.1 in `.tools`, which has no Zeiss driver and reported
+Zeiss as `n/a` with no indication that the wrong binary was used.
+
+Both benches now print the version *and the resolved binary path*, and warn
+loudly when it is not 4.0.1. See
+[remote-patch-benchmark.md](remote-patch-benchmark.md#d-the-reference-reader-was-unverified-now-fixed);
+the fix needed a second one, because `slidetool --version` writes to stderr.
 
 ## What these numbers do and don't show
 

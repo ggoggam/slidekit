@@ -12,6 +12,8 @@
 
 #![allow(dead_code)] // not every test binary uses every helper
 
+pub mod slidetool;
+
 use fs2::FileExt;
 use once_cell::sync::Lazy;
 use sha2::{Digest, Sha256};
@@ -613,23 +615,59 @@ pub fn remote_bucket() -> Option<RemoteBucket> {
 // ───────────────────────── tissue-region search ────────────────────────────
 
 /// Find the `w`×`h` window (at `level`, returned as level-0 top-left coords)
-/// that covers the most tissue, by scanning the coarsest pyramid level for
-/// non-white opaque pixels. Returns `None` if the overview can't be read, so
+/// that covers the most tissue. Returns `None` if the overview can't be read, so
 /// callers fall back to slide center.
 ///
 /// Both benches pick their compared region this way, and the remote bench
 /// reuses the coordinates the local pass computed — so remote timings measure
 /// the read, not a second tissue search.
-///
-/// Builds a summed-area table so the search is O(pixels) rather than
-/// O(pixels × window). The coarsest level is a small thumbnail on real
-/// pyramids, so memory and time are trivial.
 pub fn tissue_region(
     slide: &slidekit::OpenSlide,
     level: i32,
     w: i64,
     h: i64,
 ) -> Option<(i64, i64)> {
+    tissue_patches(slide, level, w, h, 1, 0.0)
+        .into_iter()
+        .next()
+}
+
+/// The `count` most tissue-dense `w`×`h` windows that are at least
+/// `min_separation` window-widths apart, densest first, as level-0 top-left
+/// coordinates.
+///
+/// `min_separation` is what makes this more than a repeat of [`tissue_region`].
+/// With 0 it returns the single best window and its immediate overlaps; with a
+/// few window-widths it returns windows scattered across the specimen, which is
+/// the access pattern that defeats read-ahead and tile caching — and therefore
+/// the honest upper bound on what a patch costs remotely.
+///
+/// Tissue is detected by scanning the coarsest pyramid level for opaque pixels
+/// that are dark or saturated (i.e. stained). A summed-area table makes the
+/// search O(pixels) rather than O(pixels × window); the coarsest level is a small
+/// thumbnail on real pyramids, so memory and time are trivial.
+pub fn tissue_patches(
+    slide: &slidekit::OpenSlide,
+    level: i32,
+    w: i64,
+    h: i64,
+    count: usize,
+    min_separation: f64,
+) -> Vec<(i64, i64)> {
+    let Some(patches) = tissue_patches_inner(slide, level, w, h, count, min_separation) else {
+        return Vec::new();
+    };
+    patches
+}
+
+fn tissue_patches_inner(
+    slide: &slidekit::OpenSlide,
+    level: i32,
+    w: i64,
+    h: i64,
+    count: usize,
+    min_separation: f64,
+) -> Option<Vec<(i64, i64)>> {
     let ov = slide.level_count() - 1;
     let (ow, oh) = slide.level_dimensions(ov)?;
     if ow <= 0 || oh <= 0 {
@@ -648,7 +686,14 @@ pub fn tissue_region(
             let (r, g, b, a) = ((p >> 16) & 0xff, (p >> 8) & 0xff, p & 0xff, p >> 24);
             let bright = r.max(g).max(b);
             let saturation = bright - r.min(g).min(b);
-            let tissue = (a & 0xff) == 0xff && (bright < 210 || saturation > 25);
+            // Opaque, not near-white, and **not near-black**. Excluding black is
+            // not cosmetic: several vendors surround the specimen with black
+            // padding in the coarse levels (Ventana's BIF overview, DICOM
+            // thumbnails), and counting it as stain sent the search to a corner of
+            // padding — those slides were then "compared" against OpenSlide over
+            // windows holding 1% specimen, which agrees trivially and proves
+            // nothing about tile placement.
+            let tissue = (a & 0xff) == 0xff && bright >= 25 && (bright < 210 || saturation > 25);
             let v = tissue as u32;
             sat[(y + 1) * stride + (x + 1)] =
                 v + sat[y * stride + (x + 1)] + sat[(y + 1) * stride + x] - sat[y * stride + x];
@@ -665,24 +710,160 @@ pub fn tissue_region(
             - sat[y * stride + x + bw]
             - sat[(y + bh) * stride + x]
     };
-    let (mut best, mut best_xy) = (0, (0usize, 0usize));
+
+    // Score every window position, then keep only the best one per grid cell of
+    // `min_separation` windows — cheap non-maximum suppression, so the result is
+    // spread over the specimen instead of being one hotspot's overlapping shifts.
+    let cell_w = ((win_w as f64 * min_separation) as usize).max(1);
+    let cell_h = ((win_h as f64 * min_separation) as usize).max(1);
+    let cells_x = ow.div_ceil(cell_w);
+    let mut best_per_cell: std::collections::HashMap<usize, (u32, (usize, usize))> =
+        std::collections::HashMap::new();
     for y in 0..=(oh - win_h) {
         for x in 0..=(ow - win_w) {
             let s = sum(x, y, win_w, win_h);
-            if s > best {
-                best = s;
-                best_xy = (x, y);
+            if s == 0 {
+                continue;
+            }
+            let cell = (y / cell_h) * cells_x + (x / cell_w);
+            let slot = best_per_cell.entry(cell).or_insert((0, (x, y)));
+            if s > slot.0 {
+                *slot = (s, (x, y));
             }
         }
     }
-    if best == 0 {
-        return None; // no tissue found — let caller use center
+    if best_per_cell.is_empty() {
+        return None; // no tissue found — let caller fall back
     }
+
+    let mut ranked: Vec<(u32, (usize, usize))> = best_per_cell.into_values().collect();
+    // Densest first; ties broken by scan order (row-major, so y before x) both to
+    // keep the set deterministic — a HashMap's iteration order is not — and to
+    // return the same window the earlier single-window search did, so figures
+    // recorded before this became a set stay comparable.
+    ranked.sort_by(|a, b| {
+        b.0.cmp(&a.0)
+            .then_with(|| (a.1.1, a.1.0).cmp(&(b.1.1, b.1.0)))
+    });
+
+    // Enforce the separation between the windows actually returned, not merely
+    // between cells: the densest cells are frequently neighbours, so taking the N
+    // densest can hand back a huddle.
+    //
+    // This is Chebyshev separation — far apart in *either* axis. It deliberately
+    // does not demand separation in both, which would be unsatisfiable on a wide,
+    // short slide (Zeiss is 50171×11340: at six window-widths there is only one
+    // distinct row of windows to choose from). The consequence is that a set can
+    // still land in one horizontal band, and on a format stored in rows rather
+    // than tiles — a single-strip NDPI — windows in one band share data. Where
+    // that happens the per-patch cost measured here is a lower bound.
+    let (sep_x, sep_y) = (
+        (win_w as f64 * min_separation) as usize,
+        (win_h as f64 * min_separation) as usize,
+    );
+    let mut chosen: Vec<(usize, usize)> = Vec::with_capacity(count);
+    for (_, (x, y)) in ranked {
+        if chosen.len() == count {
+            break;
+        }
+        let far_enough = chosen
+            .iter()
+            .all(|&(cx, cy)| x.abs_diff(cx) >= sep_x || y.abs_diff(cy) >= sep_y);
+        if far_enough {
+            chosen.push((x, y));
+        }
+    }
+
     // Overview top-left → level-0 coords (what read_region expects).
-    Some((
-        (best_xy.0 as f64 * ov_ds) as i64,
-        (best_xy.1 as f64 * ov_ds) as i64,
-    ))
+    Some(
+        chosen
+            .into_iter()
+            .map(|(x, y)| ((x as f64 * ov_ds) as i64, (y as f64 * ov_ds) as i64))
+            .collect(),
+    )
+}
+
+/// Top-left of a `w`×`h` window whose *neighbourhood* is tissue, for anchoring an
+/// adjacent patch set.
+///
+/// [`tissue_region`] returns the single densest window, which is frequently at the
+/// edge of the specimen — its neighbours are then background, and an adjacent set
+/// built around it has nothing to read. This scores a 3×3 block of windows
+/// instead and returns the middle one, so stepping one window in any direction
+/// still lands on specimen. Falls back to the plain densest window when no block
+/// qualifies (a slide with less than three windows of tissue in either axis).
+pub fn tissue_neighbourhood(
+    slide: &slidekit::OpenSlide,
+    level: i32,
+    w: i64,
+    h: i64,
+) -> Option<(i64, i64)> {
+    let ds = slide.level_downsample(level).unwrap_or(1.0);
+    match tissue_patches(slide, level, w * 3, h * 3, 1, 0.0)
+        .into_iter()
+        .next()
+    {
+        // The block's top-left is one window up and left of the window we want.
+        Some((bx, by)) => Some((bx + (w as f64 * ds) as i64, by + (h as f64 * ds) as i64)),
+        None => tissue_region(slide, level, w, h),
+    }
+}
+
+/// A set of `count` distinct `w`×`h` windows (level-0 top-left coords) starting
+/// at `primary` and stepping outwards by one window at a time.
+///
+/// One patch measures one code path through the tile grid; a real caller
+/// extracts many. Stepping by exactly one window width means consecutive patches
+/// touch disjoint tile columns, so a steady-state read cannot be served entirely
+/// from the tile cache the previous patch filled — which is what makes the
+/// per-patch request count meaningful rather than an artefact of caching.
+///
+/// Windows are clamped inside the level and de-duplicated, so a slide too small
+/// to hold `count` of them simply yields fewer.
+pub fn patch_grid(
+    slide: &slidekit::OpenSlide,
+    level: i32,
+    w: i64,
+    h: i64,
+    primary: (i64, i64),
+    count: usize,
+) -> Vec<(i64, i64)> {
+    let (lw, lh) = slide.level_dimensions(level).unwrap_or((0, 0));
+    let ds = slide.level_downsample(level).unwrap_or(1.0);
+    // Bounds and step are in level-0 coordinates, which is what read_region takes.
+    let max_x = (((lw - w).max(0)) as f64 * ds) as i64;
+    let max_y = (((lh - h).max(0)) as f64 * ds) as i64;
+    let (step_x, step_y) = ((w as f64 * ds) as i64, (h as f64 * ds) as i64);
+
+    // Ring around the primary window, nearest first: staying next to the densest
+    // tissue keeps every patch on something worth decoding.
+    const RING: &[(i64, i64)] = &[
+        (0, 0),
+        (1, 0),
+        (0, 1),
+        (1, 1),
+        (-1, 0),
+        (0, -1),
+        (-1, -1),
+        (2, 0),
+        (0, 2),
+    ];
+    let mut out = Vec::with_capacity(count);
+    for &(dx, dy) in RING {
+        if out.len() == count {
+            break;
+        }
+        let p = (
+            (primary.0 + dx * step_x).clamp(0, max_x),
+            (primary.1 + dy * step_y).clamp(0, max_y),
+        );
+        // Clamping can collapse two ring offsets onto the same window; a repeated
+        // window would read from cache and understate the per-patch cost.
+        if !out.contains(&p) {
+            out.push(p);
+        }
+    }
+    out
 }
 
 // ───────────────────────── synthetic fixtures ──────────────────────────────

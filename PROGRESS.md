@@ -240,21 +240,43 @@
       slide per vendor, with open/read latency separated on both sides (a
       measured process floor and a `prop list` run are subtracted so slidetool's
       startup tax is not charged to the library) and a tolerant pixel diff. All
-      11 cases pass: mean per-channel diff ≤ 0.17 except Ventana (2.51)
+      13 cases pass: mean per-channel diff ≤ 0.17 except Ventana (2.51) and the
+      two lossy JP2K Aperios (3.41 / 4.46). `SLIDEKIT_BENCH_WINDOW=x,y` re-reads
+      one specific window instead of searching for tissue and
+      `SLIDEKIT_BENCH_PROFILE=1` prints *where* inside it the readers part ways
+      (bounding box + a coarse heat map), which is what distinguishes decoder
+      noise from a misplaced tile
 - [x] `tests/bench_remote.rs` — the same slides read from an S3-compatible
-      bucket, counting requests/bytes per phase and asserting remote pixels
-      equal local pixels *exactly*. Byte accounting excludes zero-body HEAD
-      probes (`ObjectStoreExt::head` is `get_opts` with `head: true`, whose
-      response still reports the whole-object range — counting it made a lazy
-      open look like a full download)
+      bucket, counting requests/bytes per phase. Byte accounting excludes
+      zero-body HEAD probes (`ObjectStoreExt::head` is `get_opts` with
+      `head: true`, whose response still reports the whole-object range —
+      counting it made a lazy open look like a full download). It reads **ten
+      1024×1024 patches per slide**, five adjacent (a viewer panning, where
+      read-ahead helps) and five scattered ≥6 window-widths apart on tissue (a
+      tiling job, where it cannot), because locality decides the request count
+      and one patch cannot show both ends of it. Every patch is checked twice:
+      identical to the local read *exactly* (the I/O layer must not alter a
+      pixel) and against `slidetool` on the same window *tolerantly* — exact
+      agreement with our own local reader only proves the two are
+      self-consistent, and cannot catch a decode or geometry bug they share.
+      OpenSlide has no remote backend (it rejects `s3://` and `https://` as
+      unrecognized files), so it reads the local copy. `SLIDEKIT_BENCH_DUMP=<dir>`
+      writes all three images per patch (slidekit, OpenSlide, amplified difference)
+      plus `patches.csv` and an `index.html` contact sheet sorted
+      worst-disagreement-first — how the Zeiss seam finding was confirmed to be
+      fine detail inside the overlap rather than displaced tissue
 - [x] `tests/upload_testdata.rs` — mirrors the bench set into the bucket
       (multipart above 32 MiB, skips objects already present at the same size,
       never deletes). The ZIP-packaged vendors are uploaded **extracted**, which
       is what makes MIRAX and DICOM openable remotely at all
 - [x] Shared fixture resolution in `tests/common/mod.rs` (`BENCH_CASES`,
-      `bench_slide`, `extracted_slide_dir`, `tissue_region`) so the two benches
-      and the uploader agree on one slide set, and the ZIP vendors self-extract
-      instead of requiring their test binaries to have been run first
+      `bench_slide`, `extracted_slide_dir`, `tissue_region`, `tissue_patches`,
+      `patch_grid`) so the two benches and the uploader agree on one slide set,
+      and the ZIP vendors self-extract instead of requiring their test binaries
+      to have been run first
+- [x] `tests/common/slidetool.rs` — one implementation of driving OpenSlide and
+      comparing its pixels (process floor, `region read`, tolerant diff, the
+      disagreement profiler), shared by both benches instead of a copy in each
 
 ### Defects surfaced by the bench
 
@@ -348,10 +370,21 @@ Outstanding (see `docs/benchmarks.md` for the traces):
       megabytes apart in a 1 GB file with nothing to coalesce. Batched and
       concurrent now (65.6 → 11.9 s); going further means caching the resolved
       offsets or finding metadata that removes the second pass
-- [ ] **`bench_openslide` trusts `PATH`** — run outside `mise` it silently picks up
-      Homebrew's `slidetool` 4.0.0 instead of the 4.0.1 in `.tools`, which has no
-      Zeiss driver and reports Zeiss as `n/a` with no hint that the wrong binary
-      was used. It should assert the version it found
+- [x] **`bench_openslide` trusted `PATH`** — fixed. Both benches now print the
+      `slidetool` version *and the binary it resolved to*, and warn loudly when it
+      is not 4.0.1, so picking up Homebrew's 4.0.0 (no Zeiss driver) can no longer
+      pass as an equivalent run. Finding the bug needed a second fix: `slidetool
+      --version` writes to **stderr**, and reading only stdout made the harness
+      announce that slidetool was missing while it was in fact using it
+- [ ] **Zeiss disagrees with OpenSlide in mosaic overlap strips** — away from
+      subblock seams the two agree bit-for-bit on this uncompressed CZI (`0` diff),
+      but in the overlap bands they pick different tiles: a window straddling a seam
+      differs on 19–28% of its pixels, up to 143 per channel. slidekit composites in
+      subblock-directory order (last wins); OpenSlide draws through its tilemap grid.
+      Inside the bench's tolerance, but it is the largest structural disagreement in
+      the suite, and it is invisible to any single-window comparison — the densest
+      tissue window on this slide has zero difference. See
+      `docs/remote-patch-benchmark.md`
 
 ---
 

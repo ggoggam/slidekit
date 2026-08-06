@@ -25,17 +25,12 @@
 
 mod common;
 
+use common::slidetool::{self, MEAN_DIFF_CEILING, MIN_OPAQUE_FRAC, ms};
 use slidekit::OpenSlide;
-use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::path::PathBuf;
 use std::time::Instant;
 
 const REGION: i64 = 1024; // side length of the compared square
-const MEAN_DIFF_CEILING: f64 = 15.0; // per-channel; trips only on gross mismatch
-
-/// Below this both-opaque fraction there is no real overlap to compare, so the
-/// pixel diff is reported as `n/a` rather than as a passing 0.00.
-const MIN_OPAQUE_FRAC: f64 = 0.01;
 
 struct Row {
     vendor: String,
@@ -58,24 +53,34 @@ struct Row {
 #[test]
 #[ignore = "bench: assumes warm cache + optional openslide (slidetool) on PATH"]
 fn bench_vs_openslide() {
-    let have_slidetool = Command::new("slidetool")
-        .arg("--version")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false);
-    if !have_slidetool {
-        eprintln!("NOTE: `slidetool` not on PATH — reporting slidekit latency only.");
-    }
+    let have_slidetool = slidetool::available();
+    slidetool::report_version();
 
     // slidekit is timed in-process; slidetool can only be timed as a whole
     // process. Measure the bare process floor (`--version` does no slide work)
     // so the open/read columns can have it subtracted out — otherwise every
     // OpenSlide number carries a fixed startup tax that has nothing to do with
     // the library. Best-of-N: we want the floor, not the scheduler's noise.
-    let floor_ms = have_slidetool.then(process_floor_ms).flatten();
+    let floor_ms = have_slidetool.then(slidetool::process_floor_ms).flatten();
     if let Some(floor) = floor_ms {
         eprintln!("slidetool process floor: {floor:.1}ms (subtracted from osl_open)");
     }
+
+    // Re-read one specific window instead of searching for tissue:
+    //   SLIDEKIT_BENCH_WINDOW=42496,6784
+    // The remote bench's correctness table prints the level-0 top-left of the
+    // patch that disagrees with OpenSlide most, and this is how you go and look
+    // at it — with SLIDEKIT_BENCH_PROFILE=1 to see *where* inside the window the
+    // two readers part ways.
+    let forced_window: Option<(i64, i64)> =
+        std::env::var("SLIDEKIT_BENCH_WINDOW").ok().and_then(|v| {
+            let (x, y) = v.split_once(',')?;
+            Some((x.trim().parse().ok()?, y.trim().parse().ok()?))
+        });
+    if let Some((x, y)) = forced_window {
+        eprintln!("Reading the window at ({x},{y}) on every slide, not the densest tissue");
+    }
+    let profile = std::env::var_os("SLIDEKIT_BENCH_PROFILE").is_some();
 
     // Optional: dump each reader's region as a PNG for side-by-side inspection.
     //   SLIDEKIT_BENCH_DUMP=/tmp/cmp cargo test --test bench_openslide -- --ignored
@@ -110,11 +115,13 @@ fn bench_vs_openslide() {
         // Top-left of the compared window, in level-0 coords. Prefer a spot with
         // real tissue (many slides have blank centers); fall back to center.
         let ds = slide.level_downsample(level).unwrap_or(1.0);
-        let (x0, y0) = common::tissue_region(&slide, level, w, h).unwrap_or_else(|| {
-            (
-                (((lw - w) / 2) as f64 * ds) as i64,
-                (((lh - h) / 2) as f64 * ds) as i64,
-            )
+        let (x0, y0) = forced_window.unwrap_or_else(|| {
+            common::tissue_region(&slide, level, w, h).unwrap_or_else(|| {
+                (
+                    (((lw - w) / 2) as f64 * ds) as i64,
+                    (((lh - h) / 2) as f64 * ds) as i64,
+                )
+            })
         });
 
         let t = Instant::now();
@@ -129,13 +136,22 @@ fn bench_vs_openslide() {
 
         // ── openslide: one cold process, open+read+encode ──
         let (osl_ms, mean_diff, max_diff, opaque_frac) = if have_slidetool {
-            match run_slidetool(&path, x0, y0, level, w, h) {
+            match slidetool::region_read(&path, &slug, x0, y0, level, w, h) {
                 Some((osl_ms, rgba)) => {
-                    let (mean, max, frac) = diff(&sk, &rgba, (w * h) as usize);
-                    if let Some(dir) = dump_dir.as_deref() {
-                        dump_png(&dir.join(format!("{slug}_openslide.png")), &rgba, w, h);
+                    let d = slidetool::diff(&sk, &rgba, (w * h) as usize);
+                    if profile {
+                        eprintln!("  {vendor} at ({x0},{y0}):");
+                        slidetool::profile(&sk, &rgba, w, h, 8);
                     }
-                    (Some(osl_ms), Some(mean), Some(max), Some(frac))
+                    if let Some(dir) = dump_dir.as_deref() {
+                        slidetool::dump_png(
+                            &dir.join(format!("{slug}_openslide.png")),
+                            &rgba,
+                            w,
+                            h,
+                        );
+                    }
+                    (Some(osl_ms), Some(d.mean), Some(d.max), Some(d.opaque_frac))
                 }
                 None => (None, None, None, None),
             }
@@ -146,7 +162,7 @@ fn bench_vs_openslide() {
         // A second slidetool process that opens the slide but reads no region,
         // so `region read` minus this isolates the read from the open. Both
         // carry the same startup tax, which cancels in the subtraction.
-        let osl_props_ms = have_slidetool.then(|| run_slidetool_props(&path)).flatten();
+        let osl_props_ms = have_slidetool.then(|| slidetool::props_ms(&path)).flatten();
         let osl_open_ms = match (osl_props_ms, floor_ms) {
             // Clamp at zero: on a slide that opens in under a millisecond the
             // floor estimate can exceed the measurement.
@@ -160,9 +176,9 @@ fn bench_vs_openslide() {
 
         // Dump slidekit's region too, for side-by-side visual comparison.
         if let Some(dir) = dump_dir.as_deref() {
-            dump_png(
+            slidetool::dump_png(
                 &dir.join(format!("{slug}_slidekit.png")),
-                &argb_to_rgba(&sk),
+                &slidetool::argb_to_rgba(&sk),
                 w,
                 h,
             );
@@ -206,161 +222,6 @@ fn bench_vs_openslide() {
         !rows.is_empty(),
         "no slides available — warm the cache first"
     );
-}
-
-/// Pack slidekit's ARGB (0xAARRGGBB) into straight R,G,B,A bytes for PNG.
-fn argb_to_rgba(argb: &[u32]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(argb.len() * 4);
-    for &px in argb {
-        out.push((px >> 16) as u8); // R
-        out.push((px >> 8) as u8); // G
-        out.push(px as u8); // B
-        out.push((px >> 24) as u8); // A
-    }
-    out
-}
-
-/// Write 8-bit RGBA pixels to `path` as a PNG. Best-effort — a failure here
-/// only costs a debug artifact, so it warns rather than aborting the bench.
-fn dump_png(path: &Path, rgba: &[u8], w: i64, h: i64) {
-    let file = match std::fs::File::create(path) {
-        Ok(f) => f,
-        Err(e) => return eprintln!("WARN: cannot write {}: {e}", path.display()),
-    };
-    let mut enc = png::Encoder::new(std::io::BufWriter::new(file), w as u32, h as u32);
-    enc.set_color(png::ColorType::Rgba);
-    enc.set_depth(png::BitDepth::Eight);
-    if let Err(e) = enc
-        .write_header()
-        .and_then(|mut wr| wr.write_image_data(rgba))
-    {
-        eprintln!("WARN: cannot encode {}: {e}", path.display());
-    }
-}
-
-/// Wall time of the cheapest possible `slidetool` invocation — `--version` does
-/// no slide work, so this is the fork+exec+dynamic-link cost every other
-/// measurement inherits. Returns the minimum of several runs (the floor is what
-/// we want to subtract, not an average inflated by scheduling noise).
-fn process_floor_ms() -> Option<f64> {
-    let mut best: Option<f64> = None;
-    for _ in 0..5 {
-        let t = Instant::now();
-        let ok = Command::new("slidetool")
-            .arg("--version")
-            .output()
-            .is_ok_and(|o| o.status.success());
-        if !ok {
-            return None;
-        }
-        let elapsed = ms(t.elapsed());
-        best = Some(best.map_or(elapsed, |b: f64| b.min(elapsed)));
-    }
-    best
-}
-
-/// Wall time of `slidetool prop list` — a process that opens the slide and dumps
-/// its properties, but reads no pixels. Used as the open-side measurement.
-fn run_slidetool_props(path: &Path) -> Option<f64> {
-    let t = Instant::now();
-    let out = Command::new("slidetool")
-        .args(["prop", "list"])
-        .arg(path)
-        .output()
-        .ok()?;
-    out.status.success().then(|| ms(t.elapsed()))
-}
-
-fn run_slidetool(
-    path: &Path,
-    x: i64,
-    y: i64,
-    level: i32,
-    w: i64,
-    h: i64,
-) -> Option<(f64, Vec<u8>)> {
-    let out = std::env::temp_dir().join("slidekit_bench_osl.png");
-    let t = Instant::now();
-    let status = Command::new("slidetool")
-        .args(["region", "read"])
-        .arg(path)
-        .args([
-            x.to_string(),
-            y.to_string(),
-            level.to_string(),
-            w.to_string(),
-            h.to_string(),
-        ])
-        .arg(&out)
-        .status()
-        .ok()?;
-    let osl_ms = ms(t.elapsed());
-    if !status.success() {
-        eprintln!("slidetool failed on {path:?}");
-        return None;
-    }
-    let file = std::io::BufReader::new(std::fs::File::open(&out).ok()?);
-    let decoder = png::Decoder::new(file);
-    let mut reader = decoder.read_info().ok()?;
-    let mut buf = vec![0u8; reader.output_buffer_size()?];
-    let info = reader.next_frame(&mut buf).ok()?;
-    buf.truncate(info.buffer_size());
-    // slidetool writes 8-bit RGBA; anything else we don't compare.
-    if info.color_type != png::ColorType::Rgba || info.bit_depth != png::BitDepth::Eight {
-        eprintln!(
-            "unexpected PNG format from slidetool: {:?}/{:?}",
-            info.color_type, info.bit_depth
-        );
-        return None;
-    }
-    Some((osl_ms, buf))
-}
-
-/// Mean per-channel RGB diff and max single-channel diff over pixels that are
-/// opaque in BOTH readers, plus the fraction of pixels that qualified.
-/// `sk` is packed ARGB (0xAARRGGBB); `rgba` is straight bytes R,G,B,A.
-fn diff(sk: &[u32], rgba: &[u8], n: usize) -> (f64, u32, f64) {
-    let n = n.min(sk.len()).min(rgba.len() / 4);
-    let (mut sum, mut max, mut counted) = (0u64, 0u32, 0usize);
-    for i in 0..n {
-        let px = sk[i];
-        let (sr, sg, sb, sa) = (
-            (px >> 16) & 0xff,
-            (px >> 8) & 0xff,
-            px & 0xff,
-            (px >> 24) & 0xff,
-        );
-        let (or, og, ob, oa) = (
-            rgba[i * 4] as u32,
-            rgba[i * 4 + 1] as u32,
-            rgba[i * 4 + 2] as u32,
-            rgba[i * 4 + 3] as u32,
-        );
-        if sa != 0xff || oa != 0xff {
-            continue; // background / partial-cover pixel — not a decode comparison
-        }
-        for (a, b) in [(sr, or), (sg, og), (sb, ob)] {
-            let d = a.abs_diff(b);
-            sum += d as u64;
-            max = max.max(d);
-        }
-        counted += 1;
-    }
-    let mean = if counted == 0 {
-        0.0
-    } else {
-        sum as f64 / (counted * 3) as f64
-    };
-    let frac = if n == 0 {
-        0.0
-    } else {
-        counted as f64 / n as f64
-    };
-    (mean, max, frac)
-}
-
-fn ms(d: std::time::Duration) -> f64 {
-    d.as_secs_f64() * 1000.0
 }
 
 fn print_table(rows: &[Row]) {
