@@ -1,9 +1,13 @@
 # slidekit
 
-A pure-Rust implementation of [OpenSlide](https://openslide.org/) for reading
+A Rust implementation of [OpenSlide](https://openslide.org/) for reading
 whole-slide images (WSI) in digital pathology. Ground-up rewrite of the C
-library with 1:1 API parity, streaming/remote file support (S3, GCS, Azure,
-HTTP) without full download, and no C dependencies.
+library with 1:1 API parity, and streaming/remote file support (S3, GCS, Azure,
+HTTP) without full download.
+
+Every codec is pure Rust except JPEG 2000, which decodes through OpenJPEG so
+that it matches OpenSlide bit-for-bit; a pure-Rust build is still one feature
+flag away. See [Compression / decoders](#compression--decoders).
 
 ```rust
 use slidekit::OpenSlide;
@@ -71,30 +75,44 @@ the C API makes between `openslide_get_icc_profile_size` and
 | PackBits (TIFF) | ✅ | in-tree |
 | Zstd v0 / v1 (CZI) | ✅ | `ruzstd` (pure Rust) |
 | Uncompressed (CZI BGR/gray, DICOM RGB) | ✅ | in-tree |
-| JPEG 2000 | ✅ | `hayro-jpeg2000` (pure Rust) |
+| JPEG 2000 | ✅ | `openjpeg-sys` via `jpeg2k` (default) — or `hayro-jpeg2000` (pure Rust) with `--features hayro` |
 | JPEG XL | ✅ | `jxl-oxide` (pure Rust) — DICOM `…1.2.4.140`/`.141`/`.142`, TIFF 50002/52546 |
 | PNG | ✅ | `png` (pure Rust) |
 | JPEG XR (CZI) | ❌ | No pure-Rust decoder |
 | BMP | ❌ | Planned (rare MIRAX levels) |
 
-Every codec is pure Rust, and none of the codec crates has a build script. So
 `cargo add slidekit` is the whole install: there is no system package for a
-user to find, no `cmake`/`pkg-config` step, and nothing to go wrong when
-cross-compiling. `--no-default-features` resolves to a graph with **zero
-`-sys` crates**.
+user to find and no `cmake`/`pkg-config` step. Every codec but JPEG 2000 is pure
+Rust with no build script at all.
 
-The only C a *default* build compiles is `aws-lc-sys`, the TLS backend that
-`object_store` brings in for the optional `object-store` feature. It has
+### Why JPEG 2000 links C
+
+Because the pure-Rust option is measurably wrong on the slides that matter.
+OpenSlide decodes JPEG 2000 with OpenJPEG; `hayro-jpeg2000` 0.4 does not
+reproduce it on aggressively rate-controlled tiles, which is exactly what Aperio
+ships (Kakadu `Q=30`, ~1:27). Scored against the *original* image rather than
+against OpenSlide, OpenJPEG reaches 42.99 dB PSNR where `hayro` reaches
+34.97 dB — 8 dB of quality the encoder already paid for, discarded. With
+OpenJPEG both Aperio JP2K bench slides are bit-identical to OpenSlide, 0.00 mean
+and 0 max, at roughly +18% decode time on one of them and none on the other.
+The measurement is in [docs/benchmarks.md](docs/benchmarks.md).
+
+`openjpeg-sys` vendors the OpenJPEG C sources and builds them with `cc`: it
+needs a C compiler, but no cmake, no pkg-config and no system library. (The
+third option, `openjp2` — OpenJPEG machine-translated to Rust — exposes no
+in-memory stream constructor and hits undefined behaviour tearing down a tile on
+real Aperio slides.)
+
+For targets that cannot link C at all, `--no-default-features --features hayro`
+restores the pure-Rust decoder and its accuracy cost. Building with neither
+backend is a compile error rather than a silent fallback.
+
+The only other C a *default* build compiles is `aws-lc-sys`, the TLS backend
+that `object_store` brings in for the optional `object-store` feature. It has
 nothing to do with image decoding, and turning that feature off removes it —
 along with the Apple framework bindings (`core-foundation-sys`,
 `security-framework-sys`) the same TLS stack pulls in on macOS, which link
 against the OS rather than building anything.
-
-JPEG 2000 in particular chose `hayro-jpeg2000` over the two OpenJPEG routes.
-`openjpeg-sys` would have meant vendoring and statically linking C (a build
-dependency for every downstream consumer), and `openjp2` — OpenJPEG
-machine-translated to Rust — exposes no in-memory stream constructor and hits
-undefined behaviour tearing down a tile on real Aperio slides.
 
 ## I/O backends
 

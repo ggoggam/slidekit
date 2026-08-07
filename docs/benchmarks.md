@@ -124,6 +124,14 @@ the known integer-vs-cairo subtile seam noted in `PROGRESS.md`; Ventana's 2.51
 mean is the largest and the one still worth a closer look, though inside
 tolerance.
 
+**Ventana is now the only real outlier**, at 15× the next-largest decoder
+difference, since the two JPEG 2000 slides became bit-exact (see the
+[2026-08-07 addendum](#addendum-2026-08-07--the-jp2k-difference-was-a-decoder-defect)).
+It disagrees uniformly across the whole window — 3.559% of pixels by more than 8
+— which is a decoder signature rather than a placement one, and it is baseline
+JPEG through `jpeg-decoder`, so the JPEG 2000 work does not touch it. It has not
+been diagnosed.
+
 ### Addendum, 2026-08-06 — the JPEG 2000 Aperio slides
 
 The two JP2K Aperio variants were outside the bench set above, because slidekit
@@ -141,12 +149,13 @@ eleven slides above (whose figures moved only by run-to-run noise):
 | Aperio/JP2K-33003-1 | 4.46 | 38 | 100% |
 | Aperio/CMU-1-JP2K-33005 | 3.41 | 33 | 100% |
 
-These are the largest pixel differences in the suite, and they are expected
-rather than a defect. Both slides are lossy 9/7 irreversible codestreams, and
-`hayro-jpeg2000` reconstructs them independently of OpenJPEG; two conforming
-decoders are entitled to disagree by a few counts. What rules out a colour bug
-is the *signed* difference, which is ~0 on every channel (R +0.16, G +0.02,
-B −0.15 on 33003) while the absolute mean is 3–5 — unbiased scatter, not a cast.
+> **Superseded by the [2026-08-07 addendum](#addendum-2026-08-07--the-jp2k-difference-was-a-decoder-defect).**
+> This section originally argued the 3–5 mean difference was expected rather
+> than a defect, on the grounds that the *signed* difference is ~0 on every
+> channel (R +0.16, G +0.02, B −0.15 on 33003) while the absolute mean is 3–5 —
+> unbiased scatter, not a cast. The signed statistic does rule out a colour
+> cast, but it says nothing about accuracy: random error is unbiased too. It was
+> a decoder defect, and both slides are now bit-exact against OpenSlide.
 
 33003 is the interesting one. Its chroma is subsampled 2:1 horizontally and its
 codestream flags no multi-component transform, so nothing inside the file says
@@ -155,10 +164,68 @@ if they were RGB, the region's mean chroma reads about 55 against `slidetool`'s
 33.2 — the failure looks like a plausible image, which is why
 `test_aperio.rs` asserts on that statistic and the bench compares pixels.
 
-Reads are the slowest in the table (69.4 ms and 28.9 ms against Aperio/CMU-1's
-18.8 ms): JPEG 2000 costs more than baseline JPEG, 33003 additionally pays a
-per-pixel YCbCr conversion, and `hayro-jpeg2000` is younger than
-`jpeg-decoder`. Both still finish inside OpenSlide's whole-process time.
+### Addendum, 2026-08-07 — the JP2K difference was a decoder defect
+
+Both JPEG 2000 slides are now **bit-identical to OpenSlide**, 0.00 mean and 0
+max over the full 1024×1024 window, because slidekit decodes JPEG 2000 with
+OpenJPEG — the library OpenSlide itself uses — behind the default `openjpeg`
+feature. `hayro-jpeg2000` is still selectable as `--no-default-features
+--features hayro` for targets that cannot link C.
+
+| vendor | mean diff | max diff | pixels differing >8 |
+|---|---|---|---|
+| Aperio/JP2K-33003-1 | 4.46 → **0.00** | 38 → **0** | 33.759% → **0.000%** |
+| Aperio/CMU-1-JP2K-33005 | 3.41 → **0.00** | 33 → **0** | 11.402% → **0.000%** |
+
+**Everything slidekit does around the decoder was already correct.** Diffing an
+OpenSlide region against `opj_decompress` run on the tile bytes pulled straight
+out of the SVS gives 0.000/0 — so tile placement is right; and driving
+slidekit's own colour path (the fixed-point YCbCr tables, the 2:1 chroma
+replication) from OpenJPEG's components reproduces OpenSlide exactly on 33003.
+The entire 3–5 mean came from codestream reconstruction alone.
+
+**Why the pure-Rust decoder failed here.** Re-encoding one tile across a range
+of rates and decoding it both ways isolates the regime:
+
+| compression ratio | hayro vs OpenJPEG |
+|---|---|
+| 1:1 – 1:15 | 0.157 – 0.316 |
+| 1:25 | 2.567 |
+| 1:40 | 3.584 |
+
+Clean at high quality, wrong under aggressive rate control — the signature of
+mis-reconstructing *truncated* code-blocks, where the standard's midpoint rule
+adds half the undecoded remainder. Aperio ships Kakadu `Q=30`, about 1:27, so
+every Aperio JP2K tile sits in the broken zone.
+
+That is a real loss, not a difference of opinion between conforming decoders.
+Taking a real tile as ground truth, re-encoding it at 1:27 and scoring each
+decoder **against the original**:
+
+| decoder | mean abs error | PSNR |
+|---|---|---|
+| OpenJPEG | 0.529 | **42.99 dB** |
+| hayro-jpeg2000 0.4 | 3.469 | **34.97 dB** |
+
+The pure-Rust backend discards ~8 dB of quality the encoder had already paid
+for.
+
+**What it costs.** Reads, measured at a fixed window so the two backends see
+identical tiles (`SLIDEKIT_BENCH_WINDOW=29216,1488`, two runs each):
+
+| slide | hayro | OpenJPEG |
+|---|---|---|
+| Aperio/CMU-1-JP2K-33005 | 27.3 / 27.4 ms | 34.3 / 31.7 ms |
+
+About +5 ms, ~18%, on a region OpenSlide needs 292 ms of whole-process time for.
+33003 is unaffected — in an isolated 64-tile decode loop OpenJPEG is marginally
+*faster* there (1.558 vs 1.607 ms/tile) and slower on 33005 (1.055 vs 0.976),
+so the sign of the difference depends on the tile geometry. Open times are
+unchanged; no JPEG 2000 is decoded at open.
+
+Build cost is a C compiler. `openjpeg-sys` vendors the OpenJPEG sources and
+compiles them with `cc` — no cmake, no pkg-config, no system library, and
+nothing for an end user to install.
 
 ## Part 2 — remote storage
 

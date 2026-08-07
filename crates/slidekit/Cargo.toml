@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
-description = "Pure Rust implementation of OpenSlide for reading whole slide images"
+description = "Rust implementation of OpenSlide for reading whole slide images"
 
 [dependencies]
 thiserror.workspace = true
@@ -14,7 +14,8 @@ parking_lot.workspace = true
 bytes.workspace = true
 jpeg-decoder.workspace = true
 png.workspace = true
-hayro-jpeg2000.workspace = true
+jpeg2k = { workspace = true, optional = true }
+hayro-jpeg2000 = { workspace = true, optional = true }
 jxl-oxide.workspace = true
 weezl.workspace = true
 miniz_oxide.workspace = true
@@ -25,10 +26,21 @@ tokio = { workspace = true, optional = true }
 url = { workspace = true, optional = true }
 
 [features]
-default = ["object-store"]
+default = ["object-store", "openjpeg"]
 # Vendor-agnostic filesystem/blob backend (local, S3, GCS, Azure, HTTP)
 # via the Apache Arrow `object_store` crate.
 object-store = ["dep:object_store", "dep:tokio", "dep:url"]
+
+# --- JPEG 2000 backend: pick exactly one; `openjpeg` wins if both are on. ---
+#
+# `openjpeg` decodes bit-identically to OpenSlide, because it *is* the library
+# OpenSlide uses. It needs a C compiler (vendored sources, built by `cc`) but no
+# system library. `hayro` keeps the build pure Rust for targets that cannot link
+# C at all, at a measured cost in accuracy on Aperio slides — see
+# `decode/jp2k/mod.rs`. Building with neither is a compile error, not a silent
+# fallback.
+openjpeg = ["dep:jpeg2k"]
+hayro = ["dep:hayro-jpeg2000"]
 
 [dev-dependencies]
 serde = { version = "1", features = ["derive"] }

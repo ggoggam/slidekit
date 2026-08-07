@@ -217,9 +217,14 @@ fn cmu1_small_region() {
 /// this statistic far above what stained tissue produces.
 ///
 /// The ceiling below is measured, not guessed. Over the same tissue window,
-/// `slidetool` reports 33.2 on `JP2K-33003-1` and 21.5 on `CMU-1-JP2K-33005`,
-/// against slidekit's 32.2 and 21.0 — these are genuinely saturated H&E slides.
+/// `slidetool` reports 33.2 on `JP2K-33003-1` and 21.5 on `CMU-1-JP2K-33005`;
+/// slidekit reproduces both exactly, since the `openjpeg` backend decodes
+/// bit-identically to the C library. These are genuinely saturated H&E slides.
 /// A YCbCr-as-RGB misread of the same pixels measures upwards of 55.
+///
+/// The margin is deliberately wide rather than an equality check: this test
+/// must also pass on the pure-Rust `hayro` backend, which reconstructs the same
+/// tiles a few counts differently (see `decode/jp2k/mod.rs`).
 const MAX_MEAN_CHROMA: f64 = 45.0;
 
 fn mean_chroma(pixels: &[u32]) -> f64 {

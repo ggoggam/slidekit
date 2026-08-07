@@ -15,8 +15,10 @@ opt-level = 3
 version = "0.1.0"
 edition = "2024"
 license = "LGPL-2.1"
-# 1.92 is `hayro-jpeg2000`'s floor (the JPEG 2000 decoder); everything else
-# here builds on 1.85.
+# 1.92 is `hayro-jpeg2000`'s floor (the optional pure-Rust JPEG 2000 backend);
+# everything else here builds on 1.85. Kept at the higher figure because
+# `rust-version` is static and cannot follow a feature flag — lowering it would
+# turn `--features hayro` on an older toolchain into a confusing error.
 rust-version = "1.92"
 
 [workspace.dependencies]
@@ -27,10 +29,16 @@ parking_lot = "0.12"
 quick-xml = "0.37"
 bytes = "1"
 jpeg-decoder = "0.3"
-# Image codecs are all pure Rust on purpose: slidekit ships as a plain crate
-# with no C toolchain, no system library and nothing for an end user to
-# install. See `decode/jp2k.rs` for why the transpiled-OpenJPEG crate lost.
+# Every codec here is pure Rust except JPEG 2000, which is the one place where
+# that cost correctness rather than convenience. OpenSlide decodes JPEG 2000
+# with OpenJPEG, and the pure-Rust alternative does not reproduce it on
+# aggressively rate-controlled tiles — which is precisely what Aperio ships.
+# `openjpeg-sys` vendors the C sources and builds them with `cc`: a C compiler
+# is needed, but no cmake, no pkg-config and no system library. See
+# `decode/jp2k/mod.rs` for the measurement, and for why the *transpiled*
+# OpenJPEG crate lost to both.
 png = "0.18"
+jpeg2k = { version = "0.10", default-features = false, features = ["openjpeg-sys"] }
 hayro-jpeg2000 = { version = "0.4", default-features = false, features = ["std", "simd"] }
 jxl-oxide = { version = "0.12", default-features = false }
 weezl = "0.1"

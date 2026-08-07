@@ -1,10 +1,26 @@
 //! JPEG 2000 tile decoder.
 //!
-//! Backed by `hayro-jpeg2000`, a memory-safe pure-Rust JPEG 2000 decoder, so
-//! slidekit stays a single `cargo add` with no C toolchain or system library
-//! for a caller to install. (The transpiled-OpenJPEG crate `openjp2` was the
-//! alternative: it exposes no in-memory stream constructor, and its tile
-//! teardown path hits undefined behaviour on real Aperio tiles.)
+//! The codestream reconstruction itself comes from a swappable backend, chosen
+//! at compile time:
+//!
+//! - **`openjpeg`** (default) — the OpenJPEG C library, vendored and built by
+//!   `openjpeg-sys`, which is the same decoder OpenSlide links against. Tiles
+//!   decode *bit-identically* to the C library rather than merely close to it.
+//! - **`hayro`** — `hayro-jpeg2000`, a memory-safe pure-Rust decoder, for
+//!   builds that cannot run a C compiler (wasm) or will not link C at all.
+//!
+//! **`hayro` is not bit-exact on Aperio slides, and the gap is not rounding.**
+//! Aperio ships Kakadu-encoded tiles at `Q=30`, roughly 1:27, which truncates
+//! most code-blocks mid-bitplane. Reconstructing a truncated code-block needs
+//! the midpoint rule (add half of the undecoded remainder); `hayro-jpeg2000`
+//! 0.4 does not reproduce OpenJPEG there. Measured on a real Aperio tile
+//! re-encoded at 1:27 and compared against the *original* image, OpenJPEG
+//! lands at 42.99 dB PSNR and `hayro` at 34.97 dB — the pure-Rust backend
+//! discards about 8 dB of quality the encoder already paid for. Below roughly
+//! 1:15 the two agree to ~0.2 per channel, so the defect only bites on
+//! aggressively rate-controlled slides, which is exactly what Aperio ships.
+//! Decode speed is within 8% either way, so `openjpeg` costs nothing but the
+//! C toolchain.
 //!
 //! **Colorspace is not in the codestream.** Aperio stores JPEG 2000 tiles under
 //! two private TIFF compression tags that mean the same codestream syntax but
@@ -25,6 +41,32 @@ use crate::color::argb;
 use crate::error::{OpenSlideError, Result};
 
 use super::TileDecoder;
+
+#[cfg(feature = "openjpeg")]
+#[path = "openjpeg.rs"]
+mod backend;
+
+#[cfg(all(not(feature = "openjpeg"), feature = "hayro"))]
+#[path = "hayro.rs"]
+mod backend;
+
+#[cfg(all(not(feature = "openjpeg"), not(feature = "hayro")))]
+compile_error!(
+    "slidekit needs a JPEG 2000 backend: enable the `openjpeg` feature (default, \
+     bit-exact with OpenSlide) or `hayro` (pure Rust, not bit-exact on Aperio)"
+);
+
+/// One decoded component, at its own — possibly subsampled — size.
+///
+/// Backends normalise to this: samples already scaled to 0..=255, laid out
+/// `width` per row. `width`/`height` are the component's *own* dimensions, not
+/// the image's, which is what makes the subsampled-chroma case fall out of
+/// [`Plane`] indexing rather than needing a special case.
+pub(crate) struct Component {
+    pub samples: Vec<u8>,
+    pub width: usize,
+    pub height: usize,
+}
 
 /// How to read the three components a JPEG 2000 tile decodes to.
 ///
@@ -96,97 +138,53 @@ impl Jp2kDecoder {
     }
 }
 
-/// One decoded component, addressed in full-image pixel coordinates.
+/// A component addressed in full-image pixel coordinates.
 ///
-/// `hayro-jpeg2000` replicates a subsampled component up to the full image
-/// size before handing it back, so `sub_x`/`sub_y` are normally 1. They are
-/// carried anyway: the crate does not document that as a guarantee, and
-/// reading a half-width chroma plane at the full stride yields a plausible but
-/// wrong image rather than an error — the worst possible failure for a slide
-/// viewer. Deriving the divisor from the sample count keeps both layouts
-/// correct.
+/// The subsampling factor is derived from the component's own size against the
+/// image's, never from a declared value: reading a half-width chroma plane at
+/// the full stride yields a plausible but wrong image rather than an error —
+/// the worst possible failure for a slide viewer.
 struct Plane<'a> {
-    samples: &'a [f32],
+    samples: &'a [u8],
     stride: usize,
     sub_x: usize,
     sub_y: usize,
-    /// Multiplier that scales a sample to 0..=255.
-    scale: f32,
 }
 
 impl<'a> Plane<'a> {
-    fn new(samples: &'a [f32], bit_depth: u8, width: u32, height: u32, sub: (u8, u8)) -> Self {
+    fn new(comp: &'a Component, width: u32, height: u32) -> Self {
         let (w, h) = (width as usize, height as usize);
-        let (sub_x, sub_y) = if samples.len() >= w * h {
-            (1, 1)
-        } else {
-            (sub.0.max(1) as usize, sub.1.max(1) as usize)
-        };
-        let max = ((1u32 << bit_depth.clamp(1, 16)) - 1) as f32;
         Self {
-            samples,
-            stride: w.div_ceil(sub_x),
-            sub_x,
-            sub_y,
-            scale: if bit_depth == 8 { 1.0 } else { 255.0 / max },
+            samples: &comp.samples,
+            stride: comp.width.max(1),
+            sub_x: w.div_ceil(comp.width.max(1)).max(1),
+            sub_y: h.div_ceil(comp.height.max(1)).max(1),
         }
     }
 
-    /// The sample at full-image position (`row`, `col`), clamped to 0..=255.
+    /// The sample at full-image position (`row`, `col`).
     fn at(&self, row: usize, col: usize) -> u8 {
         let idx = (row / self.sub_y) * self.stride + (col / self.sub_x);
-        let v = self.samples.get(idx).copied().unwrap_or(0.0) * self.scale;
-        v.round().clamp(0.0, 255.0) as u8
+        self.samples.get(idx).copied().unwrap_or(0)
     }
 }
 
 impl TileDecoder for Jp2kDecoder {
     fn decode(&self, data: &[u8], width: u32, height: u32) -> Result<Vec<u32>> {
-        use hayro_jpeg2000::{DecodeSettings, DecoderContext, Image};
+        let (iw, ih, comps) = backend::decode(data)?;
 
-        let settings = DecodeSettings::default();
-        let image = Image::new(data, &settings)
-            .map_err(|e| OpenSlideError::Decode(format!("JPEG 2000 parse error: {e:?}")))?;
-
-        if image.width() != width || image.height() != height {
+        if iw != width || ih != height {
             return Err(OpenSlideError::Decode(format!(
-                "JPEG 2000 size mismatch: expected {}x{}, got {}x{}",
-                width,
-                height,
-                image.width(),
-                image.height()
+                "JPEG 2000 size mismatch: expected {width}x{height}, got {iw}x{ih}"
             )));
         }
-
-        let subsampling = codestream_subsampling(data);
-        let mut ctx = DecoderContext::default();
-        let decoded = image
-            .decode(&mut ctx)
-            .map_err(|e| OpenSlideError::Decode(format!("JPEG 2000 decode error: {e:?}")))?;
-        let comps = decoded.components();
-
-        let sub_of = |i: usize| -> (u8, u8) {
-            subsampling
-                .as_ref()
-                .and_then(|s| s.get(i).copied())
-                .unwrap_or((1, 1))
-        };
-        let plane = |i: usize| -> Plane<'_> {
-            Plane::new(
-                comps[i].samples(),
-                comps[i].bit_depth(),
-                width,
-                height,
-                sub_of(i),
-            )
-        };
 
         let (w, h) = (width as usize, height as usize);
         let mut out = Vec::with_capacity(w * h);
 
         match comps.len() {
             1 => {
-                let y = plane(0);
+                let y = Plane::new(&comps[0], width, height);
                 for row in 0..h {
                     for col in 0..w {
                         let g = y.at(row, col);
@@ -200,7 +198,9 @@ impl TileDecoder for Jp2kDecoder {
             // guessing wrong on alpha would blank the tile; a slide with one
             // is not a case that occurs in practice either way.
             3 | 4 => {
-                let (p0, p1, p2) = (plane(0), plane(1), plane(2));
+                let p0 = Plane::new(&comps[0], width, height);
+                let p1 = Plane::new(&comps[1], width, height);
+                let p2 = Plane::new(&comps[2], width, height);
                 match self.colorspace {
                     Jp2kColorSpace::Rgb => {
                         for row in 0..h {
@@ -244,37 +244,6 @@ impl TileDecoder for Jp2kDecoder {
 
         Ok(out)
     }
-}
-
-/// Per-component `(XRsiz, YRsiz)` subsampling factors from the codestream's SIZ
-/// marker, or `None` if the SIZ can't be found or is truncated.
-///
-/// Handles a JP2-boxed image as well as a bare codestream by scanning a bounded
-/// prefix for the SOC+SIZ marker pair rather than walking the box structure.
-fn codestream_subsampling(data: &[u8]) -> Option<Vec<(u8, u8)>> {
-    /// SOC followed by SIZ — the first four bytes of every codestream.
-    const SOC_SIZ: [u8; 4] = [0xFF, 0x4F, 0xFF, 0x51];
-    /// A JP2 header preceding the contiguous codestream box is far smaller.
-    const SCAN_LIMIT: usize = 4096;
-
-    let limit = data.len().min(SCAN_LIMIT);
-    let start = data[..limit]
-        .windows(4)
-        .position(|w| w == SOC_SIZ)
-        .map(|p| p + 2)?; // position of the SIZ marker itself
-
-    // SIZ: marker(2) Lsiz(2) Rsiz(2) Xsiz(4) Ysiz(4) XOsiz(4) YOsiz(4)
-    //      XTsiz(4) YTsiz(4) XTOsiz(4) YTOsiz(4) Csiz(2), then 3 bytes/component.
-    let csiz_at = start + 38;
-    let csiz = u16::from_be_bytes(data.get(csiz_at..csiz_at + 2)?.try_into().ok()?) as usize;
-    let comps_at = csiz_at + 2;
-
-    (0..csiz)
-        .map(|c| {
-            let o = comps_at + 3 * c;
-            Some((*data.get(o + 1)?, *data.get(o + 2)?))
-        })
-        .collect()
 }
 
 #[cfg(test)]
@@ -403,46 +372,29 @@ mod tests {
         }
     }
 
-    #[test]
-    fn siz_subsampling_reads_aperio_422_layout() {
-        // Minimal SIZ for a 256x256 3-component image with 2:1 horizontal
-        // chroma subsampling — the Aperio 33003 layout.
-        let mut d = vec![0xFF, 0x4F, 0xFF, 0x51];
-        d.extend_from_slice(&47u16.to_be_bytes()); // Lsiz
-        d.extend_from_slice(&0u16.to_be_bytes()); // Rsiz
-        for v in [256u32, 256, 0, 0, 256, 256, 0, 0] {
-            d.extend_from_slice(&v.to_be_bytes());
-        }
-        d.extend_from_slice(&3u16.to_be_bytes()); // Csiz
-        d.extend_from_slice(&[7, 1, 1, 7, 2, 1, 7, 2, 1]); // Ssiz, XRsiz, YRsiz
-
-        assert_eq!(
-            codestream_subsampling(&d),
-            Some(vec![(1, 1), (2, 1), (2, 1)])
-        );
-    }
-
-    #[test]
-    fn siz_subsampling_tolerates_garbage() {
-        assert_eq!(codestream_subsampling(&[]), None);
-        assert_eq!(codestream_subsampling(&[0u8; 64]), None);
-        // Truncated right after the marker pair.
-        assert_eq!(codestream_subsampling(&[0xFF, 0x4F, 0xFF, 0x51]), None);
-    }
-
-    /// A subsampled plane replicates across the missing columns; a
-    /// full-resolution plane is read straight through.
+    /// A half-width component replicates across the missing columns; a
+    /// full-resolution one is read straight through. This is the Aperio 33003
+    /// chroma layout, and reading it at the wrong stride is the failure that
+    /// looks like a plausible image.
     #[test]
     fn plane_indexing_handles_both_layouts() {
-        let half: Vec<f32> = (0..8).map(|v| v as f32).collect(); // 2 rows x 4 cols
-        let p = Plane::new(&half, 8, 8, 2, (2, 1));
-        assert_eq!(p.sub_x, 2);
+        let half = Component {
+            samples: (0..8).collect(), // 2 rows x 4 cols, for an 8x2 image
+            width: 4,
+            height: 2,
+        };
+        let p = Plane::new(&half, 8, 2);
+        assert_eq!((p.sub_x, p.sub_y), (2, 1));
         assert_eq!((p.at(0, 0), p.at(0, 1)), (0, 0));
         assert_eq!((p.at(0, 2), p.at(0, 3)), (1, 1));
         assert_eq!(p.at(1, 0), 4);
 
-        let full: Vec<f32> = (0..16).map(|v| v as f32).collect(); // 2 rows x 8 cols
-        let p = Plane::new(&full, 8, 8, 2, (2, 1));
+        let full = Component {
+            samples: (0..16).collect(), // 2 rows x 8 cols
+            width: 8,
+            height: 2,
+        };
+        let p = Plane::new(&full, 8, 2);
         assert_eq!(p.sub_x, 1, "a full-size plane must not be re-upsampled");
         assert_eq!((p.at(0, 0), p.at(0, 1)), (0, 1));
         assert_eq!(p.at(1, 0), 8);
