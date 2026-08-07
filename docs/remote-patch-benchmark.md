@@ -1,6 +1,6 @@
 # Remote patch extraction — are the patches right, what do they cost, and how many API calls?
 
-Measured 2026-08-06 at [`a52ed2f`](../PROGRESS.md). Three questions, in the order
+Measured 2026-08-06 at [`33a209e`](../PROGRESS.md). Three questions, in the order
 they matter:
 
 1. **Are the patches slidekit extracts from remote storage correct?** Yes — every
@@ -8,25 +8,40 @@ they matter:
    from local disk, and agrees with OpenSlide 4.0.1 within decoder tolerance.
    Structural disagreements at tile seams on three slides are real, and the
    clearest of them is characterised below.
-2. **What do they cost in latency?** A remote *open* costs 3.0–9.1 s and is
-   entirely round-trip-bound. A patch from an already-open slide costs 15 ms–3.2 s,
-   most often 0.5–1.0 s, against 5.7–64 ms from local disk.
-3. **How many API calls?** 10–27 GET requests to open a slide — no vendor is an
-   outlier any more — then **~2 requests per 1024×1024 patch**: 2.0 for spatially
-   adjacent patches, 2.2 for scattered ones.
+2. **What do they cost in latency?** A remote *open* costs 2.7–7.4 s and is
+   entirely round-trip-bound. A patch from an already-open slide costs 10 ms–4.6 s,
+   most often 0.4–1.1 s, against 5.8–58 ms from local disk.
+3. **How many API calls?** 10–27 GET requests to open a slide, then **under 2
+   requests per 1024×1024 patch**: 1.6 for spatially adjacent patches, 1.8 for
+   scattered ones. For the first time in this report no slide exceeds 3 requests
+   per patch at either locality.
 
-Since the previous run of this report, [`a52ed2f`](../PROGRESS.md) stopped resolving
-CZI subblock pixel offsets at open. That closed the one outlier in the whole
-suite: **Zeiss open fell from 151 requests, 9.59 MB and 11.6 s to 10 requests,
-6.60 MB and 4.9 s**, and its adjacent patch halved from 6337 ms to 3129 ms. What
-was [finding B](#b-zeiss-open-no-longer-costs-151-requests-fixed) is now a fixed
-defect rather than an outstanding one.
+Since the previous run, [`33a209e`](../PROGRESS.md) did two things to the read
+paths. It **batched the tile fetches** on MIRAX, Ventana and NDPI — the three paths
+that still issued one request per tile — and it **wired up a tile cache** that had
+been dead code with a public API attached.
 
-Nothing else changed by design, and the run bears that out: **every figure in the
-correctness table is identical to the previous run**, to the last decimal place, and
-so is every request and byte count outside Zeiss. The latencies all moved, because
-this session's endpoint was slower — see below. Where a number is quoted here that
-this run did not re-measure, it says so.
+The batching closed the last three per-patch outliers in the suite: **MIRAX fell
+from 4.2/6.4 requests per patch to 2.0/1.8, Ventana from 2.7/3.6 to 1.3/2.2, and
+Hamamatsu's cold patch from 8.0 s to 1.2 s**
+([finding E](#e-mirax-ventana-and-ndpi-now-batch-their-tile-fetches-fixed)). The
+cache is the more interesting result, because it is a negative one: it shaved a few
+percent off the bytes some patches move, and changed exactly one request count in
+the whole suite, by 0.2
+([finding F](#f-the-tile-cache-is-wired-and-barely-changes-request-counts)).
+
+**Every figure in the correctness table is identical to the previous run**, to the
+last decimal place, and so is every open request and byte count. That is the result
+worth taking from a run that touched six read paths and added a caching layer
+between the decoder and every one of them: the pixels did not move. The
+[Zeiss](#a-zeiss-disagrees-with-openslide-in-mosaic-overlap-strips) and
+[Mirax](#looking-at-the-patches) disagreement profiles were re-run by hand and
+reproduce to the pixel.
+
+One number went the wrong way and is reproducible: DICOM/Leica-4's cold patch,
+7.3 s against 3.9 s before, at an unchanged request count
+([finding G](#g-dicomleica-4s-cold-patch-got-slower)). Where a number quoted here
+was not re-measured this run, it says so.
 
 Everything below is the real output of `mise run bench:remote` and
 `mise run bench:openslide`; reproduce with the commands in
@@ -52,18 +67,21 @@ bucket:
 
 | min | median | max |
 |---|---|---|
-| 360 ms | **401 ms** | 875 ms |
+| 349 ms | **352 ms** | 690 ms |
 
-**Every remote figure in this report is a multiple of that 401 ms.** It is the
+**Every remote figure in this report is a multiple of that 352 ms.** It is the
 single most important number for reading the rest: it means the request *counts*
 are the portable result and the seconds are not. A same-region S3 endpoint at
-~20 ms per request would run the same request counts roughly 20× faster.
+~20 ms per request would run the same request counts roughly 18× faster.
 
-This session's endpoint was slower and noisier than the previous run's (which
-measured 355/**360**/565 ms), and the spread between its own min and max is wider
-than most of the differences between slides. Remote seconds below should therefore
-be read as "roughly this many round trips", never compared with each other at
-finer than a few hundred ms.
+This session's endpoint was faster than the previous run's (which measured
+360/**401**/875 ms) and close to the run before that (355/**360**/565 ms), but the
+spread between its own min and max is still wider than most of the differences
+between slides. **Every remote latency in this report therefore dropped for reasons
+that have nothing to do with the code**, and the only honest way to compare a second
+against the previous run is alongside its request count — which is why the findings
+below quote both. Remote seconds should be read as "roughly this many round trips",
+never compared with each other at finer than a few hundred ms.
 
 ## How this is measured
 
@@ -197,11 +215,13 @@ exactly what you are looking for.
 
 **In every one of the 120 patches, slidekit's image and OpenSlide's are visually
 indistinguishable.** No patch shows displaced, missing, duplicated or wrongly
-coloured tissue. (That inspection was done over the full dump on the previous run;
-this run re-dumped the 46 patches of the four slides in the table below, and every
-per-patch difference statistic in the suite is identical, so the images are too.) What the difference images do show is three distinct signatures,
-and they separate cleanly along the two statistics — which is why the table reports
-both a mean and a max rather than one number:
+coloured tissue. (That inspection was done over the full dump on an earlier run.
+This run wrote no dump: instead the two worst disagreement profiles — Zeiss and
+Mirax below — were re-run by hand and reproduce to the pixel, and every per-slide
+difference statistic in the suite is identical, so the images are too.) What the
+difference images do show is three distinct signatures, and they separate cleanly
+along the two statistics — which is why the table reports both a mean and a max
+rather than one number:
 
 | signature | looks like | worst example | mean | max |
 |---|---|---|---|---|
@@ -209,6 +229,10 @@ both a mean and a max rather than one number:
 | lossy codec | an even wash over the whole patch | Aperio/CMU-1-JP2K-33005 `scattered4` | 4.702 | 36 |
 | mosaic overlap | a band, fixed in slide coordinates | Zeiss `scattered2` | 1.354 | 109 |
 | subtile seam | one small box, sparse spikes inside it | Mirax `scattered1` | 0.228 | **142** |
+
+The four per-patch means in that table come from a `patches.csv` this run did not
+regenerate; the per-slide maxima they roll up to are re-measured and identical, and
+the two profiles quoted below reproduce exactly.
 
 **A high mean and a high max mean opposite things.** The JP2K slides have the
 highest means in the set — all 18 JP2K patches sit between 3.08 and 4.70 — and the
@@ -280,28 +304,35 @@ It is inside the bench's tolerance and it is not a data-corruption bug — but o
 slide with no codec, any difference is a decision one of the two readers is making
 differently, and 23% of a window is a lot of pixels to leave to whichever order the
 subblock directory happens to list. Resolving it means deciding which subblock CZI
-intends to win and matching that deliberately. [`a52ed2f`](../PROGRESS.md) touched
-this code to move offset resolution out of open and left the compositing order
-alone, deliberately: the pixel output is unchanged, which the correctness table
-confirms — every Zeiss figure is identical to the previous run.
+intends to win and matching that deliberately.
+
+Two commits have now touched this code without touching that decision.
+[`a52ed2f`](../PROGRESS.md) moved offset resolution out of open, and
+[`33a209e`](../PROGRESS.md) put a tile cache in front of the compositing loop —
+which is the riskier of the two here, because CZI subblocks overlap and the last one
+written wins, so a cached subblock has to occupy the slot it would have had. It
+does: every Zeiss figure in the correctness table is identical, and re-running the
+profile above at both windows reproduces it to the pixel. The disagreement with
+OpenSlide is unchanged because it was never a caching or offset question — it is
+the compositing order itself, still deliberately untouched.
 
 ## 2. Latency
 
 | vendor | level 0 | local open | local patch | remote open | cold patch | adjacent patch | scattered patch | OpenSlide process |
 |---|---|---|---|---|---|---|---|---|
-| Aperio/CMU-1 | 46000×32914 | 41.4 ms | 17.3 ms | 9.0 s | 1164 ms | 774 ms | 749 ms | 203 ms |
-| Aperio/JP2K-33003-1 | 15374×17497 | 19.8 ms | 64.0 ms | 6.3 s | 919 ms | 788 ms | 1668 ms | 233 ms |
-| Aperio/CMU-1-JP2K-33005 | 46000×32893 | 23.9 ms | 29.2 ms | 6.9 s | 1024 ms | 1030 ms | 728 ms | 262 ms |
-| Hamamatsu | 51200×38144 | 14.4 ms | 20.8 ms | 6.5 s | 7979 ms | 548 ms | 20 ms | 65 ms |
-| Leica | 53130×153470 | 51.2 ms | 12.9 ms | 6.3 s | 538 ms | 476 ms | 534 ms | 200 ms |
-| Philips-TIFF | 91136×68096 | 12.3 ms | 5.7 ms | **9.1 s** | 621 ms | 655 ms | 658 ms | 321 ms |
-| Generic-TIFF | 46000×32914 | 7.5 ms | 14.3 ms | 5.4 s | 869 ms | 671 ms | 871 ms | 186 ms |
-| Trestle | 40000×27712 | 8.8 ms | 13.0 ms | 4.4 s | 902 ms | 702 ms | 687 ms | 300 ms |
-| Mirax | 109240×220696 | 197.9 ms | 13.4 ms | 4.7 s | 3769 ms | 2199 ms | **3194 ms** | 314 ms |
-| Zeiss | 50171×11340 | 13.3 ms | 14.4 ms | 4.9 s | 3045 ms | 3129 ms | 1990 ms | 261 ms |
-| Ventana | 114942×76349 | 38.1 ms | 32.1 ms | 8.1 s | 2168 ms | 2223 ms | 2198 ms | 399 ms |
-| DICOM/Leica-4 | 23374×22079 | 50.4 ms | 15.1 ms | 8.1 s | 3945 ms | **15 ms** | — | 548 ms |
-| DICOM/Hamamatsu-2 | 30720×39168 | 38.3 ms | 11.1 ms | **3.0 s** | 496 ms | 472 ms | 499 ms | 319 ms |
+| Aperio/CMU-1 | 46000×32914 | 37.4 ms | 16.2 ms | 7.3 s | 1437 ms | 845 ms | 891 ms | 199 ms |
+| Aperio/JP2K-33003-1 | 15374×17497 | 25.9 ms | 57.8 ms | 5.1 s | 906 ms | 720 ms | 870 ms | 226 ms |
+| Aperio/CMU-1-JP2K-33005 | 46000×32893 | 18.6 ms | 27.2 ms | 5.8 s | 866 ms | 794 ms | 764 ms | 268 ms |
+| Hamamatsu | 51200×38144 | 5.7 ms | 20.3 ms | 5.2 s | 1248 ms | 626 ms | 1313 ms | 65 ms |
+| Leica | 53130×153470 | 48.6 ms | 12.4 ms | 6.0 s | 1023 ms | 406 ms | 732 ms | 196 ms |
+| Philips-TIFF | 91136×68096 | 7.4 ms | 5.8 ms | 7.0 s | 536 ms | 581 ms | 548 ms | 307 ms |
+| Generic-TIFF | 46000×32914 | 3.0 ms | 14.0 ms | 4.5 s | 1560 ms | 1092 ms | 976 ms | 182 ms |
+| Trestle | 40000×27712 | 1.6 ms | 12.2 ms | 3.9 s | 462 ms | 571 ms | 506 ms | 292 ms |
+| Mirax | 109240×220696 | 33.9 ms | 13.3 ms | 3.6 s | 590 ms | 468 ms | 517 ms | 277 ms |
+| Zeiss | 50171×11340 | 5.7 ms | 12.4 ms | 5.0 s | 5413 ms | **4595 ms** | 3781 ms | 260 ms |
+| Ventana | 114942×76349 | 30.6 ms | 32.5 ms | **7.4 s** | 651 ms | 732 ms | 804 ms | 367 ms |
+| DICOM/Leica-4 | 23374×22079 | 40.4 ms | 13.5 ms | 6.1 s | **7345 ms** | **10 ms** | — | 527 ms |
+| DICOM/Hamamatsu-2 | 30720×39168 | 29.8 ms | 10.6 ms | **2.7 s** | 472 ms | 441 ms | 494 ms | 307 ms |
 
 `local patch` is the median over every patch. `adjacent`/`scattered` are medians
 over those sets, from the already-open remote slide. `OpenSlide process` is the
@@ -309,30 +340,47 @@ fastest whole `slidetool region read` over the same windows on the local file �
 process startup + open + read + PNG encode, the only granularity the CLI offers.
 
 **Remote open is round-trip-bound, and that is the whole story.** Multiply each
-slide's open request count (next section) by the endpoint's 401 ms and you land
-just under its measured open time: Trestle's 10 requests → 4.0 s against 4.4 s
-measured, Philips-TIFF's 18 → 7.2 s against 9.1 s. Across the eleven single-file
-slides the measured open is 1.07–1.27× that product — a fully serialized
-round-trip chain, plus the time to actually move the bytes. Bytes are not the
-constraint; requests are.
+slide's open request count (next section) by the endpoint's 352 ms and you land
+just under its measured open time: Trestle's 10 requests → 3.5 s against 3.9 s
+measured, Philips-TIFF's 18 → 6.3 s against 7.0 s. Across ten of the eleven
+single-file slides the measured open is 1.02–1.22× that product — a fully
+serialized round-trip chain, plus the time to actually move the bytes. Bytes are
+not the constraint; requests are. The eleventh is Zeiss at 1.42×, and it is the
+exception that proves the rule: it is the one slide whose open moves enough bytes
+(6.60 MB) for the transfer to be a visible fraction of the total.
 
-**The two DICOM slides are the exception, and they show what concurrency buys.**
-DICOM/Hamamatsu-2 issues 19 requests, which at 401 ms serial would be 7.6 s, and
-opens in 3.0 s — the fastest open in the suite despite issuing more requests than
-eleven of the other twelve slides. DICOM/Leica-4's 27 requests predict 10.8 s and
-measure 8.1 s. A
-DICOM slide is a directory of instances that can be parsed independently, so its
-open overlaps requests instead of chaining them. Every other format's open is a
-dependency chain: a header says where the next header is.
+**The two DICOM slides are the other exception, and they show what concurrency
+buys.** DICOM/Hamamatsu-2 issues 19 requests, which at 352 ms serial would be
+6.7 s, and opens in 2.7 s — the fastest open in the suite despite issuing more
+requests than eleven of the other twelve slides. DICOM/Leica-4's 27 requests
+predict 9.5 s and measure 6.1 s. A DICOM slide is a directory of instances that can
+be parsed independently, so its open overlaps requests instead of chaining them.
+Every other format's open is a dependency chain: a header says where the next
+header is.
 
-**Two rows show what caching does rather than what the format costs.**
-DICOM/Leica-4's 15 ms adjacent patch is its memoized fragment walk being reused,
-after a 3.9 s cold patch paid for it. Hamamatsu's 20 ms scattered patch is the same
-effect: its NDPI level 0 is a single JPEG strip, its cold patch spent 8.0 s and 18
-requests scanning restart markers, and its scattered windows all fall in the band
-that scan already covered (see [the caveat](#what-these-numbers-do-and-dont-show)).
+**Hamamatsu's rows moved the most, and in the direction that matters.** Its cold
+patch fell from 7979 ms to 1248 ms and its 18-request restart-marker scan is gone:
+the NDPI path now confirms every marker it needs in one batched gather
+([finding E](#e-mirax-ventana-and-ndpi-now-batch-their-tile-fetches-fixed)). The
+previous run's headline oddity — a 20 ms scattered patch — disappeared with it,
+because that 20 ms was never the format's cost. It was the scattered windows
+free-riding on a scan the cold patch had already paid 8 s for. At 1313 ms and
+2.0 requests the scattered figure is now the real one, and it is *worse* on paper
+while the slide as a whole got much faster.
 
-**Local opens are 7.5–198 ms and local patches 5.7–64 ms, against 65–548 ms for
+**One row still shows caching rather than format cost.** DICOM/Leica-4's 10 ms
+adjacent patch is its memoized fragment walk being reused, after a cold patch paid
+7.3 s for it — and that cold patch is the one regression in this run
+([finding G](#g-dicomleica-4s-cold-patch-got-slower)).
+
+**Zeiss's patch latency is the noisiest number in the report and should not be read
+as a change.** It measured 4595 ms adjacent here against 3129 ms before, but its
+request count (2.0) and its bytes per patch (36 MB) are unchanged, and a repeat run
+of that slide alone gave 6004 ms adjacent with a *faster* cold patch (3134 ms). A
+row that moves ±40% between runs at a fixed request count and a fixed byte count is
+measuring the endpoint's throughput, not slidekit.
+
+**Local opens are 1.6–48.6 ms and local patches 5.8–58 ms, against 65–527 ms for
 OpenSlide's whole process** — but that gap is not a decode-speed claim.
 `slidetool` re-opens the slide and PNG-encodes the region on every invocation, and
 slidekit does neither. A like-for-like decode comparison needs in-process FFI,
@@ -342,27 +390,28 @@ which does not exist yet.
 
 | vendor | open reqs | open MB | adjacent req/patch | adjacent MB/patch | scattered req/patch | scattered MB/patch | slide MB | fetched % |
 |---|---|---|---|---|---|---|---|---|
-| Aperio/CMU-1 | 18 | 1.33 | 2.2 | 2.44 | 2.6 | 2.29 | 169.3 | 14.8% |
-| Aperio/JP2K-33003-1 | 14 | 1.05 | 2.8 | 2.00 | 1.0 | 3.99 | 60.9 | 41.5% |
+| Aperio/CMU-1 | 18 | 1.33 | 2.0 | 2.41 | 2.6 | 2.29 | 169.3 | 14.7% |
+| Aperio/JP2K-33003-1 | 14 | 1.05 | 2.8 | 1.75 | 1.0 | 3.99 | 60.9 | 39.9% |
 | Aperio/CMU-1-JP2K-33005 | 16 | 1.19 | 1.0 | 3.61 | 1.0 | 3.43 | 126.4 | 28.8% |
-| Hamamatsu | 14 | 1.49 | 3.0 | 1.09 | 1.2 | 0.40 | 188.9 | 5.9% |
+| Hamamatsu | 14 | 1.49 | 1.0 | 2.25 | 2.0 | 3.97 | 188.9 | 18.2% |
 | Leica | 14 | 2.33 | 2.5 | 0.40 | 3.0 | 0.65 | 278.3 | 2.8% |
 | Philips-TIFF | 18 | 1.24 | 1.0 | 0.51 | 1.0 | 0.64 | 277.5 | 2.5% |
 | Generic-TIFF | 12 | 0.70 | 1.5 | 3.21 | 2.6 | 2.29 | 194.7 | 15.0% |
 | Trestle | **10** | 0.62 | 1.0 | 0.55 | 1.0 | 0.49 | 158.9 | 3.7% |
-| Mirax | **10** | 1.24 | 4.2 | 0.44 | 6.4 | 0.89 | 538.9 | 1.6% |
-| Zeiss | **10** | **6.60** | 2.0 | **39.89** | 1.3 | **24.18** | 1004.9 | 26.6% |
-| Ventana | 18 | 2.99 | 2.7 | 0.97 | 3.6 | 1.49 | 2591.9 | **0.6%** |
+| Mirax | **10** | 1.24 | 2.0 | 0.72 | 1.8 | 0.74 | 538.9 | 1.7% |
+| Zeiss | **10** | **6.60** | 2.0 | **36.27** | 1.3 | **24.18** | 1004.9 | 25.2% |
+| Ventana | 18 | 2.99 | 1.3 | 1.23 | 2.2 | 1.96 | 2591.9 | **0.7%** |
 | DICOM/Leica-4 | **27** | 6.25 | 0.2 | 0.01 | — | — | 107.5 | 28.2% |
 | DICOM/Hamamatsu-2 | 19 | 1.32 | 2.0 | 0.29 | 2.2 | 0.36 | 197.8 | 2.4% |
 
-**Totals: 13 slides, 200 requests to open all of them; 2.0 requests per adjacent
-patch and 2.2 per scattered patch.**
+**Totals: 13 slides, 200 requests to open all of them; 1.6 requests per adjacent
+patch and 1.8 per scattered patch.**
 
 **Opening a slide costs 10–27 requests and 0.6–6.6 MB**, on files from 61 MB to
-2.6 GB, with no vendor outside that band — the first run of this report where that
-is true. Ventana is the clearest demonstration: 18 requests and 3.0 MB — 0.1% of
-the file — to open a **2.6 GB** slide.
+2.6 GB, with no vendor outside that band — every open request and byte count in this
+table is unchanged from the previous run, as expected from a commit that touched
+only the read paths. Ventana is the clearest demonstration: 18 requests and 3.0 MB
+— 0.1% of the file — to open a **2.6 GB** slide.
 
 The two most expensive opens are expensive in *bytes*, not requests, and for
 opposite reasons. Zeiss pulls 6.60 MB in 10 requests because a CZI's subblock
@@ -374,23 +423,29 @@ instances that must each be parsed, so the cost scales with instance count rathe
 than with slide size — it pays that on a 107 MB slide, the second smallest in the
 set, while a 2.6 GB Ventana opens for 3.0 MB.
 
-**A patch costs 1–3 requests on eleven of thirteen slides**, and that is the
-headline answer to "how many API calls under the hood". It is close to the floor: a
-1024×1024 level-0 patch spans 16–25 tiles of 256², so two requests means the tile
-ranges are being coalesced rather than fetched one at a time. Ventana reaches 3.6
-scattered, and Mirax is the outlier at 4.2 adjacent / 6.4 scattered because its
-subtiles are small and scattered through the file.
+**A patch costs 1–3 requests on all thirteen slides**, at both localities, and that
+is the headline answer to "how many API calls under the hood". It is close to the
+floor: a 1024×1024 level-0 patch spans 16–25 tiles of 256², so two requests means
+the tile ranges are being coalesced rather than fetched one at a time. This is the
+first run of this report with no outlier above the band — the widest rows are now
+Aperio/JP2K-33003-1 at 2.8 adjacent and Leica at 3.0 scattered, both of which were
+already there. MIRAX (4.2/6.4) and Ventana (2.7/3.6) came into the band in
+[`33a209e`](#e-mirax-ventana-and-ndpi-now-batch-their-tile-fetches-fixed).
 
-**Locality barely matters**: 2.0 requests per adjacent patch against 2.2 scattered,
+**Locality barely matters**: 1.6 requests per adjacent patch against 1.8 scattered,
 across the set. That is worth stating because it locates where the saving comes
-from — range coalescing *within* one region read, not cache hits *between* reads.
-A tiling job that never revisits a region pays essentially the same as a viewer
-panning across one.
+from — range coalescing *within* one region read, not reuse *between* reads. A
+tiling job that never revisits a region pays essentially the same as a viewer
+panning across one. That claim used to rest on the gap being small; it now rests on
+something stronger, because this run wired up a tile cache and measured the
+difference directly
+([finding F](#f-the-tile-cache-is-wired-and-barely-changes-request-counts)).
 
 ### B. Zeiss open no longer costs 151 requests (fixed)
 
-This was the one outstanding outlier in the previous run of this report, and
-[`a52ed2f`](../PROGRESS.md) closed it:
+This was the one outstanding outlier two runs ago, and [`a52ed2f`](../PROGRESS.md)
+closed it. The table below is that before/after, kept as recorded — it is not a
+re-measurement:
 
 | | before | after |
 |---|---|---|
@@ -399,6 +454,11 @@ This was the one outstanding outlier in the previous run of this report, and
 | open time | 11.6 s | **4.9 s** |
 | adjacent patch | 6337 ms | **3129 ms** |
 | adjacent requests/patch | 2.8 | **2.0** |
+
+Every one of those "after" figures still holds at [`33a209e`](../PROGRESS.md) except
+the adjacent patch time, which this run measured at 4595 ms and a repeat run at
+6004 ms, at an unchanged 2.0 requests and 36 MB per patch. Zeiss's per-patch seconds
+are throughput noise on this endpoint and nothing should be read into them.
 
 The CZI directory says where each subblock *is* but not where its pixels start, so
 resolving a subblock's pixel offset takes a 16-byte read of its own payload header.
@@ -419,9 +479,79 @@ it). Falling short costs one extra request and is still correct. So the patch go
 Two things did not improve, and both are inherent rather than deferred. Open still
 moves 6.60 MB — the largest in the suite in bytes — because the subblock directory
 of a full mosaic is genuinely that big, and it is now read as a few large
-sequential ranges rather than chased entry by entry. And a patch still moves 24–40
+sequential ranges rather than chased entry by entry. And a patch still moves 24–36
 MB ([finding C](#c-bytes-per-patch-are-read-ahead-blocks-not-tiles)), because CZI
 subblocks are large and uncompressed.
+
+### E. MIRAX, Ventana and NDPI now batch their tile fetches (fixed)
+
+The tiled-TIFF and DICOM read paths already resolved every tile's byte range first
+and issued one `read_ranges`, which the object-store backend coalesces into a
+handful of concurrent requests. Three paths did not: MIRAX, Ventana's tilemap and
+NDPI fetched one tile per positioned read. The previous run of this report measured
+them as the three worst rows in the suite, which is what prompted the fix.
+
+| | before | after |
+|---|---|---|
+| Mirax adjacent req/patch | 4.2 | **2.0** |
+| Mirax scattered req/patch | 6.4 | **1.8** |
+| Mirax adjacent patch | 2199 ms | **468 ms** |
+| Mirax scattered patch | 3194 ms | **517 ms** |
+| Ventana adjacent req/patch | 2.7 | **1.3** |
+| Ventana scattered req/patch | 3.6 | **2.2** |
+| Ventana cold patch | 2168 ms | **651 ms** |
+| Hamamatsu adjacent req/patch | 3.0 | **1.0** |
+| Hamamatsu cold patch | 7979 ms | **1248 ms** |
+
+The seconds in that table flatter the fix, because this run's endpoint was 12%
+faster per request; the request counts do not, and they moved by 2–3.5×. Mirax's
+scattered patch is the clearest single result in this run — **6.4 requests to 1.8**,
+on the slide the previous report singled out as "the outlier … because its subtiles
+are small and scattered through the file". They still are. They are now asked for
+together.
+
+Hamamatsu is the one to read carefully, because two of its numbers got *worse* and
+the slide got much better. Its NDPI level 0 is a single JPEG strip, and the old cold
+patch spent 8.0 s and 18 requests scanning restart markers to find tile boundaries;
+the path now confirms every marker it needs in one gather. Bytes per patch rose
+(adjacent 1.09 → 2.25 MB, scattered 0.40 → 3.97 MB) and `fetched%` tripled to 18.2%,
+because the scattered patches used to ride on data the scan had already pulled
+rather than fetching their own. Trading 3.5 MB per patch for 6.7 s of cold latency
+is the right trade at 352 ms a request, and would still be right at 20 ms.
+
+### F. The tile cache is wired, and barely changes request counts
+
+`Cache` was dead code with a public API attached — `get`/`insert` had zero call
+sites, so every `read_region` re-fetched and re-decoded tiles it had decoded moments
+earlier. [`33a209e`](../PROGRESS.md) wired it into all six read paths, with a 32 MB
+default budget, which means this run measured it live for the first time.
+
+It is worth reporting that it changed almost nothing, because the expectation going
+in was that it would. Isolating the effect is possible because the batching in
+[finding E](#e-mirax-ventana-and-ndpi-now-batch-their-tile-fetches-fixed) touched
+only three paths: on the other ten slides, the cache is the *only* thing that
+changed. Nine of the ten report request counts identical to the previous run at both
+localities — Aperio/JP2K-33003-1 2.8/1.0, Aperio/CMU-1-JP2K-33005 1.0/1.0, Leica
+2.5/3.0, Philips-TIFF 1.0/1.0, Generic-TIFF 1.5/2.6, Trestle 1.0/1.0, Zeiss 2.0/1.3,
+DICOM/Leica-4 0.2/—, DICOM/Hamamatsu-2 2.0/2.2. The tenth, Aperio/CMU-1, moved from
+2.2 to 2.0 adjacent. **That 0.2 is the entire measured effect of the tile cache on
+request count across the suite.**
+
+The reason is geometry, and it is the same reason locality barely matters at all.
+The adjacent windows in this bench *abut* rather than overlap — they are offset by
+exactly one patch width — so consecutive patches share only the single row or
+column of tiles that straddles their shared edge, about 5 of 25. Coalescing had
+already merged those into the same range as their neighbours, so removing them from
+the fetch does not remove a request. Bytes tell the same story from the other side:
+Aperio/JP2K-33003-1's adjacent MB/patch fell 2.00 → 1.75 and Zeiss's 39.89 → 36.27,
+a real saving in transfer with no saving in round trips. Tracing the large GETs on
+JP2K-33003-1 shows exactly one range shrinking, from 4.06 MB to 3.07 MB.
+
+None of that makes the cache useless — it eliminates re-*decode*, which the local
+columns are where you would look for, and this report does not isolate. But **the
+claim it was wired to support, that reuse between reads would cut remote requests,
+is not supported by this measurement.** A viewer that revisits a region at the same
+level would benefit; the two localities this bench measures never revisit one.
 
 ### C. Bytes per patch are read-ahead blocks, not tiles
 
@@ -433,7 +563,7 @@ large GET:
 ```
 GET 39814949..44334058 (4.31 MB)
 GET 39927237..43263293 (3.18 MB)
-GET 35649138..39901641 (4.06 MB)
+GET 35649138..38871302 (3.07 MB)
 GET 32139954..36322269 (3.99 MB)
 GET 25008995..28917577 (3.73 MB)
 GET  7417643..11866112 (4.24 MB)
@@ -445,21 +575,55 @@ under 1 MB: **over 4× more bytes cross the wire than the patch needs**. The blo
 doubles on sequential access, and a multi-tile region read looks sequential.
 
 At *this* endpoint the trade is about break-even: 4 MB costs ~110–330 ms at the
-12–36 MB/s observed in the previous run (throughput was not re-measured this time),
-against ~401 ms for each request saved. On a low-latency endpoint it is clearly the
+12–36 MB/s observed in an earlier run (throughput was not re-measured this time),
+against ~352 ms for each request saved. On a low-latency endpoint it is clearly the
 wrong side — a same-region S3 at ~20 ms per request would rather issue four small
 GETs than move 4 MB. **The block growth should be bounded by what the read actually
 asked for**, or exposed as a knob, before this is pointed at low-latency
-infrastructure. Nothing in `a52ed2f` touched the read-ahead layer, and the per-patch
-byte columns are unchanged from the previous run to two decimal places, so this
-finding stands exactly as it did.
+infrastructure.
 
-Zeiss's 24–40 MB per patch is a different and mostly inherent cost: its subblocks
+Nothing in `33a209e` touched the read-ahead layer, and five of the six traced GETs
+above are byte-identical to the previous run's, so this finding stands. The
+per-patch byte columns are no longer unchanged, though: the tile cache trimmed the
+third range from 4.06 MB to 3.07 MB, and shaved a few percent off the adjacent
+MB/patch on several slides
+([finding F](#f-the-tile-cache-is-wired-and-barely-changes-request-counts)). That is
+a saving of the wrong magnitude to matter here — the block is still at its 4 MiB
+ceiling, and still over 4× what the patch asked for.
+
+Zeiss's 24–36 MB per patch is a different and mostly inherent cost: its subblocks
 are large and uncompressed, so a 1024×1024 window genuinely straddles tens of MB
 of pixel data. `fetched %` for Zeiss, the JP2K Aperios and DICOM/Leica-4 is
 correspondingly high — but note that column now covers an open *plus up to ten
 patches*, so it is not comparable with the single-patch figures in
 [benchmarks.md](benchmarks.md#traffic--the-actual-result).
+
+### G. DICOM/Leica-4's cold patch got slower
+
+One number in this run went the wrong way, and it reproduces:
+
+| | previous run | this run | repeat run |
+|---|---|---|---|
+| cold patch | 3945 ms | **7345 ms** | 7010 ms |
+| open requests | 27 | 27 | 27 |
+| cold-patch requests | — | 6 | 6 |
+| adjacent patch | 15 ms | 10 ms | 11 ms |
+
+The request count is unchanged and the endpoint was *faster* this run, so this is
+not explained by anything the rest of this report explains. Six requests at 352 ms
+is 2.1 s; the other ~5 s is not round trips. That points at the fragment walk
+`locate_tile` performs to find a frame inside a DICOM concatenation — the expensive
+half of a cold patch on this format, and the half [`33a209e`](../PROGRESS.md) put a
+cache in front of. A cache cannot help a cold patch by definition, so the plausible
+readings are that the walk itself got more expensive, or that per-tile cache
+insertion costs something on a format whose frames are large enough to churn a 32 MB
+budget. This report does not distinguish them: it measures one slide, once per run,
+with no profiler on the local path.
+
+It is worth keeping in proportion. The cost is paid once per slide per session, the
+adjacent patch that follows it is 10 ms, and DICOM/Leica-4 is the second-smallest
+slide in the set. But it is a 1.9× regression on a path that was measured before and
+after, and it should be profiled rather than left in a table.
 
 ### D. The reference reader was unverified (now fixed)
 
@@ -485,11 +649,14 @@ columns were visibly populated from the same binary.
   localised tile seams.
 - Opening a slide from object storage costs 10–27 requests and 0.6–6.6 MB, with no
   vendor outside that band, including 18 requests for a 2.6 GB Ventana.
-- A 1024×1024 patch costs ~2 requests once the slide is open, and locality changes
-  that by ~10%.
-- Remote latency is request-count × per-request cost, at this endpoint 401 ms. Every
-  single-file format's open is a serial chain of round trips (measured open is
-  1.07–1.27× count × 401 ms); the two DICOM directories overlap theirs.
+- A 1024×1024 patch costs 1–3 requests once the slide is open — 1.6 adjacent and 1.8
+  scattered across the set — on all thirteen slides at both localities.
+- Remote latency is request-count × per-request cost, at this endpoint 352 ms. Ten of
+  the eleven single-file formats open in a serial chain of round trips (measured open
+  is 1.02–1.22× count × 352 ms); Zeiss at 1.42× moves enough bytes for transfer to
+  show; the two DICOM directories overlap theirs and beat the serial prediction.
+- Batching the MIRAX, Ventana and NDPI tile fetches cut their per-patch request
+  counts by 2–3.5×, measured before and after at a fixed window set.
 
 **Not supported:**
 
@@ -502,21 +669,32 @@ columns were visibly populated from the same binary.
   minimise request counts and validated on that axis only, never swept. Transfer
   throughput was not re-measured this run, so the break-even estimate there is
   carried over.
+- **That the tile cache helps remote reads.** It measurably does not, on either
+  locality this bench uses ([finding F](#f-the-tile-cache-is-wired-and-barely-changes-request-counts)).
+  Its value is in avoiding re-decode and in access patterns that revisit a region,
+  neither of which this report measures.
+- **Why DICOM/Leica-4's cold patch nearly doubled** ([finding G](#g-dicomleica-4s-cold-patch-got-slower)).
+  Reproducible, unexplained, and not attributable to request count.
 - **Hamamatsu's per-patch cost as a worst case.** Its scattered windows all land in
-  one horizontal band (the densest tissue on that slide sits there), and NDPI
-  stores level 0 as one JPEG strip, so those patches reuse the restart-marker scan
-  the cold patch paid for. Its 0.2–1.2 requests per patch is a lower bound. The
+  one horizontal band, because the densest tissue on that slide sits there. The
   scattered selection enforces Chebyshev separation, which cannot demand separation
   in both axes — on a wide, short slide like Zeiss (50171×11340) there is only one
-  row of windows to choose from at six window-widths.
+  row of windows to choose from at six window-widths. (The stronger version of this
+  caveat in the previous run — that Hamamatsu's scattered patches free-rode on the
+  cold patch's restart-marker scan, making its figures a lower bound — no longer
+  applies: that scan is gone, and its scattered patches now fetch their own bytes at
+  2.0 requests and 3.97 MB each.)
 - **DICOM/Leica-4's scattered locality**, which is unmeasured: no candidate window
   outside the primary neighbourhood held 10% specimen.
 - **Single-shot timings throughout.** Medians over 5 patches per locality, but no
   repetitions of the same read, no variance, no confidence intervals. This run's
-  endpoint alone varied 360–875 ms per request, so remote differences smaller than
-  ~500 ms — and local ones smaller than a few tens of ms — are noise. Comparing this
-  run's seconds against the previous run's is only meaningful where the request
-  count also moved, which is why finding B quotes both.
+  endpoint alone varied 349–690 ms per request, so remote differences smaller than
+  ~350 ms — and local ones smaller than a few tens of ms — are noise. Zeiss's
+  adjacent patch moved 4595 → 6004 ms between two runs of this suite at an identical
+  request and byte count, which is the scale of variance to assume on the
+  byte-heavy rows. Comparing this run's seconds against the previous run's is only
+  meaningful where the request count also moved, which is why findings B, E and G
+  quote both.
 - **Anything about JPEG XR CZI or Sakura**, which slidekit cannot read (matching
   OpenSlide for JXR) or has no public fixture.
 
@@ -528,7 +706,7 @@ mise run bench:warm-cache        # download + verify fixtures (~6.8 GB, once)
 mise run bench:upload-slides     # mirror the slide set into the bucket (once)
 
 mise run bench:openslide         # local slidekit vs OpenSlide (~3 s)
-mise run bench:remote            # this report (279 s, 13 slides × 10 patches)
+mise run bench:remote            # this report (239 s, 13 slides × 10 patches)
 ```
 
 Run them **through `mise`**, which puts `.tools/openslide/bin` first on `PATH` and
