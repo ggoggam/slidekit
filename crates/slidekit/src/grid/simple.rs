@@ -12,10 +12,25 @@ pub struct SimpleGrid {
     pub image_w: i64,
     /// Image height in pixels.
     pub image_h: i64,
-    /// Tile width in pixels.
+    /// Horizontal distance between the origins of adjacent tiles.
+    ///
+    /// For a non-overlapping grid this is the tile width. For an overlapping
+    /// one (Trestle, MIRAX) it is the *advance*, `tile_width - overlap`, and
+    /// [`span_w`](Self::span_w) carries the real tile width.
     pub tile_w: i64,
-    /// Tile height in pixels.
+    /// Vertical distance between the origins of adjacent tiles. See
+    /// [`tile_w`](Self::tile_w).
     pub tile_h: i64,
+    /// Real decoded tile width, which is `tile_w` unless tiles overlap.
+    ///
+    /// The tile count depends on both: `n` tiles reach
+    /// `(n - 1) * tile_w + span_w`, not `n * tile_w`. Deriving the count from
+    /// the advance alone overcounts an overlapping grid by a column, and the
+    /// phantom column indexes a tile the file does not have — see
+    /// [`tiles_across`](Self::tiles_across).
+    pub span_w: i64,
+    /// Real decoded tile height. See [`span_w`](Self::span_w).
+    pub span_h: i64,
     /// Where tile `(0, 0)` sits in the *level's* pixel space.
     ///
     /// Usually `(0, 0)`: the image and the level are the same thing. Leica SCN
@@ -36,9 +51,23 @@ impl SimpleGrid {
             image_h,
             tile_w,
             tile_h,
+            span_w: tile_w,
+            span_h: tile_h,
             origin_x: 0,
             origin_y: 0,
         }
+    }
+
+    /// Declare that the decoded tiles are larger than the grid advance, i.e.
+    /// that adjacent tiles overlap by `span - advance` pixels.
+    ///
+    /// Without this the grid assumes tiles butt up against each other, and its
+    /// tile count comes out one column and one row too large — indices the
+    /// underlying file has no tile for.
+    pub fn with_tile_span(mut self, span_w: i64, span_h: i64) -> Self {
+        self.span_w = span_w.max(self.tile_w);
+        self.span_h = span_h.max(self.tile_h);
+        self
     }
 
     /// Place the image at `(origin_x, origin_y)` within a larger level canvas.
@@ -80,13 +109,22 @@ impl SimpleGrid {
     }
 
     /// Number of tile columns.
+    ///
+    /// `n` tiles laid down at `tile_w` intervals reach
+    /// `(n - 1) * tile_w + span_w`, so the count is the smallest `n` that
+    /// covers the image at that reach — *not* `ceil(image_w / tile_w)`, which
+    /// is right only while `span_w == tile_w`. On an overlapping grid the
+    /// simpler form returns one column too many, and `read_region` turns that
+    /// phantom column into `row * tiles_across + col` for a tile the file does
+    /// not have: the wrong tile painted at the right edge, or a hard
+    /// "tile index out of range" that fails the whole read.
     pub fn tiles_across(&self) -> i64 {
-        (self.image_w + self.tile_w - 1) / self.tile_w
+        tile_count(self.image_w, self.tile_w, self.span_w)
     }
 
-    /// Number of tile rows.
+    /// Number of tile rows. See [`tiles_across`](Self::tiles_across).
     pub fn tiles_down(&self) -> i64 {
-        (self.image_h + self.tile_h - 1) / self.tile_h
+        tile_count(self.image_h, self.tile_h, self.span_h)
     }
 
     /// Convert a level-pixel region to the range of tile column/row indices that
@@ -97,9 +135,15 @@ impl SimpleGrid {
         let x = x - self.origin_x as f64;
         let y = y - self.origin_y as f64;
 
-        let col_start = (x / self.tile_w as f64).floor() as i64;
+        // Tile `i` spans `[i * advance, i * advance + span)`, so the first tile
+        // reaching `x` is the smallest `i` with `i * advance > x - span`. With
+        // `span == advance` that is exactly `floor(x / advance)`; where tiles
+        // overlap it is one column further left, and taking `floor(x / advance)`
+        // there would step past the last real tile and drop the region's right
+        // edge entirely.
+        let col_start = first_tile(x, self.tile_w, self.span_w);
         let col_end = ((x + w) / self.tile_w as f64).ceil() as i64;
-        let row_start = (y / self.tile_h as f64).floor() as i64;
+        let row_start = first_tile(y, self.tile_h, self.span_h);
         let row_end = ((y + h) / self.tile_h as f64).ceil() as i64;
 
         // Clamp to valid range
@@ -110,6 +154,34 @@ impl SimpleGrid {
 
         (col_start, col_end, row_start, row_end)
     }
+}
+
+/// How many tiles of real width `span`, laid down every `advance` pixels, it
+/// takes to cover `image` pixels.
+///
+/// `advance` comes from the slide file, so zero is reachable on a corrupt or
+/// hostile one; dividing by it would abort the process. Reporting no tiles
+/// instead leaves the level unreadable but keeps the failure a `Result` — the
+/// drivers reject a zero tile size at open, and this is the backstop.
+fn tile_count(image: i64, advance: i64, span: i64) -> i64 {
+    if image <= 0 || advance <= 0 {
+        return 0;
+    }
+    if image <= span {
+        return 1;
+    }
+    (image - span + advance - 1) / advance + 1
+}
+
+/// Index of the first tile whose span reaches `x`, in image space.
+///
+/// Tile `i` covers `[i * advance, i * advance + span)`, so this is the smallest
+/// `i` with `x < i * advance + span`. May be negative; callers clamp.
+fn first_tile(x: f64, advance: i64, span: i64) -> i64 {
+    if advance <= 0 {
+        return 0;
+    }
+    ((x - span as f64) / advance as f64).floor() as i64 + 1
 }
 
 impl TileGrid for SimpleGrid {
@@ -181,5 +253,55 @@ mod tests {
         let overlap = SimpleGrid::new(1000, 800, 240, 240);
         assert_eq!(overlap.tile_extent(0, 0, 256, 256), (0, 0, 256, 256));
         assert_eq!(overlap.tile_extent(4, 0, 256, 256), (960, 0, 40, 256));
+    }
+
+    /// A Trestle-shaped level: 1024x1024 of 256px tiles overlapping by 32, so
+    /// the file holds 4x4 tiles and the level measures 928x928.
+    ///
+    /// Counting columns as `ceil(928 / 224)` says 5, and `read_region` turns
+    /// column 4 into `row * 4 + 4` — tile 4 is row 1's first tile, and row 3
+    /// asks for index 16, which the file does not have. The count has to come
+    /// from the tiles' real reach, not the advance alone.
+    #[test]
+    fn an_overlapping_grid_has_as_many_tiles_as_the_file() {
+        let grid = SimpleGrid::new(928, 928, 224, 224).with_tile_span(256, 256);
+        assert_eq!(grid.tiles_across(), 4);
+        assert_eq!(grid.tiles_down(), 4);
+
+        // The whole level: 16 tiles, none of them past the file's last one.
+        let tiles = grid.tiles_for_region(0.0, 0.0, 928.0, 928.0);
+        assert_eq!(tiles.len(), 16);
+        assert!(tiles.iter().all(|&(c, r)| c < 4 && r < 4));
+
+        // The right edge lives in the last column, not in a phantom fifth one.
+        // Tile 3 spans 672..928, so it is the one that has these pixels.
+        assert_eq!(grid.tiles_for_region(900.0, 0.0, 28.0, 10.0), [(3, 0)]);
+
+        // Past the image there is still nothing.
+        assert_eq!(grid.tiles_for_region(1200.0, 0.0, 28.0, 10.0).len(), 0);
+    }
+
+    /// The span defaults to the advance, so every non-overlapping caller counts
+    /// tiles exactly as it did before the span existed.
+    #[test]
+    fn a_butting_grid_counts_tiles_by_plain_ceiling_division() {
+        for (image, tile, expected) in
+            [(1024, 256, 4), (1000, 256, 4), (255, 256, 1), (256, 256, 1)]
+        {
+            let grid = SimpleGrid::new(image, image, tile, tile);
+            assert_eq!(grid.tiles_across(), expected, "image {image} tile {tile}");
+            assert_eq!(grid.tiles_down(), expected, "image {image} tile {tile}");
+        }
+    }
+
+    /// A tile size of zero comes straight off the file. Dividing by it would
+    /// abort the process, so the grid reports no tiles and the read comes back
+    /// empty instead.
+    #[test]
+    fn a_zero_tile_size_yields_no_tiles_rather_than_a_panic() {
+        let grid = SimpleGrid::new(1024, 1024, 0, 0);
+        assert_eq!(grid.tiles_across(), 0);
+        assert_eq!(grid.tiles_down(), 0);
+        assert_eq!(grid.tiles_for_region(0.0, 0.0, 1024.0, 1024.0).len(), 0);
     }
 }

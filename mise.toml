@@ -6,7 +6,19 @@ rust = "latest"
 # cargo-nextest: runs tests from every crate's every test binary in one global
 # thread pool, so slidekit's I/O-bound integration binaries overlap instead of
 # running one binary at a time like `cargo test` does.
-"cargo:cargo-nextest" = "latest"
+#
+# Taken as a prebuilt release binary, not `cargo:cargo-nextest`. The cargo
+# backend runs `cargo install`, which locks the *tool* version and nothing
+# underneath it: nextest 0.9.140's dependency tree resolved fresh on every cold
+# CI runner, picked up aws-lc-sys 0.39.0, and that crate's build script now
+# aborts on the runner's gcc ("COMPILER BUG DETECTED", gcc bug 95189). The pin
+# held and CI still broke, because the pin was never the part that floated.
+#
+# The version is the release tag rather than a bare number — nextest tags
+# `cargo-nextest-<version>` because the repo ships several crates. Same 0.9.140
+# binary the source build was producing, minus the C toolchain and the minutes
+# spent compiling a test runner.
+"github:nextest-rs/nextest" = "cargo-nextest-0.9.140"
 
 [tasks."pre-commit"]
 description = "Run pre-commit checks via prek"
@@ -43,7 +55,14 @@ limit=$((limit_gib * 1024 * 1024 * 1024))
 
 # Sum the declared `size:` fields without fetching anything, so the budget is
 # decided before any download. Counts slides by their `- path:` entries.
-total=$(awk '/^[[:space:]]*size:/ { s += $2 } END { print s + 0 }' "$manifest")
+#
+# `printf "%.0f"`, not `print`: awk's `print` renders a number through OFMT
+# (`%.6g` by default), and mawk — which is what the CI runners have — applies it
+# to any value outside int range. The manifest passed 2^31 bytes, so the sum
+# started coming out "6.22236e+09", which the budget comparison and the printf
+# below both choke on. printf takes its own format and never consults OFMT, so
+# this reads the same on mawk, gawk and BSD awk.
+total=$(awk '/^[[:space:]]*size:/ { s += $2 } END { printf "%.0f\n", s + 0 }' "$manifest")
 count=$(grep -cE '^[[:space:]]*-[[:space:]]+path:' "$manifest")
 printf 'Test data manifest: %d slides, %d bytes (%.2f GiB).\n' \
   "$count" "$total" "$(awk "BEGIN { print $total / 1073741824 }")"

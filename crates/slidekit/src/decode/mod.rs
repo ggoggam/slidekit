@@ -84,9 +84,31 @@ pub fn decode_predicted(
     samples_to_argb(&decompressed, width, height, samples_per_pixel)
 }
 
+/// Reject a directory whose samples are not 8 bits wide.
+///
+/// Everything downstream of here — the horizontal predictor's row stride,
+/// `samples_to_argb`'s channel packing — assumes one byte per sample. A 16-bit
+/// tile does not fail those checks, it passes them at the wrong stride: the
+/// predictor sums bytes across half a scanline and the packer reads the first
+/// `pixel_count * spp` bytes as 8-bit RGB, so the tile renders as noise and the
+/// read reports success. Refusing the file says so instead.
+pub fn check_bits_per_sample(tl: &mut TiffLike, dir: i64) -> Result<()> {
+    if !tl.has_tag(dir, tags::BITS_PER_SAMPLE) {
+        return Ok(()); // TIFF's default is 1, but in practice absent means 8.
+    }
+    let bits = tl.get_uint(dir, tags::BITS_PER_SAMPLE)?;
+    if bits != 8 {
+        return Err(OpenSlideError::Decode(format!(
+            "Unsupported BitsPerSample {bits} in directory {dir}; only 8-bit samples decode"
+        )));
+    }
+    Ok(())
+}
+
 /// Read a TIFF directory's SamplesPerPixel and Predictor tags, defaulting to
 /// 1 sample and no predictor when absent.
 pub fn read_spp_predictor(tl: &mut TiffLike, dir: i64) -> Result<(usize, u32)> {
+    check_bits_per_sample(tl, dir)?;
     let samples_per_pixel = if tl.has_tag(dir, tags::SAMPLES_PER_PIXEL) {
         tl.get_uint(dir, tags::SAMPLES_PER_PIXEL)? as usize
     } else {

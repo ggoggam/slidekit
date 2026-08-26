@@ -10,6 +10,7 @@
 use crate::associated::AssociatedImage;
 use crate::color::argb;
 use crate::decode::TileDecoder;
+use crate::decode::check_bits_per_sample;
 use crate::decode::deflate::DeflateDecoder;
 use crate::decode::jp2k::Jp2kDecoder;
 use crate::decode::lzw::{self, LzwDecoder};
@@ -22,7 +23,7 @@ use crate::io::SlideReader;
 use crate::level::LevelInfo;
 use crate::properties::{self, Properties};
 use crate::vendor::generic_tiff::{
-    jpeg_decoder_for_dir, set_resolution_props, set_tiff_string_props,
+    check_tile_size, jpeg_decoder_for_dir, set_resolution_props, set_tiff_string_props,
 };
 use crate::vendor::{LevelData, SlideData, VendorDriver};
 
@@ -122,6 +123,7 @@ impl VendorDriver for AperioDriver {
                 let image_h = tl.get_uint(dir, tags::IMAGE_LENGTH)? as i64;
                 let tile_w = tl.get_uint(dir, tags::TILE_WIDTH)? as i64;
                 let tile_h = tl.get_uint(dir, tags::TILE_LENGTH)? as i64;
+                check_tile_size(tile_w, tile_h, dir)?;
 
                 let decoder = make_decoder_for_dir(&mut tl, dir)?;
 
@@ -325,12 +327,23 @@ fn make_decoder_for_dir(tl: &mut TiffLike, dir: i64) -> Result<Box<dyn TileDecod
         tags::COMPRESSION_PACKBITS => Ok(Box::new(PackBitsDecoder::for_dir(tl, dir)?)),
         1 => {
             // Uncompressed — passthrough
+            check_bits_per_sample(tl, dir)?;
             Ok(Box::new(UncompressedDecoder))
         }
         other => Err(OpenSlideError::Decode(format!(
             "Unsupported TIFF compression: {other}"
         ))),
     }
+}
+
+/// How many of `height` rows strip `index` still has to cover.
+///
+/// Zero once the declared strips run past the image, which a malformed file can
+/// arrange: `StripOffsets` sets the strip count and `RowsPerStrip` the stride,
+/// and nothing reconciles the two with `ImageLength`.
+fn remaining_rows(height: i64, index: usize, rows_per_strip: i64) -> i64 {
+    let consumed = (index as i64).saturating_mul(rows_per_strip);
+    rows_per_strip.min(height - consumed).max(0)
 }
 
 /// Decode a stripped associated image into ARGB pixel data.
@@ -367,15 +380,21 @@ pub(crate) fn decode_associated_image(
             let mut argb_buf = Vec::with_capacity(pixel_count);
 
             for (i, strip) in strips.iter().enumerate() {
+                // Nothing ties the strip count to `ceil(h / rows_per_strip)` —
+                // both come from the file — so a strip past the last row leaves
+                // no rows to fill. Unclamped, the subtraction goes negative and
+                // `(w * rows) as usize` becomes a ~10^19-element resize.
+                let strip_rows = remaining_rows(h, i, rows_per_strip);
+                if strip_rows == 0 {
+                    continue;
+                }
                 if strip.is_empty() {
                     // Fill with transparent pixels for this strip
-                    let rows = rows_per_strip.min(h - (i as i64 * rows_per_strip));
-                    let count = (w * rows) as usize;
+                    let count = (w * strip_rows) as usize;
                     argb_buf.resize(argb_buf.len() + count, 0);
                     continue;
                 }
 
-                let strip_rows = rows_per_strip.min(h - (i as i64 * rows_per_strip));
                 let strip_pixels = decoder.decode(strip, w as u32, strip_rows as u32)?;
                 argb_buf.extend_from_slice(&strip_pixels);
             }
@@ -430,12 +449,13 @@ pub(crate) fn decode_associated_image(
             let row_bytes = w as usize * samples_per_pixel;
             let mut data = Vec::with_capacity(pixel_count * samples_per_pixel);
 
+            let rows_per_strip = tl.rows_per_strip(dir)? as i64;
             for (i, strip) in strips.iter().enumerate() {
                 if strip.is_empty() {
-                    // Empty strip — fill with zeros
-                    let rows_per_strip = tl.rows_per_strip(dir)? as usize;
-                    let remaining_rows = h as usize - (i * rows_per_strip);
-                    let rows = rows_per_strip.min(remaining_rows);
+                    // Empty strip — fill with zeros. See the JPEG path above for
+                    // why the row count has to be clamped: here the subtraction
+                    // is in `usize`, so it wraps rather than going negative.
+                    let rows = remaining_rows(h, i, rows_per_strip) as usize;
                     data.resize(data.len() + rows * row_bytes, 0);
                     continue;
                 }
@@ -516,20 +536,15 @@ struct UncompressedDecoder;
 
 impl TileDecoder for UncompressedDecoder {
     fn decode(&self, data: &[u8], width: u32, height: u32) -> Result<Vec<u32>> {
-        let pixel_count = (width * height) as usize;
-        if data.len() >= pixel_count * 4 {
-            let mut argb_buf = Vec::with_capacity(pixel_count);
-            for chunk in data.chunks_exact(4) {
-                argb_buf.push(argb(chunk[3], chunk[0], chunk[1], chunk[2]));
-            }
-            return Ok(argb_buf);
+        // An uncompressed tile carries no channel count of its own, so infer it
+        // from the size: RGBA first, then RGB. Packing goes through the shared
+        // `samples_to_argb`, whose `.take(pixel_count)` is what keeps an
+        // over-long buffer from yielding more pixels than the tile has.
+        if let Ok(px) = crate::decode::samples_to_argb(data, width, height, 4) {
+            return Ok(px);
         }
-        if data.len() >= pixel_count * 3 {
-            let mut argb_buf = Vec::with_capacity(pixel_count);
-            for chunk in data.chunks_exact(3) {
-                argb_buf.push(argb(0xFF, chunk[0], chunk[1], chunk[2]));
-            }
-            return Ok(argb_buf);
+        if let Ok(px) = crate::decode::samples_to_argb(data, width, height, 3) {
+            return Ok(px);
         }
         Err(OpenSlideError::Decode(format!(
             "Uncompressed tile data size {} doesn't match {}x{} pixels",

@@ -180,8 +180,15 @@ impl MiraxLevel {
         // Phase 3: composite in placement order — subtiles overlap, and the one
         // written last wins, so this must stay the order phase 1 walked.
         for t in placed {
+            // A blob the batch did not return leaves the subtile transparent.
+            // Indexing here would panic instead — and `SlideReader` is a public
+            // extension point, so a short batch is a third party's bug to
+            // report, not this crate's to abort on.
+            let Some(px) = decoded.get(&(t.fileno, t.offset)) else {
+                continue;
+            };
             crate::slide::composite_subtile(
-                &decoded[&(t.fileno, t.offset)],
+                px,
                 self.image_w,
                 t.src_x,
                 t.src_y,
@@ -474,10 +481,12 @@ fn level_params(
     let mut concat0 = 1i64;
     for (i, s) in sections.iter().enumerate() {
         total_exp += s.concat_exponent;
-        if total_exp > 30 {
-            return Err(OpenSlideError::Decode(
-                "MIRAX image_concat exponent too large".into(),
-            ));
+        if !(0..=30).contains(&total_exp) {
+            // A negative exponent is a shift overflow, not a small level: in
+            // release it masks to bit 63 and the level comes out 0x0.
+            return Err(OpenSlideError::Decode(format!(
+                "MIRAX image_concat exponent out of range: {total_exp}"
+            )));
         }
         let image_concat = 1i64 << total_exp;
         if i == 0 {
@@ -568,9 +577,16 @@ impl<'a> IndexFile<'a> {
         }
         // dp: [pagesize, next, 0, 0, offset, size, fileno]
         let offset = i32le(self.data, dp + 16)? as u64;
-        let size = i32le(self.data, dp + 20)? as usize;
+        let size = i32le(self.data, dp + 20)?;
         let fileno = i32le(self.data, dp + 24)? as usize;
-        Ok((offset, size, fileno))
+        // These are signed on the wire and the caller allocates `size` bytes;
+        // `-1 as usize` is 18 exabytes, which aborts rather than erroring.
+        if size < 0 || offset > i32::MAX as u64 {
+            return Err(OpenSlideError::Decode(
+                "MIRAX nonhier: negative record offset or size".into(),
+            ));
+        }
+        Ok((offset, size as usize, fileno))
     }
 
     /// Walk the hierarchical data pages, expanding each stored image into
@@ -603,7 +619,18 @@ impl<'a> IndexFile<'a> {
             }
             let mut page = i32le(self.data, level_ptr + 4)? as usize;
 
+            // `next` is a file-supplied offset with nothing stopping it from
+            // pointing back into the chain. A page that names itself, or any
+            // cycle, would spin here forever — at best burning a core inside
+            // `open`, at worst pushing a tile per pass until memory runs out.
+            let mut seen: HashSet<usize> = HashSet::new();
+
             loop {
+                if !seen.insert(page) {
+                    return Err(OpenSlideError::Decode(
+                        "MIRAX hier: data page chain loops".into(),
+                    ));
+                }
                 let page_len = i32le(self.data, page)?;
                 let next_ptr = i32le(self.data, page + 4)? as usize;
                 let mut cur = page + 8;

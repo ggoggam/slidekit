@@ -17,7 +17,7 @@
 
 use std::sync::{Arc, OnceLock};
 
-use crate::error::Result;
+use crate::error::{OpenSlideError, Result};
 use crate::io::SlideReader;
 
 /// A slide's or associated image's ICC profile.
@@ -109,6 +109,16 @@ impl IccProfile {
             } => {
                 if let Some(bytes) = cache.get() {
                     return Ok(Some(bytes));
+                }
+                // `length` is the slide's own declared profile size, so a
+                // corrupt one asks for gigabytes. `read_exact_at` would reject
+                // it a line later — but only after the allocation had already
+                // aborted the process.
+                let size = reader.size()?;
+                if *offset > size || (*length as u64) > size - *offset {
+                    return Err(OpenSlideError::Decode(format!(
+                        "ICC profile at {offset}+{length} runs past the end of the file"
+                    )));
                 }
                 let mut buf = vec![0u8; *length];
                 reader.read_exact_at(*offset, &mut buf)?;

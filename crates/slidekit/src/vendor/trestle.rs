@@ -16,6 +16,7 @@
 //! Ported from `openslide-vendor-trestle.c` (412 LOC in C).
 
 use crate::decode::TileDecoder;
+use crate::decode::check_bits_per_sample;
 use crate::decode::deflate::DeflateDecoder;
 use crate::decode::lzw::LzwDecoder;
 use crate::decode::packbits::PackBitsDecoder;
@@ -28,7 +29,7 @@ use crate::io::SlideReader;
 use crate::level::LevelInfo;
 use crate::properties::{self, Properties};
 use crate::vendor::generic_tiff::{
-    jpeg_decoder_for_dir, set_resolution_props, set_tiff_string_props,
+    check_tile_size, jpeg_decoder_for_dir, set_resolution_props, set_tiff_string_props,
 };
 use crate::vendor::{LevelData, SlideData, VendorDriver};
 
@@ -118,10 +119,17 @@ impl VendorDriver for TrestleDriver {
         // Parse overlaps from OverlapsXY property
         let overlaps = parse_overlaps(props.get(PROP_OVERLAPS_XY));
 
-        // Copy tiff.XResolution/YResolution to mpp-x/mpp-y
-        // Trestle uses these TIFF tags in a non-standard way (they already contain MPP)
-        duplicate_prop(&mut props, "tiff.XResolution", properties::names::MPP_X);
-        duplicate_prop(&mut props, "tiff.YResolution", properties::names::MPP_Y);
+        // Trestle uses XResolution/YResolution non-standardly: they already hold
+        // microns per pixel, so the generic `dividend / res` conversion
+        // `set_resolution_props` ran above is wrong here and has to be replaced
+        // with the raw tag value.
+        //
+        // Reading the tags is the point. This used to copy from a
+        // `tiff.XResolution` property, which nothing in the crate produces —
+        // `set_tiff_string_props` maps only the ASCII tags — so it never fired.
+        // Trestle files carry `ResolutionUnit = None`, which `set_resolution_props`
+        // bails on, and the slides ended up with no mpp at all.
+        set_mpp_from_raw_resolution(&mut tl, &mut props);
 
         // Build levels — all directories are tiled levels (linear ordering)
         let mut levels: Vec<LevelData> = Vec::new();
@@ -148,6 +156,9 @@ impl VendorDriver for TrestleDriver {
             let image_h = tl.get_uint(dir, tags::IMAGE_LENGTH)? as i64;
             let tile_w = tl.get_uint(dir, tags::TILE_WIDTH)? as i64;
             let tile_h = tl.get_uint(dir, tags::TILE_LENGTH)? as i64;
+            // `is_tiled` only proves the tags are present, not that they hold a
+            // usable size; every tile count below divides by these.
+            check_tile_size(tile_w, tile_h, dir)?;
 
             let tiles_across = (image_w + tile_w - 1) / tile_w;
             let tiles_down = (image_h + tile_h - 1) / tile_h;
@@ -191,7 +202,11 @@ impl VendorDriver for TrestleDriver {
                     tile_width: tile_w,
                     tile_height: tile_h,
                 },
-                grid: SimpleGrid::new(effective_w, effective_h, advance_w, advance_h),
+                // The advance is what separates tiles; the real tile is
+                // `tile_w` wide and overlaps its neighbour. The grid needs both
+                // to count columns correctly.
+                grid: SimpleGrid::new(effective_w, effective_h, advance_w, advance_h)
+                    .with_tile_span(tile_w, tile_h),
                 tiff_dir: dir,
                 decoder,
                 tiff_tile_width: tile_w,
@@ -253,6 +268,25 @@ fn parse_trestle_properties(desc: &str, props: &mut Properties) {
     }
 }
 
+/// Write `openslide.mpp-x`/`-y` straight from `XResolution`/`YResolution`.
+///
+/// For Trestle those tags hold microns per pixel directly rather than pixels
+/// per unit, so no conversion applies. Leaves whatever is already there when a
+/// tag is missing or zero.
+fn set_mpp_from_raw_resolution(tl: &mut TiffLike, props: &mut Properties) {
+    for (tag, name) in [
+        (tags::X_RESOLUTION, properties::names::MPP_X),
+        (tags::Y_RESOLUTION, properties::names::MPP_Y),
+    ] {
+        if tl.has_tag(0, tag)
+            && let Ok(res) = tl.get_float(0, tag)
+            && res > 0.0
+        {
+            props.insert(name, format!("{res:.10}"));
+        }
+    }
+}
+
 /// Parse the OverlapsXY property into (x, y) overlap pairs per directory.
 ///
 /// Format: "x0 y0 x1 y1 ..." — space-separated integers, two per directory.
@@ -295,7 +329,10 @@ fn make_decoder_for_dir(tl: &mut TiffLike, dir: i64) -> Result<Box<dyn TileDecod
             Ok(Box::new(DeflateDecoder::for_dir(tl, dir)?))
         }
         tags::COMPRESSION_PACKBITS => Ok(Box::new(PackBitsDecoder::for_dir(tl, dir)?)),
-        1 => Ok(Box::new(UncompressedDecoder)),
+        1 => {
+            check_bits_per_sample(tl, dir)?;
+            Ok(Box::new(UncompressedDecoder))
+        }
         other => Err(OpenSlideError::Decode(format!(
             "Unsupported TIFF compression: {other}"
         ))),
@@ -307,20 +344,15 @@ struct UncompressedDecoder;
 
 impl TileDecoder for UncompressedDecoder {
     fn decode(&self, data: &[u8], width: u32, height: u32) -> Result<Vec<u32>> {
-        let pixel_count = (width * height) as usize;
-        if data.len() >= pixel_count * 4 {
-            let mut argb_buf = Vec::with_capacity(pixel_count);
-            for chunk in data.chunks_exact(4) {
-                argb_buf.push(crate::color::argb(chunk[3], chunk[0], chunk[1], chunk[2]));
-            }
-            return Ok(argb_buf);
+        // An uncompressed tile carries no channel count of its own, so infer it
+        // from the size: RGBA first, then RGB. Packing goes through the shared
+        // `samples_to_argb`, whose `.take(pixel_count)` is what keeps an
+        // over-long buffer from yielding more pixels than the tile has.
+        if let Ok(px) = crate::decode::samples_to_argb(data, width, height, 4) {
+            return Ok(px);
         }
-        if data.len() >= pixel_count * 3 {
-            let mut argb_buf = Vec::with_capacity(pixel_count);
-            for chunk in data.chunks_exact(3) {
-                argb_buf.push(crate::color::argb(0xFF, chunk[0], chunk[1], chunk[2]));
-            }
-            return Ok(argb_buf);
+        if let Ok(px) = crate::decode::samples_to_argb(data, width, height, 3) {
+            return Ok(px);
         }
         Err(OpenSlideError::Decode(format!(
             "Uncompressed tile data size {} doesn't match {}x{} pixels",

@@ -919,6 +919,13 @@ pub fn assert_cache_is_transparent(
         })
         .collect();
     assert_eq!(cold.cache().hits(), 0, "a disabled cache served a tile");
+    // `hits() == 0` alone proves nothing — a disabled cache cannot record one.
+    // The misses are what show the read path actually went through the cache
+    // that was disabled, which is the premise the comparison below rests on.
+    assert!(
+        cold.cache().misses() > 0,
+        "the reference read never consulted the cache it was given"
+    );
 
     let warm = open();
     for pass in 0..2 {

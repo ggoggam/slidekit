@@ -325,6 +325,10 @@ impl OpenSlide {
             return Ok(vec![]);
         }
 
+        // Reject a region too large to allocate before trying to: `w * h`
+        // overflows `i64` well before the allocator would refuse it.
+        let out_len = region_len(w, h)?;
+
         let lvl = &self.levels[level as usize];
         let ds = lvl.info.downsample;
 
@@ -399,7 +403,6 @@ impl OpenSlide {
         let tiles = lvl.grid.tiles_for_region(lx, ly, w as f64, h as f64);
 
         // Initialize output buffer with transparent black
-        let out_len = (w * h) as usize;
         let mut output = vec![0u32; out_len];
 
         // Need a TiffLike to read tile data
@@ -455,7 +458,7 @@ impl OpenSlide {
                 if let Some((offset, size)) = tiff.tile_location(lvl.tiff_dir, tile_index)? {
                     plan.push((extent, None));
                     miss_ids.push(id);
-                    ranges.push(offset..offset + size as u64);
+                    ranges.push(tile_range(offset, size)?);
                 }
             }
             // Skip the gather entirely when the cache served everything; an
@@ -585,7 +588,7 @@ impl OpenSlide {
                 // it out of the batch leaves its subtiles transparent.
                 if let Some((offset, size)) = tiff.tile_location(lvl.tiff_dir, index)? {
                     indices.push(index);
-                    ranges.push(offset..offset + size as u64);
+                    ranges.push(tile_range(offset, size)?);
                 }
             }
             let data = tiff.reader().read_ranges(&ranges)?;
@@ -761,10 +764,13 @@ impl OpenSlide {
         w: i64,
         h: i64,
     ) -> Result<Vec<u32>> {
-        // No async backend (e.g. local file): the sync path uses non-blocking
-        // positioned reads, so it is safe to run here directly.
+        // No async backend. A local file reads without blocking on a runtime,
+        // but `open_fs` also lands here, and a caller-supplied `SlideFs` — the
+        // in-tree `ObjectStoreFs` included — can hand back `BlockingReader`s.
+        // Those panic outright inside a runtime, so take the same thread hop the
+        // vendor fallbacks below take.
         let Some(reader) = self.async_reader.clone() else {
-            return self.read_region(x, y, level, w, h);
+            return run_off_runtime(|| self.read_region(x, y, level, w, h));
         };
 
         if level < 0 || level >= self.level_count() {
@@ -791,7 +797,7 @@ impl OpenSlide {
             || lvl.synthetic.is_some()
             || lvl.dicom.is_some()
         {
-            return read_off_runtime(|| self.read_region(x, y, level, w, h));
+            return run_off_runtime(|| self.read_region(x, y, level, w, h));
         }
 
         let ds = lvl.info.downsample;
@@ -800,7 +806,7 @@ impl OpenSlide {
 
         let tiles = lvl.grid.tiles_for_region(lx, ly, w as f64, h as f64);
 
-        let out_len = (w * h) as usize;
+        let out_len = region_len(w, h)?;
         let mut output = vec![0u32; out_len];
 
         let tiff_mutex = self.tiff.as_ref().ok_or_else(|| {
@@ -836,7 +842,7 @@ impl OpenSlide {
                 if let Some((offset, size)) = tiff.tile_location(lvl.tiff_dir, tile_index)? {
                     plan.push((extent, None));
                     miss_ids.push(id);
-                    ranges.push(offset..offset + size as u64);
+                    ranges.push(tile_range(offset, size)?);
                 }
             }
         }
@@ -893,6 +899,12 @@ impl OpenSlide {
     }
 
     /// Read a region into an existing buffer.
+    ///
+    /// `dest` must hold at least `w * h` pixels, as it must for
+    /// `openslide_read_region`. A shorter buffer is an error rather than a
+    /// partial fill: the pixels that did land would be a `w`-strided image read
+    /// back at whatever stride the caller assumed, which is a wrong image, not
+    /// a truncated one.
     pub fn read_region_into(
         &self,
         dest: &mut [u32],
@@ -902,9 +914,15 @@ impl OpenSlide {
         w: i64,
         h: i64,
     ) -> Result<()> {
+        let needed = region_len(w, h)?;
+        if dest.len() < needed {
+            return Err(OpenSlideError::InvalidArgument(format!(
+                "Destination buffer holds {} pixels, need {needed} for {w}x{h}",
+                dest.len()
+            )));
+        }
         let data = self.read_region(x, y, level, w, h)?;
-        let len = data.len().min(dest.len());
-        dest[..len].copy_from_slice(&data[..len]);
+        dest[..data.len()].copy_from_slice(&data);
         Ok(())
     }
 
@@ -953,6 +971,10 @@ impl OpenSlide {
     /// find out how large one is without fetching it. The bytes are cached, so
     /// later calls are free.
     pub fn icc_profile(&self) -> Result<Option<&[u8]>> {
+        // A deferred profile reads on this call, and on a remote slide that read
+        // goes through `BlockingReader`. Fill the cache off any ambient runtime
+        // first; the second call then only hands back what is already there.
+        run_off_runtime(|| self.icc_profile.bytes().map(|_| ()))?;
         self.icc_profile.bytes()
     }
 
@@ -967,10 +989,12 @@ impl OpenSlide {
     ///
     /// `Ok(None)` covers both "no such image" and "that image has no profile".
     pub fn associated_image_icc_profile(&self, name: &str) -> Result<Option<&[u8]>> {
-        match self.associated_image(name) {
-            Some(img) => img.icc_profile.bytes(),
-            None => Ok(None),
-        }
+        let Some(img) = self.associated_image(name) else {
+            return Ok(None);
+        };
+        // Same deferred read, same runtime hazard, as `icc_profile`.
+        run_off_runtime(|| img.icc_profile.bytes().map(|_| ()))?;
+        img.icc_profile.bytes()
     }
 
     /// Size of an associated image's ICC profile, without reading it.
@@ -1056,11 +1080,12 @@ where
         .map_err(|_| OpenSlideError::Other("slide open thread terminated unexpectedly".into()))?
 }
 
-/// Run a synchronous region read on a thread that is not driving a runtime,
-/// and hand back its result.
+/// Run synchronous, possibly blocking work on a thread that is not driving a
+/// runtime, and hand back its result.
 ///
-/// The level kinds `read_region_async` can't fetch by range fall back to the
-/// synchronous read path, and on a remote slide every byte that path touches
+/// Two callers need this. The level kinds `read_region_async` can't fetch by
+/// range fall back to the synchronous read path; and `icc_profile` reads a
+/// deferred profile on first use. On a remote slide every byte either touches
 /// goes through `BlockingReader` — i.e. `Runtime::block_on`, which panics
 /// outright when the calling thread is already inside a runtime. The open path
 /// has the same hazard and solves it with [`run_open_off_runtime`], but that
@@ -1085,20 +1110,54 @@ where
 /// Off a runtime (a plain sync caller, or a local slide reached through some
 /// other path) there is nothing to protect against, so the read runs in place
 /// and no thread is spawned.
-fn read_off_runtime<F>(f: F) -> Result<Vec<u32>>
+fn run_off_runtime<T, F>(f: F) -> T
 where
-    F: FnOnce() -> Result<Vec<u32>> + Send,
+    F: FnOnce() -> T + Send,
+    T: Send,
 {
     #[cfg(feature = "object-store")]
     if tokio::runtime::Handle::try_current().is_ok() {
         return std::thread::scope(|scope| match scope.spawn(f).join() {
-            Ok(pixels) => pixels,
-            // The read panicked on the scratch thread. Re-raise it here rather
+            Ok(value) => value,
+            // The work panicked on the scratch thread. Re-raise it here rather
             // than reporting a decoder bug as an ordinary read error.
             Err(payload) => std::panic::resume_unwind(payload),
         });
     }
     f()
+}
+
+/// Byte range of one tile, from a `TileOffsets`/`TileByteCounts` pair.
+///
+/// Both values come straight off the TIFF and are 64-bit in BigTIFF, so their
+/// sum can wrap: the range then runs backwards, and the default `read_ranges`
+/// takes `end - start` as a length, underflowing into a capacity-overflow
+/// abort. Rejecting the pair keeps it an ordinary decode error.
+fn tile_range(offset: u64, size: usize) -> Result<std::ops::Range<u64>> {
+    let end = offset.checked_add(size as u64).ok_or_else(|| {
+        OpenSlideError::Decode(format!("Tile byte range {offset}+{size} overflows"))
+    })?;
+    Ok(offset..end)
+}
+
+/// Pixel count of a `w` x `h` region, rejecting sizes that cannot be allocated.
+///
+/// `w` and `h` reach the public API from the caller, and a viewer that computes
+/// a region from a bad zoom level can ask for one whose area overflows `i64` —
+/// `(w * h) as usize` then wraps to a nonsense length and `vec!` aborts the
+/// process with a capacity overflow instead of returning an error. The cap is
+/// the buffer this crate would have to hand back: `usize::MAX / 4` pixels.
+fn region_len(w: i64, h: i64) -> Result<usize> {
+    if w <= 0 || h <= 0 {
+        return Ok(0);
+    }
+    let area = (w as i128) * (h as i128);
+    if area > (usize::MAX / std::mem::size_of::<u32>()) as i128 {
+        return Err(OpenSlideError::InvalidArgument(format!(
+            "Region {w}x{h} is too large to allocate"
+        )));
+    }
+    Ok(area as usize)
 }
 
 /// Real TIFF tile-column count for row-major tile indexing, i.e.

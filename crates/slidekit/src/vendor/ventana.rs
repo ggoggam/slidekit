@@ -42,7 +42,7 @@ use crate::io::SlideReader;
 use crate::level::LevelInfo;
 use crate::properties::{self, Properties};
 use crate::vendor::aperio::decode_associated_image;
-use crate::vendor::generic_tiff::{make_decoder_for_dir, set_tiff_string_props};
+use crate::vendor::generic_tiff::{check_tile_size, make_decoder_for_dir, set_tiff_string_props};
 use crate::vendor::{LevelData, SlideData, VendorDriver};
 use quick_xml::Reader;
 use quick_xml::events::Event;
@@ -148,6 +148,7 @@ impl VendorDriver for VentanaDriver {
                 let image_h = tl.get_uint(dir, tags::IMAGE_LENGTH)? as i64;
                 let tile_w = tl.get_uint(dir, tags::TILE_WIDTH)? as i64;
                 let tile_h = tl.get_uint(dir, tags::TILE_LENGTH)? as i64;
+                check_tile_size(tile_w, tile_h, dir)?;
                 // Building the decoder also verifies the compression is supported.
                 let decoder = make_decoder_for_dir(&mut tl, dir)?;
 

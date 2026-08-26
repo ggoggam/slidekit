@@ -869,7 +869,7 @@ pub fn parse_file_meta(reader: &dyn SlideReader) -> Result<(DataSet, u64)> {
         .ok_or_else(|| OpenSlideError::Decode("DICOM file meta group runs past EOF".into()))?;
 
     let mut meta = DataSet::default();
-    let mut ctx = ParseContext::nested();
+    let mut ctx = ParseContext::nested(0);
     parse_dataset(&mut cur, Some(meta_end), &mut meta, &mut ctx)?;
     Ok((meta, meta_end))
 }
@@ -910,22 +910,36 @@ pub fn parse(reader: &dyn SlideReader) -> Result<DicomObject> {
 /// Side channel for the two elements handled specially at the top level.
 struct ParseContext {
     top_level: bool,
+    /// How many sequences deep this dataset sits.
+    ///
+    /// `parse_dataset` and `parse_items` call each other once per nesting
+    /// level, and both are ordinary stack frames. A sequence costs 20 bytes of
+    /// input and one frame each way, so a couple of megabytes of nested `SQ`
+    /// headers overflows the stack — a segfault, which no `Result` can catch,
+    /// on any file carrying the `DICM` magic.
+    depth: u32,
     pixel_data: Option<PixelData>,
     frame_positions: Vec<(i64, i64)>,
 }
+
+/// Deepest sequence nesting accepted. Real WSI instances nest a handful deep;
+/// anything approaching this is malformed or hostile.
+const MAX_SEQUENCE_DEPTH: u32 = 64;
 
 impl ParseContext {
     fn top_level() -> Self {
         Self {
             top_level: true,
+            depth: 0,
             pixel_data: None,
             frame_positions: Vec::new(),
         }
     }
 
-    fn nested() -> Self {
+    fn nested(depth: u32) -> Self {
         Self {
             top_level: false,
+            depth,
             pixel_data: None,
             frame_positions: Vec::new(),
         }
@@ -1023,7 +1037,7 @@ fn parse_dataset(
                     value: Value::Elided,
                 });
             } else {
-                let items = parse_items(cur, header.length)?;
+                let items = parse_items(cur, header.length, ctx.depth + 1)?;
                 out.push(Element {
                     tag: header.tag,
                     vr: header.vr,
@@ -1065,14 +1079,21 @@ fn parse_dataset(
 }
 
 /// Parse a sequence's items. `length` may be [`UNDEFINED_LENGTH`].
-fn parse_items(cur: &mut Cursor, length: u32) -> Result<Vec<DataSet>> {
+///
+/// `depth` is this sequence's nesting level; see [`ParseContext::depth`].
+fn parse_items(cur: &mut Cursor, length: u32, depth: u32) -> Result<Vec<DataSet>> {
+    if depth > MAX_SEQUENCE_DEPTH {
+        return Err(OpenSlideError::Decode(format!(
+            "DICOM sequences nested deeper than {MAX_SEQUENCE_DEPTH}"
+        )));
+    }
     let end = if length == UNDEFINED_LENGTH {
         None
     } else {
         Some(cur.pos() + length as u64)
     };
     let mut items = Vec::new();
-    let mut ctx = ParseContext::nested();
+    let mut ctx = ParseContext::nested(depth);
     loop {
         match end {
             Some(end) if cur.pos() >= end => return Ok(items),
@@ -1116,7 +1137,8 @@ fn collect_frame_positions(cur: &mut Cursor, length: u32, ctx: &mut ParseContext
     } else {
         Some(cur.pos() + length as u64)
     };
-    let mut nested = ParseContext::nested();
+    // The per-frame items are one sequence below the caller's dataset.
+    let mut nested = ParseContext::nested(ctx.depth + 1);
     loop {
         match end {
             Some(end) if cur.pos() >= end => return Ok(()),

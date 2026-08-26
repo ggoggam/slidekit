@@ -226,7 +226,11 @@ impl Cache {
     fn get(&self, key: TileKey) -> Option<Arc<Vec<u32>>> {
         // `capacity == 0` never stores anything, so skip the lock entirely —
         // this is the disabled-cache path the correctness tests run through.
+        // The miss still counts: it is the only evidence those tests have that
+        // the read path consulted the cache they disabled, rather than serving
+        // the tile from somewhere `set_cache` does not reach.
         if self.inner.capacity == 0 {
+            self.inner.misses.fetch_add(1, Ordering::Relaxed);
             return None;
         }
         let hit = self.inner.map.lock().lru.get(&key).cloned();

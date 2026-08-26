@@ -220,6 +220,35 @@ impl AsyncSlideReader for ObjectStoreReader {
         // requests and fetches them concurrently, then splits the result back
         // out in the requested order.
         let bytes = self.store.get_ranges(&self.path, ranges).await?;
+        // `object_store` clamps a range that runs past the end of the object
+        // rather than rejecting it, so a truncated object comes back short with
+        // an `Ok`. `read_exact_at` refuses that; this path has to as well, or a
+        // half-fetched tile decodes into black bands and the caller is told the
+        // read succeeded.
+        if bytes.len() != ranges.len() {
+            return Err(OpenSlideError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "store returned {} buffers for {} ranges",
+                    bytes.len(),
+                    ranges.len()
+                ),
+            )));
+        }
+        for (buf, range) in bytes.iter().zip(ranges) {
+            let want = (range.end - range.start) as usize;
+            if buf.len() < want {
+                return Err(OpenSlideError::Io(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    format!(
+                        "range {}..{} returned {} of {want} bytes",
+                        range.start,
+                        range.end,
+                        buf.len()
+                    ),
+                )));
+            }
+        }
         Ok(bytes)
     }
 

@@ -5,8 +5,8 @@
 //!
 //! Ported from `openslide-vendor-generic-tiff.c` (313 LOC in C).
 
-use crate::color::argb;
 use crate::decode::TileDecoder;
+use crate::decode::check_bits_per_sample;
 use crate::decode::deflate::DeflateDecoder;
 use crate::decode::jp2k::Jp2kDecoder;
 use crate::decode::jpeg::JpegDecoder;
@@ -85,6 +85,7 @@ impl VendorDriver for GenericTiffDriver {
             let image_h = tl.get_uint(dir, tags::IMAGE_LENGTH)? as i64;
             let tile_w = tl.get_uint(dir, tags::TILE_WIDTH)? as i64;
             let tile_h = tl.get_uint(dir, tags::TILE_LENGTH)? as i64;
+            check_tile_size(tile_w, tile_h, dir)?;
 
             tiled_dirs.push(DirInfo {
                 dir,
@@ -201,6 +202,7 @@ pub(crate) fn make_decoder_for_dir(tl: &mut TiffLike, dir: i64) -> Result<Box<dy
         tags::COMPRESSION_PACKBITS => Ok(Box::new(PackBitsDecoder::for_dir(tl, dir)?)),
         1 => {
             // Uncompressed — return a passthrough decoder
+            check_bits_per_sample(tl, dir)?;
             Ok(Box::new(UncompressedDecoder))
         }
         other => Err(OpenSlideError::Decode(format!(
@@ -214,22 +216,15 @@ struct UncompressedDecoder;
 
 impl TileDecoder for UncompressedDecoder {
     fn decode(&self, data: &[u8], width: u32, height: u32) -> Result<Vec<u32>> {
-        let pixel_count = (width * height) as usize;
-        // Assume RGBA (4 bytes per pixel)
-        if data.len() >= pixel_count * 4 {
-            let mut argb_buf = Vec::with_capacity(pixel_count);
-            for chunk in data.chunks_exact(4) {
-                argb_buf.push(argb(chunk[3], chunk[0], chunk[1], chunk[2]));
-            }
-            return Ok(argb_buf);
+        // An uncompressed tile carries no channel count of its own, so infer it
+        // from the size: RGBA first, then RGB. Packing goes through the shared
+        // `samples_to_argb`, whose `.take(pixel_count)` is what keeps an
+        // over-long buffer from yielding more pixels than the tile has.
+        if let Ok(px) = crate::decode::samples_to_argb(data, width, height, 4) {
+            return Ok(px);
         }
-        // Assume RGB (3 bytes per pixel)
-        if data.len() >= pixel_count * 3 {
-            let mut argb_buf = Vec::with_capacity(pixel_count);
-            for chunk in data.chunks_exact(3) {
-                argb_buf.push(argb(0xFF, chunk[0], chunk[1], chunk[2]));
-            }
-            return Ok(argb_buf);
+        if let Ok(px) = crate::decode::samples_to_argb(data, width, height, 3) {
+            return Ok(px);
         }
         Err(OpenSlideError::Decode(format!(
             "Uncompressed tile data size {} doesn't match {}x{} pixels",
@@ -278,6 +273,22 @@ pub fn set_resolution_props(tl: &mut TiffLike, dir: i64, props: &mut Properties)
     for (i, name) in prop_names.iter().enumerate() {
         props.insert(*name, format!("{:.10}", values[i]));
     }
+}
+
+/// Reject a tile size the tile-count arithmetic cannot divide by.
+///
+/// `TiffLike::is_tiled` reports whether the `TileWidth`/`TileLength` tags are
+/// *present*, not whether they hold a usable value, so a corrupt or hostile
+/// file reaches the level builders with a zero tile size. Every tile count is a
+/// division by it, and an integer divide by zero aborts the process — a library
+/// reading untrusted pathology files has to return `Err` instead.
+pub fn check_tile_size(tile_w: i64, tile_h: i64, dir: i64) -> Result<()> {
+    if tile_w <= 0 || tile_h <= 0 {
+        return Err(OpenSlideError::Decode(format!(
+            "Invalid tile size {tile_w}x{tile_h} in directory {dir}"
+        )));
+    }
+    Ok(())
 }
 
 /// Copy well-known TIFF string tags as openslide.tiff.* properties.

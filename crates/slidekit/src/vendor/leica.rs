@@ -53,7 +53,7 @@ use crate::level::LevelInfo;
 use crate::properties::{self, Properties};
 use crate::vendor::aperio::decode_associated_image;
 use crate::vendor::generic_tiff::{
-    make_decoder_for_dir, set_resolution_props, set_tiff_string_props,
+    check_tile_size, make_decoder_for_dir, set_resolution_props, set_tiff_string_props,
 };
 use crate::vendor::{LevelData, SlideData, VendorDriver};
 
@@ -142,6 +142,7 @@ impl VendorDriver for LeicaDriver {
             let h = tl.get_uint(dir, tags::IMAGE_LENGTH)? as i64;
             let tw = tl.get_uint(dir, tags::TILE_WIDTH)? as i64;
             let th = tl.get_uint(dir, tags::TILE_LENGTH)? as i64;
+            check_tile_size(tw, th, dir)?;
             // Building the decoder also verifies the compression is supported.
             let decoder = make_decoder_for_dir(&mut tl, dir)?;
             // Nanometres per pixel at this level, from the region's own physical

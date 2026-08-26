@@ -35,7 +35,7 @@ use std::sync::Arc;
 use bytes::Bytes;
 use parking_lot::Mutex;
 
-use crate::error::Result;
+use crate::error::{OpenSlideError, Result};
 use crate::io::SlideReader;
 use crate::io::fs::SlideLocation;
 
@@ -289,6 +289,20 @@ impl<R: SlideReader> SlideReader for ReadAhead<R> {
 
         if !missing.is_empty() {
             let fetched = self.inner.read_ranges(&missing)?;
+            // `SlideReader` is a public extension point, so the one-buffer-per
+            // -range contract is a promise a downstream backend can break. The
+            // `zip` below would then leave a slot empty, and unwrapping it would
+            // turn a recoverable read failure into a process-killing panic.
+            if fetched.len() != missing.len() {
+                return Err(OpenSlideError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "reader returned {} buffers for {} ranges",
+                        fetched.len(),
+                        missing.len()
+                    ),
+                )));
+            }
             let mut state = self.state.lock();
             for ((slot, range), bytes) in missing_slots.iter().zip(&missing).zip(fetched) {
                 state.insert(range.start, bytes.to_vec());
@@ -296,10 +310,16 @@ impl<R: SlideReader> SlideReader for ReadAhead<R> {
             }
         }
 
-        Ok(out
-            .into_iter()
-            .map(|b| b.expect("every slot filled"))
-            .collect())
+        out.into_iter()
+            .map(|b| {
+                b.ok_or_else(|| {
+                    OpenSlideError::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "reader left a requested range unfilled",
+                    ))
+                })
+            })
+            .collect()
     }
 
     fn size(&self) -> Result<u64> {

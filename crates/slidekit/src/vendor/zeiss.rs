@@ -252,11 +252,16 @@ impl ZeissLevel {
         // than a header read followed by a data read. The backend coalesces
         // neighbours and issues the rest concurrently; reading them one at a
         // time made a CZI patch the slowest in the suite.
+        // The probe deliberately overshoots, so clamp it to the file: the last
+        // subblock's guess otherwise runs past the end, which a backend either
+        // rejects outright or — worse — clamps for us and hands back short.
+        let file_size = self.reader.size()?;
         let ranges: Vec<Range<u64>> = misses
             .iter()
             .map(|t| {
                 let start = t.payload_start();
-                start..start + t.probe_len()
+                let end = start.saturating_add(t.probe_len()).min(file_size);
+                start..end.max(start)
             })
             .collect();
         let probes = if ranges.is_empty() {
@@ -524,7 +529,11 @@ fn read_subblock_directory(reader: &dyn SlideReader, pos: u64) -> Result<Vec<Dir
     if entry_count < 0 {
         return Err(OpenSlideError::Decode("CZI: negative entry count".into()));
     }
-    let mut entries = Vec::with_capacity(entry_count as usize);
+    // Each entry is at least 32 bytes, so the payload caps how many there can
+    // be; `entry_count` itself is a file-supplied i32 and reserving for
+    // 2^31 of them would ask for ~150 GB before the first parse fails.
+    let capacity = (entry_count as usize).min(payload.len().saturating_sub(128) / 32);
+    let mut entries = Vec::with_capacity(capacity);
     let mut off = 128usize; // fixed region before the entries
     for _ in 0..entry_count {
         let e = parse_dir_entry(&payload, off)?;
@@ -611,7 +620,19 @@ fn decode_tile(data: &[u8], t: &ZeissTile) -> Result<Vec<u32>> {
 /// Convert raw (uncompressed) CZI samples to ARGB. CZI stores color channels in
 /// B,G,R order; 16-bit types are down-shifted to 8-bit for display.
 fn samples_to_argb(data: &[u8], pixel_type: i32, w: i64, h: i64) -> Result<Vec<u32>> {
-    let n = (w * h) as usize;
+    // The dimensions come from the subblock's directory entry, so the product
+    // can exceed anything allocatable. Bound it by what `data` could possibly
+    // hold — one byte per pixel is the densest any layout below gets — so a
+    // crafted entry errors out of `need` instead of aborting on the reserve.
+    let n = (w as i128)
+        .checked_mul(h as i128)
+        .filter(|&n| n >= 0 && n <= data.len() as i128)
+        .ok_or_else(|| {
+            OpenSlideError::Decode(format!(
+                "CZI subblock declares {w}x{h} pixels, payload holds {} bytes",
+                data.len()
+            ))
+        })? as usize;
     let mut out = Vec::with_capacity(n);
     match pixel_type {
         PT_GRAY8 => {
@@ -726,13 +747,26 @@ fn read_metadata(reader: &dyn SlideReader, metadata_pos: i64) -> Properties {
     props
 }
 
+/// Clamp a file-declared length to what actually remains after `offset`.
+///
+/// CZI segment headers carry their payload length as a signed 32-bit field, and
+/// the reads below allocate it up front. Trimming it to the file first means a
+/// corrupt length is a short read rather than a multi-gigabyte allocation.
+fn bounded_read_len(reader: &dyn SlideReader, offset: u64, len: usize) -> Option<usize> {
+    let size = reader.size().ok()?;
+    let remaining = size.saturating_sub(offset);
+    let len = (len as u64).min(remaining) as usize;
+    (len > 0).then_some(len)
+}
+
 fn read_metadata_xml(reader: &dyn SlideReader, pos: u64) -> Option<String> {
     let mut head = [0u8; 8];
     reader.read_exact_at(pos + 32, &mut head).ok()?;
-    let xml_size = i32le(&head, 0).ok()? as usize;
-    if xml_size == 0 {
-        return None;
-    }
+    let xml_size = i32le(&head, 0).ok()?;
+    // Signed on the wire, and the allocation below is this number of bytes:
+    // `-1 as usize` asks the allocator for 18 exabytes and aborts the process.
+    let xml_size = usize::try_from(xml_size).ok().filter(|&n| n > 0)?;
+    let xml_size = bounded_read_len(reader, pos + 32 + 256, xml_size)?;
     let mut buf = vec![0u8; xml_size];
     // XML begins after the fixed 256-byte metadata payload region.
     reader.read_exact_at(pos + 32 + 256, &mut buf).ok()?;
@@ -838,10 +872,10 @@ fn read_attachment_directory(reader: &dyn SlideReader, pos: u64) -> Option<HashM
 fn read_one_attachment_jpeg(reader: &dyn SlideReader, pos: u64) -> Option<AssociatedImage> {
     let mut head = [0u8; 4];
     reader.read_exact_at(pos + 32, &mut head).ok()?;
-    let data_size = i32le(&head, 0).ok()? as usize;
-    if data_size == 0 {
-        return None;
-    }
+    let data_size = i32le(&head, 0).ok()?;
+    // Same signed-length hazard as `read_metadata_xml`.
+    let data_size = usize::try_from(data_size).ok().filter(|&n| n > 0)?;
+    let data_size = bounded_read_len(reader, pos + 32 + 256, data_size)?;
     let mut buf = vec![0u8; data_size];
     // Attachment data begins after the fixed 256-byte payload region.
     reader.read_exact_at(pos + 32 + 256, &mut buf).ok()?;

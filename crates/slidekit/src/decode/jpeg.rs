@@ -65,7 +65,7 @@ impl JpegDecoder {
             Some(tables) => {
                 // JPEGTables: everything before the trailing EOI (FF D9)
                 // Tile data: everything after the leading SOI (FF D8)
-                let tables_end = find_marker(tables, 0xFFD9)
+                let tables_end = find_last_marker(tables, 0xFFD9)
                     .ok_or_else(|| OpenSlideError::Decode("JPEGTables missing EOI".into()))?;
                 let tile_start = if data.len() >= 2 && data[0] == 0xFF && data[1] == 0xD8 {
                     2 // Skip SOI
@@ -147,9 +147,15 @@ impl TileDecoder for JpegDecoder {
     }
 }
 
-/// Find a 2-byte marker in a byte slice. Returns the offset of the marker.
-fn find_marker(data: &[u8], marker: u16) -> Option<usize> {
+/// Find the *last* occurrence of a 2-byte marker. Returns its offset.
+///
+/// The trailing EOI is the one that ends a JPEGTables blob, and marker-segment
+/// payloads are not byte-stuffed: a quantization table holding the adjacent
+/// values 255 and 217, or a Huffman table whose counts do, contains `FF D9`
+/// too. Taking the first match cuts the tables off mid-payload and every tile
+/// in the directory then fails to decode.
+fn find_last_marker(data: &[u8], marker: u16) -> Option<usize> {
     let hi = (marker >> 8) as u8;
     let lo = (marker & 0xFF) as u8;
-    data.windows(2).position(|w| w[0] == hi && w[1] == lo)
+    data.windows(2).rposition(|w| w[0] == hi && w[1] == lo)
 }

@@ -333,7 +333,13 @@ impl NdpiLevel {
             let mut probe: Vec<usize> = wanted
                 .iter()
                 .copied()
-                .filter(|&i| starts[i] == -1 && hints[i] >= 2)
+                // A hint is a vendor tag, not a fact: `NDPI_MCU_STARTS` can
+                // name an offset past the end of the level. Reading there is an
+                // EOF error, and the `?` on the batch below would fail the whole
+                // region read over one bad entry the code means to discard.
+                .filter(|&i| {
+                    starts[i] == -1 && hints[i] >= 2 && (hints[i] as u64) <= self.end_in_file
+                })
                 .collect();
             // The marker probes are two bytes a tile apart, so sorting them is
             // what lets the backend coalesce a region's worth into one request.
@@ -377,6 +383,7 @@ impl NdpiLevel {
         while starts[first_good] == -1 {
             if let Some(hint) = self.unreliable.as_ref().map(|v| v[first_good])
                 && hint >= 2
+                && (hint as u64) <= self.end_in_file
                 && is_restart_marker(reader, hint as u64 - 2)?
             {
                 starts[first_good] = hint;

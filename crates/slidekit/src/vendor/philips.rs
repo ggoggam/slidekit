@@ -31,7 +31,7 @@ use crate::io::SlideReader;
 use crate::level::LevelInfo;
 use crate::properties::{self, Properties};
 use crate::vendor::aperio::decode_associated_image;
-use crate::vendor::generic_tiff::{make_decoder_for_dir, set_tiff_string_props};
+use crate::vendor::generic_tiff::{check_tile_size, make_decoder_for_dir, set_tiff_string_props};
 use crate::vendor::{LevelData, SlideData, VendorDriver};
 use quick_xml::Reader;
 use quick_xml::events::Event;
@@ -142,6 +142,7 @@ impl VendorDriver for PhilipsDriver {
                 let image_h = tl.get_uint(dir, tags::IMAGE_LENGTH)? as i64;
                 let tile_w = tl.get_uint(dir, tags::TILE_WIDTH)? as i64;
                 let tile_h = tl.get_uint(dir, tags::TILE_LENGTH)? as i64;
+                check_tile_size(tile_w, tile_h, dir)?;
 
                 // Levels must be stored largest-first.
                 if let Some(prev) = levels.last()
@@ -217,8 +218,13 @@ impl VendorDriver for PhilipsDriver {
         set_tiff_string_props(&mut tl, 0, &mut props);
         // Keep the (huge) XML document out of the property list.
         props.remove("tiff.ImageDescription");
-        if let Some((w, h)) = base_spacing {
-            // Pixel spacing is in mm; mpp wants microns.
+        // Pixel spacing is in mm; mpp wants microns. `parse_pixel_spacing` takes
+        // whatever `f64::from_str` accepts, which includes `0`, `NaN` and `inf`
+        // — and `format!("{:.10}", f64::NAN)` publishes the string "NaN" as a
+        // pixel size. OpenSlide omits the property instead.
+        if let Some((w, h)) =
+            base_spacing.filter(|(w, h)| w.is_finite() && h.is_finite() && *w > 0.0 && *h > 0.0)
+        {
             props.insert(properties::names::MPP_X, format!("{:.10}", 1e3 * w));
             props.insert(properties::names::MPP_Y, format!("{:.10}", 1e3 * h));
         }

@@ -237,16 +237,34 @@ fn read_uint_at(
 // ── Value size / type helpers ───────────────────────────────────────
 
 /// Returns (element_size, adjusted_count) for a TIFF type.
-/// Returns None for unknown types.
+///
+/// Returns None for an unknown type, and for a count the file cannot honestly
+/// mean: BigTIFF reads its count as a `u64` that lands in an `i64`, so the high
+/// bit makes it negative, and every caller multiplies it into a length.
 fn value_size_and_count(tag_type: u16, count: i64) -> Option<(u32, i64)> {
+    if count < 0 {
+        return None;
+    }
     match tag_type {
         TIFF_BYTE | TIFF_ASCII | TIFF_SBYTE | TIFF_UNDEFINED => Some((1, count)),
         TIFF_SHORT | TIFF_SSHORT => Some((2, count)),
         TIFF_LONG | TIFF_SLONG | TIFF_FLOAT | TIFF_IFD => Some((4, count)),
-        TIFF_RATIONAL | TIFF_SRATIONAL => Some((4, count * 2)),
+        TIFF_RATIONAL | TIFF_SRATIONAL => Some((4, count.checked_mul(2)?)),
         TIFF_DOUBLE | TIFF_LONG8 | TIFF_SLONG8 | TIFF_IFD8 => Some((8, count)),
         _ => None,
     }
+}
+
+/// The first element of a tag's value list.
+///
+/// A TIFF entry may declare a count of zero, in which case the value parses to
+/// an empty list while `has_tag` still reports the tag as present — so every
+/// `has_tag(..) { get_uint(..) }` pair in the crate would index element 0 of
+/// nothing.
+fn first_value<T>(values: &[T], dir: i64, tag: u16) -> Result<&T> {
+    values
+        .first()
+        .ok_or_else(|| OpenSlideError::Decode(format!("Empty value for dir {dir}, tag {tag}")))
 }
 
 /// Re-add implied high-order bits to a 32-bit offset (NDPI heuristic).
@@ -436,7 +454,14 @@ fn read_directory(
             }
         };
 
-        let total_value_len = elem_size as u64 * adjusted_count as u64;
+        // A count comes straight off the file, and in BigTIFF it is 64 bits: the
+        // product can wrap, and a wrapped one small enough to look inline sends
+        // `parse_values` reading `count` elements out of an 8-byte field.
+        let total_value_len = (elem_size as u64)
+            .checked_mul(adjusted_count as u64)
+            .ok_or_else(|| {
+                OpenSlideError::Decode(format!("TIFF tag {tag}: value length overflows"))
+            })?;
 
         let (value, deferred_offset) = if total_value_len <= value_field_size as u64 {
             // Value fits inline
@@ -650,8 +675,27 @@ impl TiffLike {
             OpenSlideError::Decode(format!("No such value: dir {dir}, tag {tag}"))
         })?;
         match &item.value {
-            TiffValue::Uints(v) => Ok(v[0]),
-            TiffValue::UintsAndBuffer(v, _) => Ok(v[0]),
+            TiffValue::Uints(v) | TiffValue::UintsAndBuffer(v, _) => {
+                first_value(v, dir, tag).copied()
+            }
+            _ => Err(OpenSlideError::Decode(format!(
+                "Unexpected value type for dir {dir}, tag {tag}, type {}",
+                item.tag_type
+            ))),
+        }
+    }
+
+    /// Borrow a tag's unsigned integer values, without the clone `get_uints`
+    /// makes. The value must already be loaded — call `ensure_loaded` first.
+    ///
+    /// Taking `&self` lets a caller hold two of these at once, which is what
+    /// `tile_location` needs.
+    fn uints_of(&self, dir: i64, tag: u16) -> Result<&[u64]> {
+        let item = self.get_item(dir, tag).ok_or_else(|| {
+            OpenSlideError::Decode(format!("No such value: dir {dir}, tag {tag}"))
+        })?;
+        match &item.value {
+            TiffValue::Uints(v) | TiffValue::UintsAndBuffer(v, _) => Ok(v),
             _ => Err(OpenSlideError::Decode(format!(
                 "Unexpected value type for dir {dir}, tag {tag}, type {}",
                 item.tag_type
@@ -682,7 +726,7 @@ impl TiffLike {
             OpenSlideError::Decode(format!("No such value: dir {dir}, tag {tag}"))
         })?;
         match &item.value {
-            TiffValue::Sints(v) => Ok(v[0]),
+            TiffValue::Sints(v) => first_value(v, dir, tag).copied(),
             _ => Err(OpenSlideError::Decode(format!(
                 "Unexpected value type for dir {dir}, tag {tag}, type {}",
                 item.tag_type
@@ -697,7 +741,7 @@ impl TiffLike {
             OpenSlideError::Decode(format!("No such value: dir {dir}, tag {tag}"))
         })?;
         match &item.value {
-            TiffValue::Floats(v) => Ok(v[0]),
+            TiffValue::Floats(v) => first_value(v, dir, tag).copied(),
             _ => Err(OpenSlideError::Decode(format!(
                 "Unexpected value type for dir {dir}, tag {tag}, type {}",
                 item.tag_type
@@ -812,8 +856,14 @@ impl TiffLike {
     /// Call [`preload_tile_tables`](Self::preload_tile_tables) first if this
     /// must not perform blocking I/O (e.g. from within an async runtime).
     pub fn tile_location(&mut self, dir: i64, tile_index: usize) -> Result<Option<(u64, usize)>> {
-        let offsets = self.get_uints(dir, tags::TILE_OFFSETS)?;
-        let byte_counts = self.get_uints(dir, tags::TILE_BYTE_COUNTS)?;
+        // Borrow the tables rather than `get_uints`, which clones both in full.
+        // This runs once per cache-missing tile, and a level-0 Aperio directory
+        // has tens of thousands of them: copying ~370 KB of offsets to read two
+        // integers cost more than the tile fetch it was preparing.
+        self.ensure_loaded(dir, tags::TILE_OFFSETS)?;
+        self.ensure_loaded(dir, tags::TILE_BYTE_COUNTS)?;
+        let offsets = self.uints_of(dir, tags::TILE_OFFSETS)?;
+        let byte_counts = self.uints_of(dir, tags::TILE_BYTE_COUNTS)?;
 
         if tile_index >= offsets.len() || tile_index >= byte_counts.len() {
             return Err(OpenSlideError::Decode(format!(
@@ -954,7 +1004,21 @@ impl TiffLike {
         let (elem_size, adjusted_count) = value_size_and_count(tag_type, count)
             .ok_or_else(|| OpenSlideError::Decode(format!("Unknown type: {tag_type}")))?;
 
-        let total_len = elem_size as usize * adjusted_count as usize;
+        let total_len = (elem_size as u64)
+            .checked_mul(adjusted_count as u64)
+            .ok_or_else(|| {
+                OpenSlideError::Decode(format!("TIFF tag {tag}: value length overflows"))
+            })? as usize;
+        // The length is the file's own count field, so a 200-byte file can ask
+        // for gigabytes. Refusing anything that cannot fit in the file turns an
+        // allocation abort into an ordinary parse error; `read_exact_at` below
+        // would have rejected it too, but only after the allocation.
+        let file_size = self.reader.size()?;
+        if total_len as u64 > file_size {
+            return Err(OpenSlideError::Decode(format!(
+                "TIFF tag {tag}: declares {total_len} bytes, file holds {file_size}"
+            )));
+        }
         let mut buf = vec![0u8; total_len];
         self.reader.read_exact_at(file_offset, &mut buf)?;
 
