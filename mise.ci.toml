@@ -1,0 +1,6 @@
+[env]
+# nextest starts a process per test, and JPEG decoding creates a Rayon pool
+# inside each process. Bound both layers to avoid exhausting the CI runner's
+# thread limit while keeping tests and decoding parallel.
+NEXTEST_TEST_THREADS = "4"
+RAYON_NUM_THREADS = "2"
