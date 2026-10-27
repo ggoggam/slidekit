@@ -55,24 +55,24 @@ impl TileDecoder for JxlDecoder {
         let mut out = Vec::with_capacity(count);
         match channels {
             1 => {
-                for c in samples.chunks_exact(1).take(count) {
+                for c in samples.as_chunks::<1>().0.iter().take(count) {
                     let g = q(c[0]);
                     out.push(argb(0xFF, g, g, g));
                 }
             }
             2 => {
-                for c in samples.chunks_exact(2).take(count) {
+                for c in samples.as_chunks::<2>().0.iter().take(count) {
                     let g = q(c[0]);
                     out.push(argb(q(c[1]), g, g, g));
                 }
             }
             3 => {
-                for c in samples.chunks_exact(3).take(count) {
+                for c in samples.as_chunks::<3>().0.iter().take(count) {
                     out.push(argb(0xFF, q(c[0]), q(c[1]), q(c[2])));
                 }
             }
             4 => {
-                for c in samples.chunks_exact(4).take(count) {
+                for c in samples.as_chunks::<4>().0.iter().take(count) {
                     out.push(argb(q(c[3]), q(c[0]), q(c[1]), q(c[2])));
                 }
             }

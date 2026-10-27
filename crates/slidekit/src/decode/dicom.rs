@@ -1213,8 +1213,10 @@ fn parse_pixel_data(cur: &mut Cursor, length: u32) -> Result<(PixelData, bool)> 
     }
     let bot_bytes = cur.take(header.length as usize)?;
     let basic_offset_table = bot_bytes
-        .chunks_exact(4)
-        .map(|c| u32::from_le_bytes(c.try_into().expect("4-byte chunk")))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| u32::from_le_bytes(*c))
         .collect();
 
     Ok((

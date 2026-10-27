@@ -431,7 +431,9 @@ fn decode_zstd(raw: &[u8]) -> Result<Vec<u32>> {
     }
     // Stored as big-endian ARGB32, one u32 per pixel (matches the C driver).
     Ok(bytes
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .take(IMAGE_PX)
         .map(|c| u32::from_be_bytes([c[0], c[1], c[2], c[3]]))
         .collect())

@@ -48,12 +48,16 @@ pub fn samples_to_argb(
     let pixel_count = (width as usize) * (height as usize);
     match samples_per_pixel {
         4 if data.len() >= pixel_count * 4 => Ok(data
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .take(pixel_count)
             .map(|c| argb(c[3], c[0], c[1], c[2]))
             .collect()),
         3 if data.len() >= pixel_count * 3 => Ok(data
-            .chunks_exact(3)
+            .as_chunks::<3>()
+            .0
+            .iter()
             .take(pixel_count)
             .map(|c| argb(0xFF, c[0], c[1], c[2]))
             .collect()),

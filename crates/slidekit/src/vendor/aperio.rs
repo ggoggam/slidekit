@@ -409,13 +409,13 @@ pub(crate) fn decode_associated_image(
             let pixel_count = (w * h) as usize;
             if strip_data.len() >= pixel_count * 4 {
                 let mut argb_buf = Vec::with_capacity(pixel_count);
-                for chunk in strip_data.chunks_exact(4) {
+                for chunk in strip_data.as_chunks::<4>().0.iter() {
                     argb_buf.push(argb(chunk[3], chunk[0], chunk[1], chunk[2]));
                 }
                 Ok(argb_buf)
             } else if strip_data.len() >= pixel_count * 3 {
                 let mut argb_buf = Vec::with_capacity(pixel_count);
-                for chunk in strip_data.chunks_exact(3) {
+                for chunk in strip_data.as_chunks::<3>().0.iter() {
                     argb_buf.push(argb(0xFF, chunk[0], chunk[1], chunk[2]));
                 }
                 Ok(argb_buf)

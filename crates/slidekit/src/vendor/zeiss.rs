@@ -643,26 +643,26 @@ fn samples_to_argb(data: &[u8], pixel_type: i32, w: i64, h: i64) -> Result<Vec<u
         }
         PT_GRAY16 => {
             need(data, n * 2)?;
-            for c in data[..n * 2].chunks_exact(2) {
+            for c in data[..n * 2].as_chunks::<2>().0.iter() {
                 let g = c[1]; // high byte of little-endian 16-bit sample
                 out.push(argb(0xFF, g, g, g));
             }
         }
         PT_BGR24 => {
             need(data, n * 3)?;
-            for c in data[..n * 3].chunks_exact(3) {
+            for c in data[..n * 3].as_chunks::<3>().0.iter() {
                 out.push(argb(0xFF, c[2], c[1], c[0])); // B,G,R → R,G,B
             }
         }
         PT_BGR48 => {
             need(data, n * 6)?;
-            for c in data[..n * 6].chunks_exact(6) {
+            for c in data[..n * 6].as_chunks::<6>().0.iter() {
                 out.push(argb(0xFF, c[5], c[3], c[1])); // high bytes of B,G,R
             }
         }
         PT_BGRA32 => {
             need(data, n * 4)?;
-            for c in data[..n * 4].chunks_exact(4) {
+            for c in data[..n * 4].as_chunks::<4>().0.iter() {
                 out.push(argb(c[3], c[2], c[1], c[0])); // B,G,R,A → A,R,G,B
             }
         }
@@ -899,7 +899,7 @@ fn decode_jpeg_sized(data: &[u8]) -> Option<(Vec<u32>, i64, i64)> {
     let mut out = Vec::with_capacity(w * h);
     match info.pixel_format {
         jpeg_decoder::PixelFormat::RGB24 => {
-            for c in pixels.chunks_exact(3) {
+            for c in pixels.as_chunks::<3>().0.iter() {
                 out.push(argb(0xFF, c[0], c[1], c[2]));
             }
         }

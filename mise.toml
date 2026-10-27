@@ -4,7 +4,7 @@
 [tools]
 # The Rust backend can resolve "latest" even in locked mode on a fresh runner.
 # Keep compiler/Clippy upgrades explicit so new lints do not break unchanged code.
-rust = "1.97.1"
+rust = "1.99.1"
 # cargo-nextest: runs tests from every crate's every test binary in one global
 # thread pool, so slidekit's I/O-bound integration binaries overlap instead of
 # running one binary at a time like `cargo test` does.
@@ -20,7 +20,7 @@ rust = "1.97.1"
 # `cargo-nextest-<version>` because the repo ships several crates. Same 0.9.140
 # binary the source build was producing, minus the C toolchain and the minutes
 # spent compiling a test runner.
-"github:nextest-rs/nextest" = "cargo-nextest-0.9.140"
+"github:nextest-rs/nextest" = "cargo-nextest-0.9.149"
 
 [tasks."pre-commit"]
 description = "Run pre-commit checks via prek"

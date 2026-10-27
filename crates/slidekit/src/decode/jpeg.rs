@@ -113,7 +113,7 @@ impl TileDecoder for JpegDecoder {
 
         match info.pixel_format {
             jpeg_decoder::PixelFormat::RGB24 => {
-                for chunk in pixels.chunks_exact(3) {
+                for chunk in pixels.as_chunks::<3>().0.iter() {
                     argb_buf.push(argb(0xFF, chunk[0], chunk[1], chunk[2]));
                 }
             }
@@ -123,14 +123,14 @@ impl TileDecoder for JpegDecoder {
                 }
             }
             jpeg_decoder::PixelFormat::L16 => {
-                for chunk in pixels.chunks_exact(2) {
+                for chunk in pixels.as_chunks::<2>().0.iter() {
                     let gray = chunk[0]; // Use high byte
                     argb_buf.push(argb(0xFF, gray, gray, gray));
                 }
             }
             jpeg_decoder::PixelFormat::CMYK32 => {
                 // Simple CMYK→RGB: R = 255 - C, G = 255 - M, B = 255 - Y, scaled by K
-                for chunk in pixels.chunks_exact(4) {
+                for chunk in pixels.as_chunks::<4>().0.iter() {
                     let c = chunk[0] as f32 / 255.0;
                     let m = chunk[1] as f32 / 255.0;
                     let y = chunk[2] as f32 / 255.0;
