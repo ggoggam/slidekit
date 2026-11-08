@@ -1,7 +1,17 @@
-# slidekit is the only Rust project in the monorepo, so its toolchain is pinned
-# here rather than at the workspace root — every project's CI job loads the root
-# config, and nothing else needs cargo.
+# Floor for local use AND the exact version CI installs: .github/workflows/ci.yml
+# parses this line and passes it to jdx/mise-action as `version:`.
+min_version = "2026.11.2"
+
+[settings]
+# Pin exact tool versions (and per-platform download URLs/checksums) in mise.lock.
+# CI installs with `--locked` and sets MISE_LOCKED, so keep the lock complete
+# for every platform. Refresh with:
+#   mise lock -p linux-x64,linux-x64-musl,linux-arm64,linux-arm64-musl,macos-arm64,macos-x64,windows-x64
+lockfile = true
+
 [tools]
+# prek runs .pre-commit-config.yaml (the `pre-commit` task below).
+prek = "latest"
 # The Rust backend can resolve "latest" even in locked mode on a fresh runner.
 # Keep compiler/Clippy upgrades explicit so new lints do not break unchanged code.
 rust = "1.99.1"
