@@ -22,10 +22,12 @@ mise run lint              # clippy with -D warnings
 mise run pre-commit        # what CI's pre-commit job runs
 ```
 
-CI runs `pre-commit` and `test` on every pull request, on GitHub-hosted runners. The integration
-slides come from the OpenSlide test-data server, which is slow (about 2 MB/s), so the first full
-run on a new machine takes a while. Set `OPENSLIDE_TEST_CACHE` to keep them somewhere shared, or
-`OPENSLIDE_SKIP_DOWNLOAD=1` to skip them.
+CI runs `pre-commit` and the unit tests (`mise run test:unit`) on every pull request, on
+GitHub-hosted runners. It doesn't download the integration slides (5.8 GiB from the OpenSlide
+test-data server), so the tests that need them are skipped there. Run `mise run test` locally
+before a pull request that touches a driver, a codec or the read path, and say so in the template.
+The first run downloads the slides into `target/testdata`; set `OPENSLIDE_TEST_CACHE` to keep them
+somewhere shared.
 
 ## Layout
 

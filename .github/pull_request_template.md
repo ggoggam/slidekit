@@ -18,7 +18,7 @@
 <!-- The commands you ran, and the slides you tried it on. -->
 
 - [ ] `mise run pre-commit`
-- [ ] `mise run test` (or `test:unit`, with a reason the slides weren't run)
+- [ ] `mise run test`, with the integration slides (CI runs only `test:unit`)
 - [ ] Checked against OpenSlide (`mise run bench:openslide`, slidetool or openslide-python)
 
 ```sh
