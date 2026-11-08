@@ -9,6 +9,13 @@ Every codec is pure Rust except JPEG 2000, which decodes through OpenJPEG so
 that it matches OpenSlide bit-for-bit; a pure-Rust build is still one feature
 flag away. See [Compression / decoders](#compression--decoders).
 
+> [!WARNING]
+> **slidekit is experimental.** It is pre-1.0 and not yet on crates.io, the API
+> can change between commits, and it has been tested against the public
+> OpenSlide test slides rather than in production. Don't rely on it for
+> clinical or diagnostic work. Where pixels must be right, check them against
+> OpenSlide. See [Status](#status).
+
 ```rust
 use slidekit::OpenSlide;
 
@@ -81,7 +88,9 @@ the C API makes between `openslide_get_icc_profile_size` and
 | JPEG XR (CZI) | ❌ | No pure-Rust decoder |
 | BMP | ❌ | Planned (rare MIRAX levels) |
 
-`cargo add slidekit` is the whole install: there is no system package for a
+Installing is just adding the crate. It isn't on crates.io yet, so depend on
+the repository for now
+(`slidekit = { git = "https://github.com/ggoggam/slidekit" }`). There is no system package for a
 user to find and no `cmake`/`pkg-config` step. Every codec but JPEG 2000 is pure
 Rust with no build script at all.
 
@@ -206,9 +215,27 @@ defects they surfaced, and what is still outstanding — are in
 
 ## Status
 
-Core library, I/O layer, and eleven vendor drivers are implemented. Python
-bindings (PyO3), the CLI, and the C-compatible FFI crate are planned — see
-[`PROGRESS.md`](PROGRESS.md) for the detailed checklist.
+Experimental. Core library, I/O layer, and eleven vendor drivers are
+implemented. Python bindings (PyO3), the CLI, and the C-compatible FFI crate are
+planned — see [`PROGRESS.md`](PROGRESS.md) for the detailed checklist.
+
+What that means in practice:
+
+- **No stability promise.** The version is 0.1.0 and nothing is published yet.
+  Public types and signatures change when parity with OpenSlide needs them to,
+  without a deprecation period. Pin a commit.
+- **Tested on public slides only.** Every driver is exercised against the
+  [OpenSlide test data](https://openslide.cs.cmu.edu/download/openslide-testdata/)
+  and cross-checked with OpenSlide 4.0.1 (`mise run bench:openslide`). Slides
+  from other scanners, firmware or software versions in the same format may
+  still open wrongly or not at all.
+- **Partial formats.** The deferred cases in [the format table](#vendor-format-support)
+  (multi-region SCN, z-stacks, fluorescence, JPEG XR CZI) are known gaps.
+- **Not for clinical use.** slidekit is not validated for diagnosis or any
+  other decision about a patient. Use OpenSlide where that matters.
+
+Reports of slides that read differently from OpenSlide are the most useful
+contribution right now.
 
 ## Contributing
 

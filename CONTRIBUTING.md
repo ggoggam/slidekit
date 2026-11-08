@@ -5,6 +5,11 @@ is to be correct first: the same pixels, levels, properties and associated image
 4.0 on the same file, then faster. Rust comes through mise, and a C compiler is the only other
 thing a default build needs (for the vendored OpenJPEG).
 
+slidekit is experimental (see [Status](README.md#status)): pre-1.0, unpublished, and with no API
+stability promise yet. That makes now a good time for breaking changes that bring it closer to
+OpenSlide, and reports of slides it reads differently from OpenSlide are the most useful
+contribution of all.
+
 ```sh
 mise trust
 mise install               # rust, cargo-nextest and prek, pinned in mise.lock
