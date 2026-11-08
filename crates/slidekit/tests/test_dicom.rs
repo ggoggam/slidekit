@@ -28,35 +28,11 @@ use std::path::PathBuf;
 
 /// Extract a DICOM slide ZIP into its own directory under the test cache and
 /// return the path of one `.dcm` instance inside it.
+///
+/// Through `common::extracted_slide_dir`, whose lock keeps concurrent test
+/// processes from extracting over each other (see `test_mirax.rs`).
 fn dicom_slide_path(manifest_path: &str) -> Option<PathBuf> {
-    let zip_path = common::test_slide_path(manifest_path)?;
-    let stem = zip_path.file_stem()?.to_str()?.to_string();
-    let extract_dir = zip_path.parent()?.join("extracted").join(&stem);
-
-    if !extract_dir.exists() {
-        let tmp_dir = extract_dir.with_extension("partial");
-        std::fs::remove_dir_all(&tmp_dir).ok();
-        std::fs::create_dir_all(&tmp_dir).ok()?;
-        let file = std::fs::File::open(&zip_path).ok()?;
-        let mut archive = zip::ZipArchive::new(file).ok()?;
-        for i in 0..archive.len() {
-            let mut entry = archive.by_index(i).ok()?;
-            let name = entry.name().to_string();
-            if name.ends_with('/') {
-                continue;
-            }
-            let out_path = tmp_dir.join(&name);
-            if let Some(parent) = out_path.parent() {
-                std::fs::create_dir_all(parent).ok()?;
-            }
-            let mut out_file = std::fs::File::create(&out_path).ok()?;
-            std::io::copy(&mut entry, &mut out_file).ok()?;
-        }
-        // Rename last, so a killed run can't leave a half-extracted directory
-        // that later runs would treat as complete.
-        std::fs::rename(&tmp_dir, &extract_dir).ok()?;
-    }
-
+    let extract_dir = common::extracted_slide_dir(manifest_path, true)?;
     first_instance(&extract_dir)
 }
 

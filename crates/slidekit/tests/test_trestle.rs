@@ -358,39 +358,12 @@ fn bad_software_falls_through_to_generic_tiff() {
 // ── Integration tests (real test data) ─────────────────────────────
 
 /// Helper to get the Trestle test slide path (extracts from ZIP if needed).
+///
+/// Through `common::extracted_slide_dir`, so concurrent test processes never
+/// read a half-written extraction (see `test_mirax.rs`).
 fn trestle_slide_path() -> Option<std::path::PathBuf> {
-    let zip_path = common::test_slide_path("Trestle/CMU-1.zip")?;
-    let extract_dir = zip_path.parent()?.join("extracted");
-    let tif_path = extract_dir.join("CMU-1.tif");
-
-    if tif_path.exists() {
-        return Some(tif_path);
-    }
-
-    // Extract the ZIP
-    std::fs::create_dir_all(&extract_dir).ok()?;
-    let file = std::fs::File::open(&zip_path).ok()?;
-    let mut archive = zip::ZipArchive::new(file).ok()?;
-
-    for i in 0..archive.len() {
-        let mut entry = archive.by_index(i).ok()?;
-        let name = entry.name().to_string();
-        if name.ends_with('/') {
-            continue;
-        }
-        let out_path = extract_dir.join(&name);
-        if let Some(parent) = out_path.parent() {
-            std::fs::create_dir_all(parent).ok()?;
-        }
-        let mut out_file = std::fs::File::create(&out_path).ok()?;
-        std::io::copy(&mut entry, &mut out_file).ok()?;
-    }
-
-    if tif_path.exists() {
-        Some(tif_path)
-    } else {
-        None
-    }
+    let tif_path = common::extracted_slide_dir("Trestle/CMU-1.zip", false)?.join("CMU-1.tif");
+    tif_path.exists().then_some(tif_path)
 }
 
 macro_rules! require_trestle_slide {
