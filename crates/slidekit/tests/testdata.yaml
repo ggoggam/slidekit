@@ -1,19 +1,16 @@
 # Vendor test slides downloaded from the OpenSlide test data server.
 #
 # This file is git-tracked and is the single source of truth for the
-# integration test fixtures. It serves three purposes:
+# integration test fixtures. It serves two purposes:
 #
 #   1. `tests/common/mod.rs` parses it to know what to download, where to fetch
 #      it, and which SHA-256 to verify against.
-#   2. CI keys its test cache on this file's hash (see .github/projects.json
-#      `lockfile`), so downloaded slides are reused across runs and only
-#      re-fetched when this manifest changes — never on unrelated code churn.
-#   3. CI sums the `size` fields (see `mise run test`); if the declared total
-#      exceeds 10 GiB, integration downloads are skipped to keep CI bounded.
+#   2. `mise run test` sums the `size` fields; if the declared total exceeds
+#      10 GiB, integration downloads are skipped. CI runs only `test:unit`,
+#      which skips them regardless.
 #
 # `size` is the exact Content-Length served by the data server, in bytes. Keep
-# it accurate: it drives the 10 GiB CI budget decision before anything is
-# fetched.
+# it accurate: it drives the 10 GiB budget decision before anything is fetched.
 
 base_url: https://openslide.cs.cmu.edu/download/openslide-testdata/
 
