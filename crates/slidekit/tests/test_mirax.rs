@@ -19,32 +19,13 @@ use slidekit::OpenSlide;
 
 /// Extract the MIRAX ZIP (preserving its `CMU-1/` dir + `CMU-1.mrxs`) and
 /// return the path to the extracted `.mrxs` file.
+///
+/// Goes through `common::extracted_slide_dir`, which serializes extraction
+/// across test processes and lands it with a rename. Unzipping here directly
+/// let one process read `Data####.dat` files another was still writing, or
+/// truncating with `File::create`, whenever several started on a cold cache.
 fn mirax_slide_path() -> Option<std::path::PathBuf> {
-    let zip_path = common::test_slide_path("Mirax/CMU-1.zip")?;
-    let extract_dir = zip_path.parent()?.join("extracted");
-    let mrxs_path = extract_dir.join("CMU-1.mrxs");
-
-    if mrxs_path.exists() {
-        return Some(mrxs_path);
-    }
-
-    std::fs::create_dir_all(&extract_dir).ok()?;
-    let file = std::fs::File::open(&zip_path).ok()?;
-    let mut archive = zip::ZipArchive::new(file).ok()?;
-    for i in 0..archive.len() {
-        let mut entry = archive.by_index(i).ok()?;
-        let name = entry.name().to_string();
-        if name.ends_with('/') {
-            continue;
-        }
-        let out_path = extract_dir.join(&name);
-        if let Some(parent) = out_path.parent() {
-            std::fs::create_dir_all(parent).ok()?;
-        }
-        let mut out_file = std::fs::File::create(&out_path).ok()?;
-        std::io::copy(&mut entry, &mut out_file).ok()?;
-    }
-
+    let mrxs_path = common::extracted_slide_dir("Mirax/CMU-1.zip", false)?.join("CMU-1.mrxs");
     mrxs_path.exists().then_some(mrxs_path)
 }
 
