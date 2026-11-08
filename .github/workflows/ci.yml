@@ -1,0 +1,106 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  merge_group:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Loads mise.ci.toml (test thread limits for the runner).
+  MISE_ENV: ci
+  # Install and run tasks against the committed mise.lock only.
+  MISE_LOCKED: "true"
+
+# GitHub-hosted runners only. This repo is public, so hosted minutes cost nothing.
+jobs:
+  ci:
+    name: ${{ matrix.task }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        task: [pre-commit, test]
+    steps:
+      - uses: actions/checkout@v6
+
+      # One source of truth for the mise version: min_version in mise.toml.
+      - name: Resolve mise version from mise.toml
+        id: mise_version
+        run: |
+          v=$(sed -n 's/^min_version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' mise.toml)
+          test -n "$v" || { echo "::error::could not parse min_version from mise.toml"; exit 1; }
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+
+      - uses: jdx/mise-action@v5
+        with:
+          version: ${{ steps.mise_version.outputs.version }}
+          install_args: --locked
+
+      # mise's rust backend only points at rustup, so the toolchain itself (and the
+      # rustfmt/clippy components the pre-commit hooks call) is installed here.
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.rustup
+            ~/.cargo/bin
+          key: rust-${{ runner.os }}-${{ runner.arch }}-${{ env.RUSTUP_TOOLCHAIN }}
+
+      - name: Install compiler and lint components
+        run: |
+          set -euo pipefail
+          test -n "$RUSTUP_TOOLCHAIN"
+          for attempt in 1 2 3; do
+            if rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --component rustfmt --component clippy; then
+              rustc --version
+              cargo clippy --version
+              exit 0
+            fi
+            if [ "$attempt" -eq 3 ]; then
+              exit 1
+            fi
+            echo "Rust download failed; retrying in $((attempt * 5)) seconds."
+            sleep "$((attempt * 5))"
+          done
+
+      # Cargo.lock is not committed (this is a library), so the manifests key the cache.
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/prek
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ matrix.task }}-${{ runner.os }}-${{ env.RUSTUP_TOOLCHAIN }}-${{ hashFiles('**/Cargo.toml', '.pre-commit-config.yaml') }}
+          restore-keys: |
+            cargo-${{ matrix.task }}-${{ runner.os }}-${{ env.RUSTUP_TOOLCHAIN }}-
+
+      # The integration slides (several GiB, listed in testdata.yaml) come from the
+      # throttled CMU server (~2 MB/s), so a cold run takes the better part of an hour.
+      # Keyed on the manifest: adding a vendor downloads only that slide once.
+      - name: Cache test slides
+        if: matrix.task == 'test'
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/openslide-testdata
+          key: testdata-${{ hashFiles('crates/slidekit/tests/testdata.yaml') }}
+          restore-keys: |
+            testdata-
+
+      - name: Pre-commit
+        if: matrix.task == 'pre-commit'
+        run: mise run pre-commit
+
+      - name: Test
+        if: matrix.task == 'test'
+        run: |
+          export OPENSLIDE_TEST_CACHE="$HOME/.cache/openslide-testdata"
+          mise run test
