@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/ggoggam/slidekit/security/advisories/new
+    about: A file that crashes, hangs or exhausts memory, or any other security problem. Report it privately, not as an issue.
+  - name: A problem with OpenSlide itself
+    url: https://github.com/openslide/openslide/issues
+    about: slidekit is a separate Rust port. Bugs in the C library go to OpenSlide.

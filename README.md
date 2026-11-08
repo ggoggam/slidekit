@@ -210,6 +210,13 @@ Core library, I/O layer, and eleven vendor drivers are implemented. Python
 bindings (PyO3), the CLI, and the C-compatible FFI crate are planned — see
 [`PROGRESS.md`](PROGRESS.md) for the detailed checklist.
 
+## Contributing
+
+Bug reports, test-slide findings and pull requests are welcome. See
+[CONTRIBUTING.md](CONTRIBUTING.md) for the setup and the rules on test slides,
+and [SECURITY.md](SECURITY.md) for reporting a file that crashes or hangs
+slidekit.
+
 ## License
 
 LGPL-2.1, matching upstream OpenSlide.
