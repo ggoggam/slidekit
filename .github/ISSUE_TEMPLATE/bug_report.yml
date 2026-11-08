@@ -1,0 +1,86 @@
+name: Bug report
+description: slidekit reads a slide wrongly, fails to open one, or behaves differently from OpenSlide.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Never attach or link a clinical slide.** Label and macro images and slide properties often
+        contain patient names, dates and accession numbers. Reproduce on a slide from the
+        [OpenSlide test data](https://openslide.cs.cmu.edu/download/openslide-testdata/) if you can,
+        and redact property values otherwise. A file that crashes or hangs slidekit is a
+        [security report](https://github.com/ggoggam/slidekit/security/advisories/new), not an issue.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you saw, and what you expected instead.
+    validations:
+      required: true
+  - type: dropdown
+    id: format
+    attributes:
+      label: Format
+      options:
+        - Aperio (.svs)
+        - DICOM WSI
+        - Generic tiled TIFF
+        - Hamamatsu (.ndpi)
+        - Leica (.scn)
+        - MIRAX (.mrxs)
+        - Philips TIFF
+        - Trestle
+        - Ventana (.bif)
+        - Zeiss (.czi)
+        - Other, or not detected
+    validations:
+      required: true
+  - type: input
+    id: slide
+    attributes:
+      label: Slide
+      description: A path from the OpenSlide test data if it reproduces there, otherwise the scanner and software version.
+      placeholder: Aperio/CMU-1.svs, or "Aperio GT 450, ScanScope 2.x"
+  - type: textarea
+    id: repro
+    attributes:
+      label: Code to reproduce
+      description: The smallest call sequence that shows it.
+      render: rust
+      placeholder: |
+        let slide = slidekit::OpenSlide::open("CMU-1.svs")?;
+        let region = slide.read_region(0, 0, 0, 512, 512)?;
+    validations:
+      required: true
+  - type: textarea
+    id: openslide
+    attributes:
+      label: What OpenSlide does
+      description: The same call through OpenSlide 4.0 (slidetool, openslide-python), if you checked.
+  - type: dropdown
+    id: source
+    attributes:
+      label: Where the slide is read from
+      options:
+        - Local file
+        - S3, GCS or Azure (open_url / open_store)
+        - HTTP
+        - A custom SlideFs
+  - type: input
+    id: version
+    attributes:
+      label: slidekit version or commit, and features
+      placeholder: 0.1.0 with default features / main@abc1234 with --features hayro
+    validations:
+      required: true
+  - type: input
+    id: platform
+    attributes:
+      label: OS, architecture and Rust version
+      placeholder: macOS 26 arm64, rustc 1.99.1
+  - type: textarea
+    id: logs
+    attributes:
+      label: Error output
+      description: The error or backtrace (RUST_BACKTRACE=1). Remove credentials and signed URLs first.
+      render: text

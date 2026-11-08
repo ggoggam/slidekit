@@ -1,0 +1,51 @@
+name: Feature request
+description: A format, codec, API or storage backend slidekit could support.
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        slidekit aims for parity with the OpenSlide C API first. Features OpenSlide has are the
+        easiest to take. Features beyond it (new formats, codecs or bindings) are welcome, but
+        expect a discussion first. The README's tables list what's supported, deferred and planned.
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - Vendor format
+        - Codec
+        - API (OpenSlide parity)
+        - Storage / I/O
+        - Bindings (Python, C FFI, CLI)
+        - Performance
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: What you're trying to do
+      description: The situation that brought you here, such as "read z-stacked NDPI slides".
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What you'd like slidekit to do
+    validations:
+      required: true
+  - type: input
+    id: reference
+    attributes:
+      label: The OpenSlide function or spec behind it, if you know
+      placeholder: openslide_read_region, DICOM PS3.3 A.32.8, ...
+  - type: input
+    id: testdata
+    attributes:
+      label: A public test slide for it
+      description: New formats need one to test against. The OpenSlide test data is the first place to look.
+  - type: textarea
+    id: else
+    attributes:
+      label: Anything else
