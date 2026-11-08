@@ -159,8 +159,9 @@ cargo test    # unit tests run always; integration tests auto-download
 
 Integration tests fetch real slides from the OpenSlide test-data server and
 verify SHA-256 checksums. They skip gracefully (rather than fail) when
-downloads are disabled via `OPENSLIDE_SKIP_DOWNLOAD` — used by CI once the
-declared fixture size exceeds its budget.
+downloads are disabled via `OPENSLIDE_SKIP_DOWNLOAD`, which is how CI runs
+them (`mise run test:unit`). `mise run test` also skips them if the declared
+fixture size exceeds its 10 GiB budget.
 
 ## Benchmarks
 

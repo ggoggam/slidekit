@@ -10,8 +10,8 @@ on:
 permissions:
   contents: read
 
-# Superseded pull request runs are cancelled. Runs on main are not: they're what seeds the
-# caches every pull request restores from, and a cancelled job saves nothing.
+# Superseded pull request runs are cancelled. Runs on main are not: they seed the cargo caches
+# pull requests restore from, and a cancelled job saves nothing.
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
@@ -85,69 +85,6 @@ jobs:
           restore-keys: |
             cargo-${{ matrix.task }}-${{ runner.os }}-${{ env.RUSTUP_TOOLCHAIN }}-
 
-      # The integration slides (5.8 GiB, listed in testdata.yaml) come from the OpenSlide
-      # test-data server, which throttles each connection to well under 1 MB/s. Fetched by the
-      # tests themselves, one connection per slide, a cold run took hours, and a plain
-      # actions/cache step only saves once the whole job succeeds, so a cancelled or failing
-      # run threw the download away and the next one started cold again.
-      #
-      # So the slides are restored, topped up and saved as their own steps, before any test
-      # runs: aria2c fetches each missing slide over 16 ranged connections and checks its
-      # SHA-256, the `.verified` markers spare the tests from re-hashing gigabytes, and the
-      # cache is saved straight away. The key follows the manifest, and restore-keys hands
-      # back the previous set, so adding a slide downloads only that slide.
-      - name: Restore test slides
-        if: matrix.task == 'test'
-        id: slides
-        uses: actions/cache/restore@v4
-        with:
-          path: ~/.cache/openslide-testdata
-          key: testdata-${{ hashFiles('crates/slidekit/tests/testdata.yaml') }}
-          restore-keys: |
-            testdata-
-
-      - name: Download missing test slides
-        if: matrix.task == 'test' && steps.slides.outputs.cache-hit != 'true'
-        run: |
-          set -euo pipefail
-          manifest=crates/slidekit/tests/testdata.yaml
-          dest="$HOME/.cache/openslide-testdata"
-          base=$(sed -n 's/^base_url:[[:space:]]*//p' "$manifest")
-          mkdir -p "$dest"
-
-          # path, sha256 per slide, skipping any already restored and verified.
-          awk '/^  - path:/{p=$3} /^    sha256:/{print p, $2}' "$manifest" > "$RUNNER_TEMP/slides"
-          : > "$RUNNER_TEMP/aria2.txt"
-          while read -r path sha; do
-            marker="$dest/${path%.*}.verified"
-            if [ -f "$dest/$path" ] && [ "$(cat "$marker" 2>/dev/null)" = "$sha" ]; then
-              continue
-            fi
-            rm -f "$dest/$path" "$marker"
-            printf '%s%s\n  out=%s\n  checksum=sha-256=%s\n' "$base" "$path" "$path" "$sha" >> "$RUNNER_TEMP/aria2.txt"
-          done < "$RUNNER_TEMP/slides"
-
-          if [ -s "$RUNNER_TEMP/aria2.txt" ]; then
-            sudo apt-get install -y -qq aria2 > /dev/null
-            aria2c --input-file="$RUNNER_TEMP/aria2.txt" --dir="$dest" \
-              --max-concurrent-downloads=4 --split=16 --max-connection-per-server=16 \
-              --min-split-size=8M --file-allocation=none --check-integrity=true \
-              --max-tries=10 --retry-wait=10 --summary-interval=60 --console-log-level=warn
-          fi
-
-          # Markers in the format tests/common/mod.rs writes, newer than each slide.
-          while read -r path sha; do
-            printf '%s' "$sha" > "$dest/${path%.*}.verified"
-          done < "$RUNNER_TEMP/slides"
-          du -sh "$dest"
-
-      - name: Save test slides
-        if: matrix.task == 'test' && steps.slides.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v4
-        with:
-          path: ~/.cache/openslide-testdata
-          key: ${{ steps.slides.outputs.cache-primary-key }}
-
       # mise.lock pins every tool for every platform, and `--locked` installs fail on a
       # platform with no entry. `mise lock` keeps existing pins, so this only fails on a
       # config change that wasn't relocked, not on a new upstream release.
@@ -170,8 +107,9 @@ jobs:
         if: matrix.task == 'pre-commit'
         run: mise run pre-commit
 
+      # Unit tests only. The integration tests need the slides in testdata.yaml (5.8 GiB from
+      # the OpenSlide test-data server); test:unit sets OPENSLIDE_SKIP_DOWNLOAD so they skip.
+      # Contributors run the full `mise run test` locally (CONTRIBUTING.md).
       - name: Test
         if: matrix.task == 'test'
-        run: |
-          export OPENSLIDE_TEST_CACHE="$HOME/.cache/openslide-testdata"
-          mise run test
+        run: mise run test:unit
